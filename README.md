@@ -33,7 +33,12 @@ plugin's own KV store, which the thread's agent cannot write. The
 `message.dispatch` hook rewrites a mirror of it onto the thread's plugin
 metadata before every turn — that mirror is what `configure` can read
 synchronously. If the agent edits its own metadata to switch the mode off, the
-next dispatch puts it back.
+next dispatch puts it back. The hook is also the only place the *new threads*
+default is applied: it is the one surface that knows a thread's `createdAt`, so
+a thread created before the default was switched on can never be caught by it.
+`configure` reads the mirror and nothing else, because it is synchronous and
+would otherwise have to guess — a guess that once governed every mirror-less
+thread in the app.
 
 **3. The watchdog.** In `guard` and `block`, the plugin reads the thread's
 timeline, classifies every new work row, and acts:

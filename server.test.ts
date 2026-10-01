@@ -205,27 +205,26 @@ describe("agent configuration", () => {
     expect(resolved.instructions).toContain("STOPS the turn");
   });
 
-  it("applies the new-thread default to a root thread only", async () => {
+  it("never governs a mirror-less thread from the default alone", async () => {
+    // configure is synchronous and receives no createdAt, so it must not guess.
+    // A default left on reaching every mirror-less thread is exactly the bug
+    // that once governed the whole app; only the dispatch hook, which has
+    // createdAt, may apply it.
     const { harness } = await load({ defaultForNewThreads: true });
-    const root = await harness.behavior.resolveAgentConfiguration(
+    for (const context of [
       makePluginAgentConfigurationContext({ thread: { id: "th_root", parentThreadId: null } }),
-    );
-    expect(root.instructions).toContain("ORCHESTRATOR MODE IS ON");
-
-    const worker = await harness.behavior.resolveAgentConfiguration(
       makePluginAgentConfigurationContext({
         thread: { id: WORKER, parentThreadId: THREAD },
       }),
-    );
-    expect(worker.instructions).toBeNull();
-
-    const sideChat = await harness.behavior.resolveAgentConfiguration(
       makePluginAgentConfigurationContext({
         thread: { id: "th_side" },
         origin: { kind: "fork", pluginId: "side-chat" },
       }),
-    );
-    expect(sideChat.instructions).toBeNull();
+    ]) {
+      const resolved = await harness.behavior.resolveAgentConfiguration(context);
+      expect(resolved.instructions).toBeNull();
+      expect(resolved.tools).toEqual([]);
+    }
   });
 
   it("leaves ordinary threads alone when the default is off", async () => {
@@ -250,12 +249,22 @@ describe("agent configuration", () => {
 });
 
 describe("the dispatch checkpoint", () => {
-  async function dispatch(harness: FakePluginHarness, threadId: string, overrides = {}) {
+  async function dispatch(
+    harness: FakePluginHarness,
+    threadId: string,
+    threadOverrides: Record<string, unknown> = {},
+    contextOverrides: Record<string, unknown> = {},
+  ) {
     const handler = harness.inspection.registrations.hooks["message.dispatch"];
     expect(handler).not.toBeNull();
     return handler!(
       makeMessageDispatchHookContext({
-        thread: makeThreadResponse({ id: threadId, createdAt: Date.now(), ...overrides }),
+        thread: makeThreadResponse({
+          id: threadId,
+          createdAt: Date.now(),
+          ...threadOverrides,
+        }),
+        ...contextOverrides,
       }),
     );
   }
@@ -301,6 +310,29 @@ describe("the dispatch checkpoint", () => {
     const { harness } = await load({ defaultForNewThreads: true });
     await dispatch(harness, "th_old", { createdAt: Date.now() - 60 * 60_000 });
     expect(metadata["th_old"]).toBeUndefined();
+  });
+
+  it("does not apply the default to a thread created before the switch", async () => {
+    const { harness } = await load();
+    const before = Date.now() - 5_000;
+    await harness.behavior.callRpc("set_default", { enabled: true });
+    await dispatch(harness, "th_just_before", { createdAt: before });
+    expect(metadata["th_just_before"]).toBeUndefined();
+
+    await dispatch(harness, "th_just_after", { createdAt: Date.now() });
+    expect(metadata["th_just_after"]).toEqual(writeMirror({ enabled: true, enforcement: null }));
+  });
+
+  it("does not apply the default to a plugin-spawned background worker", async () => {
+    const { harness } = await load();
+    await harness.behavior.callRpc("set_default", { enabled: true });
+    await dispatch(
+      harness,
+      "th_recap_worker",
+      { createdAt: Date.now(), originPluginId: "bb-recap" },
+      { initiator: "agent", originPluginId: "bb-recap" },
+    );
+    expect(metadata["th_recap_worker"]).toBeUndefined();
   });
 
   it("leaves a thread it has never enforced alone", async () => {

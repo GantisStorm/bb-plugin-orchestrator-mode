@@ -47,13 +47,13 @@ export { DELEGATE_TOOL };
 const STATE_CHANGED = "orchestrator-state";
 
 const STATE_KEY = "state";
+/** When the "new threads" default was last switched on; null while it is off. */
+const DEFAULT_KEY = "default";
 /** Threads kept in the KV map before the least recently touched is dropped. */
 const MAX_THREADS = 300;
 const MAX_VIOLATIONS = 100;
 const MAX_SEEN_ROWS = 500;
 const MAX_DELEGATIONS = 50;
-/** A thread younger than this is "new" for the new-thread default. */
-const NEW_THREAD_WINDOW_MS = 10 * 60_000;
 
 export interface Delegation {
   threadId: string;
@@ -208,6 +208,12 @@ export default async function plugin(bb: BbPluginApi) {
   /** In-memory mirror of the effective settings, for the sync configure path. */
   const live = {
     defaultForNewThreads: false,
+    /**
+     * When the default was last switched on. The dispatch hook only applies the
+     * default to threads created at or after this moment, which is what keeps
+     * "new threads" from meaning "every thread that happens to lack a mirror".
+     */
+    defaultEnabledAtMs: 0,
     enforcement: DEFAULT_ENFORCEMENT as EnforcementLevel,
     allowReadCommands: true,
     maxNudges: 3,
@@ -223,9 +229,52 @@ export default async function plugin(bb: BbPluginApi) {
     live.maxNudges = Number.isFinite(nudges) && nudges >= 0 ? Math.floor(nudges) : 3;
   }
 
+  async function persistDefaultEnabledAt(): Promise<void> {
+    await bb.storage.kv.set(DEFAULT_KEY, {
+      enabledAtMs: live.defaultForNewThreads ? live.defaultEnabledAtMs : null,
+    });
+  }
+
+  /**
+   * The one place the "new threads" default is switched. Recording the moment
+   * it turned on is what lets the dispatch hook distinguish a thread created
+   * under the default from one that merely predates it.
+   */
+  async function setDefault(enabled: boolean): Promise<boolean> {
+    await settings.experimental_set({ defaultForNewThreads: enabled });
+    live.defaultForNewThreads = enabled;
+    live.defaultEnabledAtMs = enabled ? Date.now() : 0;
+    await persistDefaultEnabledAt();
+    bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
+    return enabled;
+  }
+
   applySettings(await settings.get());
-  settings.onChange((next) => {
+  {
+    const stored = await bb.storage.kv.get<{ enabledAtMs?: unknown }>(DEFAULT_KEY);
+    const storedAt =
+      stored !== undefined && typeof stored.enabledAtMs === "number" ? stored.enabledAtMs : null;
+    if (live.defaultForNewThreads) {
+      // A default switched on by an older build, or straight through settings,
+      // has no recorded moment: claim now, so only threads created from here
+      // on are caught by it.
+      live.defaultEnabledAtMs = storedAt ?? Date.now();
+      if (storedAt === null) await persistDefaultEnabledAt();
+    } else {
+      live.defaultEnabledAtMs = 0;
+    }
+  }
+  settings.onChange((next, prev) => {
+    const wasOn = prev.defaultForNewThreads === true;
+    const isOn = next.defaultForNewThreads === true;
     applySettings(next);
+    if (isOn && !wasOn) {
+      live.defaultEnabledAtMs = Date.now();
+      void persistDefaultEnabledAt();
+    } else if (!isOn && wasOn) {
+      live.defaultEnabledAtMs = 0;
+      void persistDefaultEnabledAt();
+    }
     bb.log.info(`enforcement=${live.enforcement} default=${live.defaultForNewThreads}`);
   });
 
@@ -553,15 +602,13 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.configure((context) => {
+    // The mirror is the only source of truth here. `configure` is synchronous
+    // and receives no createdAt, so it cannot tell a thread created under the
+    // new-thread default from one that merely predates it — guessing here is
+    // what once governed every mirror-less thread in the app. The dispatch
+    // hook, which does have createdAt, is the single place the default lands.
     const mirror = readMirror(context.pluginMetadata as Record<string, unknown>);
-    const enabled =
-      mirror !== null
-        ? mirror.enabled
-        : live.defaultForNewThreads &&
-          defaultAppliesTo({
-            parentThreadId: context.thread.parentThreadId,
-            originPluginId: context.origin.pluginId,
-          });
+    const enabled = mirror !== null && mirror.enabled;
     if (!enabled) return { tools: [], skills: [] };
     const enforcement = mirror?.enforcement ?? live.enforcement;
     const state = cache?.[context.thread.id];
@@ -589,11 +636,17 @@ export default async function plugin(bb: BbPluginApi) {
       if (state === undefined) {
         const qualifies =
           live.defaultForNewThreads &&
+          live.defaultEnabledAtMs > 0 &&
+          ctx.thread.createdAt >= live.defaultEnabledAtMs &&
+          // A preference for threads *you* start. Plugin-spawned background
+          // workers (recap runners, watchers) are root threads too, and a
+          // background worker that may only delegate is a background worker
+          // that does nothing.
+          ctx.initiator === "user" &&
           defaultAppliesTo({
             parentThreadId: ctx.thread.parentThreadId,
             originPluginId: ctx.thread.originPluginId,
-          }) &&
-          Date.now() - ctx.thread.createdAt < NEW_THREAD_WINDOW_MS;
+          });
         if (qualifies) {
           const head = await timelineHead(threadId);
           state = await mutateState(threadId, (current) => ({
@@ -779,11 +832,7 @@ export default async function plugin(bb: BbPluginApi) {
       return toDto(threadId, state);
     },
     get_default: async () => ({ enabled: live.defaultForNewThreads }),
-    set_default: async ({ enabled }) => {
-      await settings.experimental_set({ defaultForNewThreads: enabled });
-      live.defaultForNewThreads = enabled;
-      return { enabled: live.defaultForNewThreads };
-    },
+    set_default: async ({ enabled }) => ({ enabled: await setDefault(enabled) }),
     clear_violations: async ({ threadId }) => {
       const state = await mutateState(threadId, (current) => ({
         ...current,
@@ -946,8 +995,7 @@ export default async function plugin(bb: BbPluginApi) {
               });
             }
             const enabled = requested === "on";
-            await settings.experimental_set({ defaultForNewThreads: enabled });
-            live.defaultForNewThreads = enabled;
+            await setDefault(enabled);
             return render(input.options.json, { enabled }, 
               `New threads start in orchestrator mode: ${enabled ? "yes" : "no"}`);
           },
