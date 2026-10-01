@@ -1,0 +1,591 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  createFakePluginHost,
+  makeMessageDispatchHookContext,
+  makePluginAgentConfigurationContext,
+  makeThreadResponse,
+  type FakePluginHarness,
+} from "@get-bb/plugin-sdk/testing";
+import type { BbPluginApi, PluginSettingValue } from "@get-bb/plugin-sdk";
+import plugin, { DELEGATE_TOOL } from "./server";
+import { writeMirror } from "./shared";
+
+const THREAD = "th_orchestrator";
+const WORKER = "th_worker";
+
+/** Timeline rows the watchdog reads, mutated per test. */
+let timelineRows: unknown[] = [];
+let timelineMaxSeq = 0;
+/** Per-thread plugin-metadata namespaces, as the server would store them. */
+let metadata: Record<string, Record<string, unknown>> = {};
+let sentTexts: string[] = [];
+let stoppedThreads: string[] = [];
+let spawned: Record<string, unknown>[] = [];
+
+/** Every loaded host, disposed after each test so no scan timer leaks into the next. */
+const hosts: FakePluginHarness[] = [];
+
+function workRow(overrides: Record<string, unknown>): Record<string, unknown> {
+  return {
+    kind: "work",
+    id: `row_${Math.random().toString(36).slice(2, 8)}`,
+    threadId: THREAD,
+    turnId: "turn_1",
+    status: "completed",
+    sourceSeqStart: timelineMaxSeq + 1,
+    sourceSeqEnd: timelineMaxSeq + 2,
+    createdAt: Date.now(),
+    startedAt: Date.now(),
+    ...overrides,
+  };
+}
+
+/** The concatenated text of a send/spawn `input` block array. */
+function textOf(input: unknown): string {
+  if (!Array.isArray(input)) return "";
+  return input
+    .map((block) =>
+      block !== null && typeof block === "object" && "text" in block
+        ? String((block as { text: unknown }).text)
+        : "",
+    )
+    .join("\n");
+}
+
+async function load(
+  settings: Record<string, PluginSettingValue> = {},
+): Promise<{ bb: BbPluginApi; harness: FakePluginHarness }> {
+  const host = createFakePluginHost({
+    pluginId: "orchestrator-mode",
+    settings,
+    sdk: {
+      threads: {
+        getPluginMetadata: async ({ threadId }: { threadId: string }) =>
+          metadata[threadId] ?? {},
+        updatePluginMetadata: async ({
+          threadId,
+          set,
+          remove,
+        }: {
+          threadId: string;
+          set?: Record<string, unknown>;
+          remove?: string[];
+        }) => {
+          const current = { ...(metadata[threadId] ?? {}) };
+          for (const key of remove ?? []) delete current[key];
+          Object.assign(current, set ?? {});
+          metadata[threadId] = current;
+          return current;
+        },
+        timeline: async () => ({ rows: timelineRows, maxSeq: timelineMaxSeq }),
+        get: async ({ threadId }: { threadId: string }) =>
+          makeThreadResponse({
+            id: threadId,
+            environmentId: threadId === WORKER ? null : "env_1",
+            parentThreadId: threadId === WORKER ? THREAD : null,
+          }),
+        spawn: async (args) => {
+          spawned.push(args as unknown as Record<string, unknown>);
+          return makeThreadResponse({ id: WORKER, parentThreadId: THREAD });
+        },
+        wait: async () => ({ matched: true, threadId: WORKER }),
+        output: async () => ({ output: "the worker finished the task" }),
+        send: async (args) => {
+          sentTexts.push(textOf((args as { input?: unknown }).input));
+          return { threadId: THREAD };
+        },
+        stop: async ({ threadId }: { threadId: string }) => {
+          stoppedThreads.push(threadId);
+          return { threadId };
+        },
+      },
+    },
+  });
+  await plugin(host.bb);
+  hosts.push(host.harness);
+  return host;
+}
+
+beforeEach(() => {
+  timelineRows = [];
+  timelineMaxSeq = 0;
+  metadata = {};
+  sentTexts = [];
+  stoppedThreads = [];
+  spawned = [];
+});
+
+afterEach(async () => {
+  for (const harness of hosts.splice(0)) {
+    await harness.lifecycle.dispose();
+  }
+  // Let any scan already in flight settle before the next test swaps the stubs.
+  await new Promise((resolve) => setTimeout(resolve, 30));
+});
+
+/** Turn the mode on through the same RPC the composer uses. */
+async function enable(
+  harness: FakePluginHarness,
+  threadId = THREAD,
+  enforcement?: "instruct" | "guard" | "block",
+): Promise<void> {
+  await harness.behavior.callRpc("set_enabled", {
+    threadId,
+    enabled: true,
+    ...(enforcement === undefined ? {} : { enforcement }),
+  });
+}
+
+describe("agent configuration", () => {
+  it("hands an enabled thread the contract and the delegation tool", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    const resolved = await harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({
+        thread: { id: THREAD },
+        pluginMetadata: writeMirror({ enabled: true, enforcement: null }),
+      }),
+    );
+    expect(resolved.instructions).toContain("ORCHESTRATOR MODE IS ON");
+    expect(resolved.tools.map((tool) => tool.name)).toEqual([DELEGATE_TOOL]);
+  });
+
+  it("contributes nothing to a thread that is not orchestrating", async () => {
+    const { harness } = await load();
+    const resolved = await harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({
+        thread: { id: THREAD },
+        pluginMetadata: writeMirror({ enabled: false, enforcement: null }),
+      }),
+    );
+    expect(resolved.instructions).toBeNull();
+    expect(resolved.tools).toEqual([]);
+  });
+
+  it("honours a per-thread enforcement override in the contract", async () => {
+    const { harness } = await load({ enforcement: "instruct" });
+    const resolved = await harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({
+        thread: { id: THREAD },
+        pluginMetadata: writeMirror({ enabled: true, enforcement: "block" }),
+      }),
+    );
+    expect(resolved.instructions).toContain("STOPS the turn");
+  });
+
+  it("applies the new-thread default to a root thread only", async () => {
+    const { harness } = await load({ defaultForNewThreads: true });
+    const root = await harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({ thread: { id: "th_root", parentThreadId: null } }),
+    );
+    expect(root.instructions).toContain("ORCHESTRATOR MODE IS ON");
+
+    const worker = await harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({
+        thread: { id: WORKER, parentThreadId: THREAD },
+      }),
+    );
+    expect(worker.instructions).toBeNull();
+
+    const sideChat = await harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({
+        thread: { id: "th_side" },
+        origin: { kind: "fork", pluginId: "side-chat" },
+      }),
+    );
+    expect(sideChat.instructions).toBeNull();
+  });
+
+  it("leaves ordinary threads alone when the default is off", async () => {
+    const { harness } = await load();
+    const resolved = await harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({ thread: { id: "th_root", parentThreadId: null } }),
+    );
+    expect(resolved.instructions).toBeNull();
+    expect(resolved.tools).toEqual([]);
+  });
+
+  it("ignores a mirror another writer forged", async () => {
+    const { harness } = await load();
+    const resolved = await harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({
+        thread: { id: THREAD },
+        pluginMetadata: { orchestrator: { enabled: true, source: "some-other-plugin" } },
+      }),
+    );
+    expect(resolved.instructions).toBeNull();
+  });
+});
+
+describe("the dispatch checkpoint", () => {
+  async function dispatch(harness: FakePluginHarness, threadId: string, overrides = {}) {
+    const handler = harness.inspection.registrations.hooks["message.dispatch"];
+    expect(handler).not.toBeNull();
+    return handler!(
+      makeMessageDispatchHookContext({
+        thread: makeThreadResponse({ id: threadId, createdAt: Date.now(), ...overrides }),
+      }),
+    );
+  }
+
+  it("always proceeds", async () => {
+    const { harness } = await load();
+    await expect(dispatch(harness, THREAD)).resolves.toEqual({ action: "proceed" });
+  });
+
+  it("mirrors authoritative state onto the thread before the turn", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    metadata[THREAD] = {}; // as if another writer cleared it
+    await dispatch(harness, THREAD);
+    expect(metadata[THREAD]).toEqual(
+      writeMirror({ enabled: true, enforcement: null }),
+    );
+  });
+
+  it("restores the mirror when the thread's own agent turns it off", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    metadata[THREAD] = writeMirror({ enabled: false, enforcement: null });
+    await dispatch(harness, THREAD);
+    expect((metadata[THREAD]!["orchestrator"] as { enabled: boolean }).enabled).toBe(true);
+  });
+
+  it("applies the new-thread default at first dispatch", async () => {
+    const { harness } = await load({ defaultForNewThreads: true });
+    await dispatch(harness, "th_fresh");
+    expect(metadata["th_fresh"]).toEqual(
+      writeMirror({ enabled: true, enforcement: null }),
+    );
+  });
+
+  it("does not apply the default to a worker thread", async () => {
+    const { harness } = await load({ defaultForNewThreads: true });
+    await dispatch(harness, WORKER, { parentThreadId: THREAD });
+    expect(metadata[WORKER]).toBeUndefined();
+  });
+
+  it("does not apply the default to a thread created long ago", async () => {
+    const { harness } = await load({ defaultForNewThreads: true });
+    await dispatch(harness, "th_old", { createdAt: Date.now() - 60 * 60_000 });
+    expect(metadata["th_old"]).toBeUndefined();
+  });
+
+  it("leaves a thread it has never enforced alone", async () => {
+    const { harness } = await load({ defaultForNewThreads: true });
+    await dispatch(harness, "th_old", { createdAt: Date.now() - 60 * 60_000 });
+    // The dispatch path is app-wide, so an unenforced thread must cost no SDK
+    // calls at all: no metadata read, no timeline read, no mirror write.
+    expect(harness.inspection.sdk.calls).toEqual([]);
+  });
+});
+
+describe("the watchdog", () => {
+  it("records a violation and corrects the thread in guard mode", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await enable(harness);
+    timelineMaxSeq = 10;
+    timelineRows = [
+      workRow({
+        id: "row_edit",
+        workKind: "file-change",
+        sourceSeqStart: 11,
+        sourceSeqEnd: 12,
+        change: { path: "src/server.ts" },
+      }),
+    ];
+    timelineMaxSeq = 12;
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: THREAD }),
+      lastAssistantText: null,
+    });
+
+    await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
+    expect(sentTexts[0]).toContain("src/server.ts");
+    expect(sentTexts[0]).toContain(DELEGATE_TOOL);
+    expect(stoppedThreads).toEqual([]);
+
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      violations: { detail: string }[];
+      nudgeCount: number;
+    };
+    expect(state.violations).toHaveLength(1);
+    expect(state.nudgeCount).toBe(1);
+  });
+
+  it("stops the turn in block mode", async () => {
+    const { harness } = await load({ enforcement: "block" });
+    await enable(harness);
+    timelineRows = [
+      workRow({ id: "row_cmd", workKind: "command", command: "npm run build" }),
+    ];
+    timelineMaxSeq = 2;
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: THREAD }),
+      lastAssistantText: null,
+    });
+
+    await vi.waitFor(() => expect(stoppedThreads).toEqual([THREAD]));
+    await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
+    expect(sentTexts[0]).toContain("npm run build");
+  });
+
+  it("does nothing in instruct mode", async () => {
+    const { harness } = await load({ enforcement: "instruct" });
+    await enable(harness);
+    timelineRows = [workRow({ id: "row_edit2", workKind: "file-change", change: { path: "a.ts" } })];
+    timelineMaxSeq = 2;
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: THREAD }),
+      lastAssistantText: null,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(sentTexts).toEqual([]);
+    expect(stoppedThreads).toEqual([]);
+  });
+
+  it("lets read-only commands through", async () => {
+    const { harness } = await load({ enforcement: "block", allowReadCommands: true });
+    await enable(harness);
+    timelineRows = [workRow({ id: "row_ls", workKind: "command", command: "git status" })];
+    timelineMaxSeq = 2;
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: THREAD }),
+      lastAssistantText: null,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(stoppedThreads).toEqual([]);
+    expect(sentTexts).toEqual([]);
+  });
+
+  it("never classifies the same row twice", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await enable(harness);
+    const row = workRow({ id: "row_once", workKind: "file-change", change: { path: "a.ts" } });
+    timelineRows = [row];
+    timelineMaxSeq = 2;
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: THREAD }),
+      lastAssistantText: null,
+    });
+    await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
+    // A second scan over the same row must not nudge again for the same turn.
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: THREAD }),
+      lastAssistantText: null,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(sentTexts).toHaveLength(1);
+  });
+
+  it("leaves a thread that is not orchestrating alone", async () => {
+    const { harness } = await load({ enforcement: "block" });
+    timelineRows = [workRow({ id: "row_x", workKind: "file-change", change: { path: "a.ts" } })];
+    timelineMaxSeq = 2;
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: "th_other" }),
+      lastAssistantText: null,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(stoppedThreads).toEqual([]);
+  });
+});
+
+describe("the delegation tool", () => {
+  it("spawns a worker under the orchestrator and returns its result", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    const result = await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Implement the retry policy in src/retry.ts" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toMatchObject({
+      projectId: "proj_1",
+      parentThreadId: THREAD,
+      prompt: "Implement the retry policy in src/retry.ts",
+      environment: { type: "reuse", environmentId: "env_1" },
+    });
+    expect(String(result)).toContain("the worker finished the task");
+    expect(String(result)).toContain(WORKER);
+
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      delegations: { threadId: string; status: string | null }[];
+    };
+    expect(state.delegations).toHaveLength(1);
+    expect(state.delegations[0]!.threadId).toBe(WORKER);
+  });
+
+  it("returns immediately when asked not to wait", async () => {
+    const { harness } = await load();
+    const result = await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it", waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(String(result)).toContain("without waiting");
+    expect(harness.inspection.sdk.callsTo("threads.wait")).toEqual([]);
+  });
+
+  it("rejects an empty brief", async () => {
+    const { harness } = await load();
+    await expect(
+      harness.behavior.callAgentTool(DELEGATE_TOOL, { task: "" }, { threadId: THREAD }),
+    ).rejects.toThrow();
+  });
+});
+
+describe("rpc", () => {
+  it("reports the effective enforcement and the plugin defaults", async () => {
+    const { harness } = await load({ enforcement: "block", maxNudges: 5 });
+    const before = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      enabled: boolean;
+      effectiveEnforcement: string;
+    };
+    expect(before.enabled).toBe(false);
+    expect(before.effectiveEnforcement).toBe("block");
+
+    await enable(harness);
+    const after = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      enabled: boolean;
+      effectiveEnforcement: string;
+      maxNudges: number;
+    };
+    expect(after.enabled).toBe(true);
+    expect(after.effectiveEnforcement).toBe("block");
+    expect(after.maxNudges).toBe(5);
+  });
+
+  it("toggles the new-thread default", async () => {
+    const { harness } = await load();
+    expect(await harness.behavior.callRpc("get_default")).toEqual({ enabled: false });
+    expect(await harness.behavior.callRpc("set_default", { enabled: true })).toEqual({
+      enabled: true,
+    });
+    expect(await harness.behavior.callRpc("get_default")).toEqual({ enabled: true });
+  });
+
+  it("clears the violation record", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await enable(harness);
+    timelineRows = [workRow({ id: "row_c", workKind: "file-change", change: { path: "a.ts" } })];
+    timelineMaxSeq = 2;
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: THREAD }),
+      lastAssistantText: null,
+    });
+    await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
+
+    const cleared = (await harness.behavior.callRpc("clear_violations", {
+      threadId: THREAD,
+    })) as { violations: unknown[]; nudgeCount: number };
+    expect(cleared.violations).toEqual([]);
+    expect(cleared.nudgeCount).toBe(0);
+  });
+
+  it("publishes a realtime signal the composer can refetch on", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    expect(
+      harness.inspection.realtimeSignals.some((signal) => signal.channel === "orchestrator-state"),
+    ).toBe(true);
+  });
+});
+
+describe("cli", () => {
+  it("turns the mode on and reports it", async () => {
+    const { harness } = await load();
+    const on = await harness.behavior.runCli(["on", "--thread", THREAD]);
+    expect(on.exitCode).toBe(0);
+    expect(on.stdout).toContain("ON");
+
+    const status = await harness.behavior.runCli(["status", "--thread", THREAD]);
+    expect(status.stdout).toContain("orchestrator mode: ON");
+
+    const off = await harness.behavior.runCli(["off", "--thread", THREAD]);
+    expect(off.stdout).toContain("off");
+    const after = await harness.behavior.runCli(["status", "--thread", THREAD]);
+    expect(after.stdout).toContain("orchestrator mode: off");
+  });
+
+  it("targets the invoking thread when no --thread is given", async () => {
+    const { harness } = await load();
+    const result = await harness.behavior.runCli(["on"], { threadId: THREAD });
+    expect(result.exitCode).toBe(0);
+    expect(metadata[THREAD]).toEqual(writeMirror({ enabled: true, enforcement: null }));
+  });
+
+  it("explains itself when there is no thread to act on", async () => {
+    const { harness } = await load();
+    const result = await harness.behavior.runCli(["status"]);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("--thread");
+  });
+
+  it("emits JSON when asked", async () => {
+    const { harness } = await load();
+    await harness.behavior.runCli(["on", "--thread", THREAD]);
+    const result = await harness.behavior.runCli(["status", "--thread", THREAD, "--json"]);
+    const parsed = JSON.parse(result.stdout) as { enabled: boolean };
+    expect(parsed.enabled).toBe(true);
+  });
+
+  it("sets and shows the new-thread default", async () => {
+    const { harness } = await load();
+    expect((await harness.behavior.runCli(["default"])).stdout).toContain("no");
+    const set = await harness.behavior.runCli(["default", "on"]);
+    expect(set.stdout).toContain("yes");
+    const bad = await harness.behavior.runCli(["default", "maybe"]);
+    expect(bad.exitCode).not.toBe(0);
+  });
+
+  it("accepts an enforcement override and rejects a made-up one", async () => {
+    const { harness } = await load();
+    const ok = await harness.behavior.runCli([
+      "on",
+      "--thread",
+      THREAD,
+      "--enforcement",
+      "block",
+    ]);
+    expect(ok.exitCode).toBe(0);
+    const bad = await harness.behavior.runCli([
+      "on",
+      "--thread",
+      THREAD,
+      "--enforcement",
+      "aggressive",
+    ]);
+    expect(bad.exitCode).not.toBe(0);
+  });
+
+  it("lists and clears violations", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await harness.behavior.runCli(["on", "--thread", THREAD]);
+    timelineRows = [workRow({ id: "row_cli", workKind: "file-change", change: { path: "z.ts" } })];
+    timelineMaxSeq = 2;
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: THREAD }),
+      lastAssistantText: null,
+    });
+    await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
+
+    const list = await harness.behavior.runCli(["violations", "--thread", THREAD]);
+    expect(list.stdout).toContain("z.ts");
+    const cleared = await harness.behavior.runCli([
+      "violations",
+      "--thread",
+      THREAD,
+      "--clear",
+    ]);
+    expect(cleared.stdout).toContain("Cleared");
+  });
+
+  it("prints help", async () => {
+    const { harness } = await load();
+    const result = await harness.behavior.runCli(["--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("orchestrator-mode");
+  });
+});
