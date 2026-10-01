@@ -18,13 +18,22 @@ Give each unit of work to a worker, with a watchdog for direct work.
 
 <br>
 
-<img src="docs/screenshots/new-thread-composer.jpg" alt="BB's new-thread composer with the orchestrator default enabled and a fictional weather-dashboard brief" width="744">
+<img src="docs/screenshots/orchestrating-thread.png" alt="A BB thread in orchestrator mode: two finished worker threads in the timeline, a third delegation running, and the status strip above the composer" width="900">
+
+<table>
+<tr>
+<td width="50%"><img src="docs/screenshots/direct-work-caught.png" alt="The strip recording direct work the watchdog caught"><br><sub>The watchdog caught the thread running a command itself, recorded it and corrected the agent.</sub></td>
+<td width="50%"><img src="docs/screenshots/new-thread-default.png" alt="The new-thread composer with the orchestrator default on and the Orchestrator mode row in the + menu"><br><sub>The new-thread default, and the <code>+</code> menu row that toggles either.</sub></td>
+</tr>
+</table>
 
 </div>
 
 > [!NOTE]
-> The screenshots are real BB renders with fictional demo data. The enabled
-> default is a browser fixture; no global setting was changed.
+> These are real BB renders of a throwaway demo project (a small Node to-do
+> CLI). The thread, its worker threads and the recorded violation are real. The
+> Playbooks and Recap panels, which belong to other plugins, were hidden so the
+> subject reads clearly. See [screenshot notes](docs/screenshots/README.md).
 
 ## The problem
 
