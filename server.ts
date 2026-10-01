@@ -246,6 +246,24 @@ export default async function plugin(bb: BbPluginApi) {
     return cache;
   }
 
+  /**
+   * Fill in fields added after a state row was written. A thread enabled by an
+   * older build of this plugin must keep being watched after an update instead
+   * of crashing the scan on a missing array.
+   */
+  function normalize(state: ThreadState): ThreadState {
+    return {
+      ...state,
+      violations: Array.isArray(state.violations) ? state.violations : [],
+      seenRowIds: Array.isArray(state.seenRowIds) ? state.seenRowIds : [],
+      delegations: Array.isArray(state.delegations) ? state.delegations : [],
+      graceTurnIds: Array.isArray(state.graceTurnIds) ? state.graceTurnIds : [],
+      graceSlots: typeof state.graceSlots === "number" ? state.graceSlots : 1,
+      lastSeq: typeof state.lastSeq === "number" ? state.lastSeq : 0,
+      nudgeCount: typeof state.nudgeCount === "number" ? state.nudgeCount : 0,
+    };
+  }
+
   async function persist(next: Record<string, ThreadState>): Promise<void> {
     cache = next;
     const write = writeQueue.then(() => bb.storage.kv.set(STATE_KEY, next));
@@ -276,7 +294,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function getState(threadId: string): Promise<ThreadState | undefined> {
     const all = await readAll();
-    return all[threadId];
+    const stored = all[threadId];
+    return stored === undefined ? undefined : normalize(stored);
   }
 
   async function mutateState(
@@ -284,7 +303,7 @@ export default async function plugin(bb: BbPluginApi) {
     update: (current: ThreadState) => ThreadState | null,
   ): Promise<ThreadState | undefined> {
     const all = { ...(await readAll()) };
-    const current = all[threadId] ?? emptyState(Date.now());
+    const current = normalize(all[threadId] ?? emptyState(Date.now()));
     const next = update(current);
     if (next === null) {
       if (all[threadId] === undefined) return undefined;

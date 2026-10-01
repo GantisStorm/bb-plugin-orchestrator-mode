@@ -54,6 +54,7 @@ function textOf(input: unknown): string {
 
 async function load(
   settings: Record<string, PluginSettingValue> = {},
+  seedState?: Record<string, unknown>,
 ): Promise<{ bb: BbPluginApi; harness: FakePluginHarness }> {
   const host = createFakePluginHost({
     pluginId: "orchestrator-mode",
@@ -101,6 +102,9 @@ async function load(
       },
     },
   });
+  if (seedState !== undefined) {
+    await host.bb.storage.kv.set("state", seedState);
+  }
   await plugin(host.bb);
   hosts.push(host.harness);
   return host;
@@ -419,6 +423,33 @@ describe("the watchdog", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 350));
     expect(stoppedThreads).toEqual([]);
+  });
+
+  it("keeps watching state written by an older build of the plugin", async () => {
+    // A row written before the grace fields existed: no graceTurnIds,
+    // no graceSlots. The scan must normalize it, not die on it.
+    const { harness } = await load({ enforcement: "block" }, {
+      [THREAD]: {
+        enabled: true,
+        enforcement: null,
+        enabledAt: new Date(Date.now() - 60_000).toISOString(),
+        touchedAt: Date.now(),
+        violations: [],
+        seenRowIds: [],
+        lastSeq: 0,
+        nudgeCount: 0,
+        lastNudgeTurnId: null,
+        lastStopTurnId: null,
+        delegations: [],
+      },
+    });
+    timelineRows = [
+      workRow({ id: "row_old0", workKind: "file-read", turnId: "turn_0", sourceSeqStart: 1, sourceSeqEnd: 1 }),
+      workRow({ id: "row_old1", workKind: "file-change", turnId: "turn_1", sourceSeqStart: 2, sourceSeqEnd: 2, change: { path: "a.ts" } }),
+    ];
+    timelineMaxSeq = 2;
+    await idle(harness);
+    await vi.waitFor(() => expect(stoppedThreads).toEqual([THREAD]));
   });
 });
 
