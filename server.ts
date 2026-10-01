@@ -73,6 +73,15 @@ export interface ThreadState {
   seenRowIds: string[];
   /** Timeline sequence already classified, so a scan never re-judges a row. */
   lastSeq: number;
+  /**
+   * Turns that ran in a provider session which never received the contract or
+   * the tool: the one in flight when the mode was switched on (if any) and the
+   * first one after it, because BB resumes a live session rather than
+   * hot-mutating it. Recorded but never judged.
+   */
+  graceTurnIds: string[];
+  /** How many grace turns this enablement gets: two mid-turn, one when idle. */
+  graceSlots: number;
   nudgeCount: number;
   lastNudgeTurnId: string | null;
   lastStopTurnId: string | null;
@@ -146,6 +155,7 @@ interface ScanRow {
   change?: { path?: string | null } | null;
   turnId?: string | null;
   sourceSeqEnd?: number;
+  startedAt?: number;
   children?: unknown;
 }
 
@@ -255,6 +265,8 @@ export default async function plugin(bb: BbPluginApi) {
       violations: [],
       seenRowIds: [],
       lastSeq: 0,
+      graceTurnIds: [],
+      graceSlots: 1,
       nudgeCount: 0,
       lastNudgeTurnId: null,
       lastStopTurnId: null,
@@ -317,14 +329,21 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** Read the thread's current timeline head so a scan starts after it. */
-  async function currentMaxSeq(threadId: string): Promise<number> {
+  async function timelineHead(
+    threadId: string,
+  ): Promise<{ seq: number; turnId: string | null }> {
     try {
       const timeline = await bb.sdk.threads.timeline({ threadId });
-      const maxSeq = (timeline as { maxSeq?: unknown }).maxSeq;
-      return typeof maxSeq === "number" && Number.isFinite(maxSeq) ? maxSeq : 0;
+      const response = timeline as { maxSeq?: unknown; rows?: unknown };
+      const seq =
+        typeof response.maxSeq === "number" && Number.isFinite(response.maxSeq)
+          ? response.maxSeq
+          : 0;
+      const rows = asScanRows(response.rows);
+      return { seq, turnId: rows.length === 0 ? null : (rows[rows.length - 1]!.turnId ?? null) };
     } catch (cause) {
       bb.log.warn(`timeline head read failed for ${threadId}: ${String(cause)}`);
-      return 0;
+      return { seq: 0, turnId: null };
     }
   }
 
@@ -335,13 +354,30 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<ThreadState> {
     // Seeding the sequence head when turning on means historical work in an
     // existing thread is never retroactively flagged.
-    const lastSeq = enabled ? await currentMaxSeq(threadId) : 0;
+    const head = enabled ? await timelineHead(threadId) : { seq: 0, turnId: null };
+    // A thread with a turn in flight loses that turn AND the next one to the
+    // session lag; an idle thread loses only the next one.
+    let graceTurnIds: string[] = [];
+    let graceSlots = 1;
+    if (enabled) {
+      try {
+        const thread = await bb.sdk.threads.get({ threadId });
+        if (thread.status === "active" && head.turnId !== null) {
+          graceTurnIds = [head.turnId];
+          graceSlots = 2;
+        }
+      } catch (cause) {
+        bb.log.warn(`thread status read failed for ${threadId}: ${String(cause)}`);
+      }
+    }
     const state = await mutateState(threadId, (current) => ({
       ...current,
       enabled,
       enforcement,
       enabledAt: enabled ? (current.enabledAt ?? new Date().toISOString()) : null,
-      lastSeq: enabled ? lastSeq : current.lastSeq,
+      lastSeq: enabled ? head.seq : current.lastSeq,
+      graceTurnIds: enabled ? graceTurnIds : current.graceTurnIds,
+      graceSlots: enabled ? graceSlots : current.graceSlots,
       nudgeCount: enabled ? current.nudgeCount : 0,
       lastNudgeTurnId: enabled ? current.lastNudgeTurnId : null,
       lastStopTurnId: enabled ? current.lastStopTurnId : null,
@@ -540,13 +576,15 @@ export default async function plugin(bb: BbPluginApi) {
           }) &&
           Date.now() - ctx.thread.createdAt < NEW_THREAD_WINDOW_MS;
         if (qualifies) {
-          const lastSeq = await currentMaxSeq(threadId);
+          const head = await timelineHead(threadId);
           state = await mutateState(threadId, (current) => ({
             ...current,
             enabled: true,
             enforcement: null,
             enabledAt: new Date().toISOString(),
-            lastSeq,
+            lastSeq: head.seq,
+            graceTurnIds: head.turnId === null ? [] : [head.turnId],
+            graceSlots: 1,
           }));
           bb.log.info(`orchestrator mode applied by default to ${threadId}`);
         }
@@ -611,13 +649,28 @@ export default async function plugin(bb: BbPluginApi) {
       ...(state.lastSeq > 0 ? { afterSequence: String(state.lastSeq) } : {}),
     });
     const rows = asScanRows((timeline as { rows?: unknown }).rows);
+    const enabledAtMs = state.enabledAt === null ? 0 : Date.parse(state.enabledAt);
     let maxSeq = state.lastSeq;
+    const graceTurnIds = [...state.graceTurnIds];
     const fresh: Violation[] = [];
     for (const row of rows) {
       const seq = typeof row.sourceSeqEnd === "number" ? row.sourceSeqEnd : 0;
       if (seq > maxSeq) maxSeq = seq;
       if (seq !== 0 && seq <= state.lastSeq) continue;
       if (state.seenRowIds.includes(row.id)) continue;
+      const turnId = row.turnId ?? null;
+      const startedAt = typeof row.startedAt === "number" ? row.startedAt : 0;
+      if (
+        turnId !== null &&
+        !graceTurnIds.includes(turnId) &&
+        graceTurnIds.length < state.graceSlots &&
+        startedAt >= enabledAtMs
+      ) {
+        graceTurnIds.push(turnId);
+      }
+      // Turns that ran before the session could gain the contract are never
+      // judged — only recorded.
+      if (turnId !== null && graceTurnIds.includes(turnId)) continue;
       const violation = classifyRow(row, { allowReadCommands: live.allowReadCommands });
       if (violation !== null) fresh.push(violation);
     }
@@ -627,6 +680,7 @@ export default async function plugin(bb: BbPluginApi) {
     const updated = await mutateState(threadId, (current) => ({
       ...current,
       lastSeq: Math.max(current.lastSeq, maxSeq),
+      graceTurnIds,
       seenRowIds: [...current.seenRowIds, ...rows.map((row) => row.id)].slice(-MAX_SEEN_ROWS),
       violations: [...current.violations, ...fresh].slice(-MAX_VIOLATIONS),
     }));

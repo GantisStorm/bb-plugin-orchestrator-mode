@@ -136,6 +136,34 @@ async function enable(
   });
 }
 
+async function idle(harness: FakePluginHarness): Promise<void> {
+  await harness.behavior.emitThreadEvent("thread.idle", {
+    thread: makeThreadResponse({ id: THREAD }),
+    lastAssistantText: null,
+  });
+}
+
+/**
+ * Model the session lag: the turn in flight when the mode is enabled, and the
+ * first turn after it, run in a provider session that never received the
+ * contract or the tool, so neither is judged. Tests that expect a violation
+ * therefore act on the third turn.
+ */
+async function arm(harness: FakePluginHarness): Promise<void> {
+  timelineRows = [
+    workRow({ id: "row_prior", workKind: "file-read", turnId: "turn_0", sourceSeqStart: 1, sourceSeqEnd: 1 }),
+  ];
+  timelineMaxSeq = 1;
+  await enable(harness);
+  timelineRows = [
+    ...timelineRows,
+    workRow({ id: "row_first", workKind: "file-read", turnId: "turn_1", sourceSeqStart: 2, sourceSeqEnd: 2 }),
+  ];
+  timelineMaxSeq = 2;
+  await idle(harness);
+  await new Promise((resolve) => setTimeout(resolve, 350));
+}
+
 describe("agent configuration", () => {
   it("hands an enabled thread the contract and the delegation tool", async () => {
     const { harness } = await load();
@@ -283,22 +311,20 @@ describe("the dispatch checkpoint", () => {
 describe("the watchdog", () => {
   it("records a violation and corrects the thread in guard mode", async () => {
     const { harness } = await load({ enforcement: "guard" });
-    await enable(harness);
-    timelineMaxSeq = 10;
+    await arm(harness);
     timelineRows = [
+      ...timelineRows,
       workRow({
         id: "row_edit",
         workKind: "file-change",
-        sourceSeqStart: 11,
-        sourceSeqEnd: 12,
+        turnId: "turn_2",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 4,
         change: { path: "src/server.ts" },
       }),
     ];
-    timelineMaxSeq = 12;
-    await harness.behavior.emitThreadEvent("thread.idle", {
-      thread: makeThreadResponse({ id: THREAD }),
-      lastAssistantText: null,
-    });
+    timelineMaxSeq = 4;
+    await idle(harness);
 
     await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
     expect(sentTexts[0]).toContain("src/server.ts");
@@ -315,30 +341,41 @@ describe("the watchdog", () => {
 
   it("stops the turn in block mode", async () => {
     const { harness } = await load({ enforcement: "block" });
-    await enable(harness);
+    await arm(harness);
     timelineRows = [
-      workRow({ id: "row_cmd", workKind: "command", command: "npm run build" }),
+      ...timelineRows,
+      workRow({ id: "row_cmd", workKind: "command", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, command: "npm run build" }),
     ];
-    timelineMaxSeq = 2;
-    await harness.behavior.emitThreadEvent("thread.idle", {
-      thread: makeThreadResponse({ id: THREAD }),
-      lastAssistantText: null,
-    });
+    timelineMaxSeq = 4;
+    await idle(harness);
 
     await vi.waitFor(() => expect(stoppedThreads).toEqual([THREAD]));
     await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
     expect(sentTexts[0]).toContain("npm run build");
   });
 
+  it("records but never judges the turns a resumed session ran ungoverned", async () => {
+    const { harness } = await load({ enforcement: "block" });
+    await arm(harness);
+    // turn_0 (in flight at enable) and turn_1 (first after it) are excused;
+    // arm() already ran turn_1, so only its recording is asserted here.
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      violations: unknown[];
+    };
+    expect(state.violations).toEqual([]);
+    expect(stoppedThreads).toEqual([]);
+    expect(sentTexts).toEqual([]);
+  });
+
   it("does nothing in instruct mode", async () => {
     const { harness } = await load({ enforcement: "instruct" });
-    await enable(harness);
-    timelineRows = [workRow({ id: "row_edit2", workKind: "file-change", change: { path: "a.ts" } })];
-    timelineMaxSeq = 2;
-    await harness.behavior.emitThreadEvent("thread.idle", {
-      thread: makeThreadResponse({ id: THREAD }),
-      lastAssistantText: null,
-    });
+    await arm(harness);
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: "row_edit2", workKind: "file-change", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, change: { path: "a.ts" } }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
     await new Promise((resolve) => setTimeout(resolve, 350));
     expect(sentTexts).toEqual([]);
     expect(stoppedThreads).toEqual([]);
@@ -346,13 +383,13 @@ describe("the watchdog", () => {
 
   it("lets read-only commands through", async () => {
     const { harness } = await load({ enforcement: "block", allowReadCommands: true });
-    await enable(harness);
-    timelineRows = [workRow({ id: "row_ls", workKind: "command", command: "git status" })];
-    timelineMaxSeq = 2;
-    await harness.behavior.emitThreadEvent("thread.idle", {
-      thread: makeThreadResponse({ id: THREAD }),
-      lastAssistantText: null,
-    });
+    await arm(harness);
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: "row_ls", workKind: "command", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, command: "git status" }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
     await new Promise((resolve) => setTimeout(resolve, 350));
     expect(stoppedThreads).toEqual([]);
     expect(sentTexts).toEqual([]);
@@ -360,20 +397,14 @@ describe("the watchdog", () => {
 
   it("never classifies the same row twice", async () => {
     const { harness } = await load({ enforcement: "guard" });
-    await enable(harness);
-    const row = workRow({ id: "row_once", workKind: "file-change", change: { path: "a.ts" } });
-    timelineRows = [row];
-    timelineMaxSeq = 2;
-    await harness.behavior.emitThreadEvent("thread.idle", {
-      thread: makeThreadResponse({ id: THREAD }),
-      lastAssistantText: null,
-    });
+    await arm(harness);
+    const row = workRow({ id: "row_once", workKind: "file-change", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, change: { path: "a.ts" } });
+    timelineRows = [...timelineRows, row];
+    timelineMaxSeq = 4;
+    await idle(harness);
     await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
     // A second scan over the same row must not nudge again for the same turn.
-    await harness.behavior.emitThreadEvent("thread.idle", {
-      thread: makeThreadResponse({ id: THREAD }),
-      lastAssistantText: null,
-    });
+    await idle(harness);
     await new Promise((resolve) => setTimeout(resolve, 350));
     expect(sentTexts).toHaveLength(1);
   });
@@ -468,13 +499,13 @@ describe("rpc", () => {
 
   it("clears the violation record", async () => {
     const { harness } = await load({ enforcement: "guard" });
-    await enable(harness);
-    timelineRows = [workRow({ id: "row_c", workKind: "file-change", change: { path: "a.ts" } })];
-    timelineMaxSeq = 2;
-    await harness.behavior.emitThreadEvent("thread.idle", {
-      thread: makeThreadResponse({ id: THREAD }),
-      lastAssistantText: null,
-    });
+    await arm(harness);
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: "row_c", workKind: "file-change", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, change: { path: "a.ts" } }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
     await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
 
     const cleared = (await harness.behavior.callRpc("clear_violations", {
@@ -562,13 +593,13 @@ describe("cli", () => {
 
   it("lists and clears violations", async () => {
     const { harness } = await load({ enforcement: "guard" });
-    await harness.behavior.runCli(["on", "--thread", THREAD]);
-    timelineRows = [workRow({ id: "row_cli", workKind: "file-change", change: { path: "z.ts" } })];
-    timelineMaxSeq = 2;
-    await harness.behavior.emitThreadEvent("thread.idle", {
-      thread: makeThreadResponse({ id: THREAD }),
-      lastAssistantText: null,
-    });
+    await arm(harness);
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: "row_cli", workKind: "file-change", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, change: { path: "z.ts" } }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
     await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
 
     const list = await harness.behavior.runCli(["violations", "--thread", THREAD]);

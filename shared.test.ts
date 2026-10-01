@@ -99,6 +99,16 @@ describe("read-only command detection", () => {
     "git config --get user.email",
     "bb status",
     "bb guide",
+    "bb --version",
+    "bb --help",
+    "bb plugin new --help",
+    "bb orchestrator-mode --help",
+    "bb skill list --json",
+    "bb thread list",
+    "bb plugin list",
+    // The exact orientation line a real orchestrator-mode thread was punished
+    // for: every segment of it only reads.
+    "pwd; ls -la; bb status --json; bb --version; bb plugin new --help",
     "diff a.txt b.txt",
   ];
   for (const command of readOnly) {
@@ -124,7 +134,13 @@ describe("read-only command detection", () => {
     "git checkout -b feature",
     "bb thread spawn --prompt hi",
     "bb plugin reload x",
+    "bb plugin install x",
+    "bb skills install foo",
+    "bb orchestrator-mode off",
     "unknown-tool --flag",
+    // From a real orchestrator-mode thread: piping bb output into python3 -c
+    // is arbitrary code, however read-only the left side of the pipe looks.
+    "bb skill list --json | python3 -c 'import json,sys; print(json.load(sys.stdin))'",
   ];
   for (const command of mutating) {
     it(`refuses \`${command}\``, () => {
@@ -246,5 +262,14 @@ describe("the contract", () => {
     expect(nudge).toContain("changed a.ts itself");
     expect(nudge).toContain("orchestrator_delegate");
     expect(nudge).toContain("stopped");
+  });
+
+  it("tells a session that predates the mode to stop rather than improvise", () => {
+    const nudge = buildNudge(
+      [{ id: "r1", turnId: "t", workKind: "command", detail: "ran `x`", detectedAt: 0 }],
+      "guard",
+    );
+    expect(nudge).toContain("predates the mode");
+    expect(nudge).toContain("Do not improvise another delegation mechanism");
   });
 });

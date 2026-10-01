@@ -258,11 +258,41 @@ const READ_ONLY_GIT_SUBCOMMANDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * `bb` subcommands that only report. Deliberately short: `bb thread`,
- * `bb plugin` and `bb workflows` can all start work, and an orchestrator has
- * `orchestrator_delegate` for that anyway.
+ * `bb` subcommands that only report, with no second token to check.
+ * Deliberately short: `bb thread`, `bb plugin` and `bb workflows` can all start
+ * work, and an orchestrator has `orchestrator_delegate` for that anyway.
  */
 const READ_ONLY_BB_SUBCOMMANDS: ReadonlySet<string> = new Set(["status", "guide"]);
+
+/**
+ * `bb <area> <verb>` pairs that only read. Kept as a table because the areas
+ * themselves are mixed: `bb plugin list` reports, `bb plugin install` changes
+ * the machine. `bb orchestrator-mode status` is read-only but `on`/`off` would
+ * let a thread switch off its own leash, so only `status` is listed.
+ */
+const READ_ONLY_BB_VERBS: Record<string, ReadonlySet<string>> = {
+  plugin: new Set(["list", "logs", "source", "search", "rpc", "outdated"]),
+  thread: new Set([
+    "list",
+    "show",
+    "get",
+    "log",
+    "messages",
+    "output",
+    "history",
+    "context",
+    "count",
+    "search",
+    "wait",
+  ]),
+  "orchestrator-mode": new Set(["status"]),
+};
+
+/** `bb skill`/`bb skills` verbs that change the catalog rather than read it. */
+const MUTATING_SKILL_VERBS: ReadonlySet<string> = new Set(["update", "remove", "install"]);
+
+/** Asking for help or a version never changes anything. */
+const HELP_OR_VERSION = /(?:^|\s)(?:--help|-h|--version)(?:\s|=|$)/;
 
 /**
  * True when every command in a shell line only reads. Any redirect, any
@@ -283,27 +313,43 @@ export function isReadOnlyCommand(command: string): boolean {
 
 function isReadOnlySegment(segment: string): boolean {
   if (segment === "") return true;
+  // `foo --help`, `foo -h` and `foo --version` report; they never mutate.
+  if (HELP_OR_VERSION.test(segment)) return true;
   const tokens = segment.split(/\s+/);
   let index = 0;
   while (index < tokens.length && ENV_ASSIGNMENT.test(tokens[index]!)) index += 1;
   const program = tokens[index];
   if (program === undefined) return true;
   const name = program.replace(/^.*\//, "");
-  if (name === "git" || name === "bb") {
+  if (name === "git") {
     const subcommand = tokens[index + 1];
     if (subcommand === undefined) return true;
     if (subcommand.startsWith("-")) return false;
-    const allowed =
-      name === "git" ? READ_ONLY_GIT_SUBCOMMANDS : READ_ONLY_BB_SUBCOMMANDS;
-    if (!allowed.has(subcommand)) return false;
+    if (!READ_ONLY_GIT_SUBCOMMANDS.has(subcommand)) return false;
     // `git config` writes unless it is only reading.
-    if (name === "git" && subcommand === "config") {
+    if (subcommand === "config") {
       return tokens.slice(index + 2).some((token) => token === "--get" ||
         token === "--list" || token === "-l");
     }
     return true;
   }
+  if (name === "bb") return isReadOnlyBbSegment(tokens.slice(index + 1));
   return READ_ONLY_PROGRAMS.has(name);
+}
+
+function isReadOnlyBbSegment(rest: readonly string[]): boolean {
+  const area = rest[0];
+  if (area === undefined) return true;
+  if (area.startsWith("-")) return false;
+  if (READ_ONLY_BB_SUBCOMMANDS.has(area)) return true;
+  if (area === "skill" || area === "skills") {
+    const verb = rest[1];
+    return verb === undefined || !MUTATING_SKILL_VERBS.has(verb);
+  }
+  const verbs = READ_ONLY_BB_VERBS[area];
+  if (verbs === undefined) return false;
+  const verb = rest[1];
+  return verb !== undefined && verbs.has(verb);
 }
 
 /**
@@ -418,7 +464,11 @@ ${commands}
    briefs. A worker cannot see this conversation, so each brief carries its own
    goal, context, constraints and definition of done.
 3. Delegate every unit with the \`${DELEGATE_TOOL}\` tool. Fan out independent
-   units in parallel; sequence only the ones with a real dependency.
+   units in parallel; sequence only the ones with a real dependency. If that
+   tool is not in your tool list, this provider session was constructed before
+   the mode was switched on and cannot gain tools mid-flight: do no work,
+   invent no substitute mechanism, say plainly that the tool arrives with the
+   next session, and stop.
 4. Review what comes back. If a result is wrong or incomplete, send a follow-up
    to a worker — never patch it yourself.
 5. Report by synthesizing: what was delegated, what each worker produced, what
@@ -447,6 +497,10 @@ export function buildNudge(violations: readonly Violation[], enforcement: Enforc
     enforcement === "block"
       ? " The turn was stopped, so any change you made mid-flight may be incomplete."
       : "";
+  const missingTool =
+    "\n\nIf `" +
+    DELEGATE_TOOL +
+    "` is not among your tools, this session predates the mode and cannot gain tools mid-flight. Do not improvise another delegation mechanism and do not retry the work: say plainly that the tool arrives with the next session, and stop.";
   return `Orchestrator mode caught you doing the work yourself:${stopped}
 
 ${acts}
@@ -455,5 +509,5 @@ Do not continue that work and do not clean it up yourself. Re-delegate it: give
 a worker thread a self-contained brief with \`${DELEGATE_TOOL}\`, then synthesize
 what comes back. If the work genuinely cannot be delegated, say so and stop.
 If orchestrator mode is wrong for this thread, ask the user to turn it off in
-the composer rather than working around it.`;
+the composer rather than working around it.${missingTool}`;
 }
