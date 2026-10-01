@@ -144,8 +144,9 @@ flowchart TD
   mirror synchronously.
 - **Delegation.** The worker receives your complete brief, rather than the
   parent's conversation. Independent units can be delegated in parallel.
-- **Classification.** The watchdog treats file changes, mutating commands and
-  mutating tool names as work. Reads, searches, plans, questions and delegation
+- **Classification.** The watchdog treats file changes, image generation,
+  mutating commands and mutating tool names as work. Reads, searches, plans,
+  questions and delegation
   remain available; command leniency is configurable.
 - **Session timing.** Instructions apply when the provider session is next
   constructed. A live session keeps its existing instructions; the watchdog

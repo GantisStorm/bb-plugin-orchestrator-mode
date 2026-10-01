@@ -8,6 +8,11 @@ each message dispatch, the plugin refreshes that mirror from its own state;
 editing the mirror alone does not disable a tracked thread. A mirror refresh
 failure logs a warning and allows dispatch to proceed.
 
+State mutations serialize the complete read, update and write operation, so
+parallel worker delegations and changes to different threads do not overwrite
+one another. RPC and CLI use the same operation to clear violation records
+and correction counters.
+
 The new-thread default records when it was enabled. At dispatch it requires a
 thread created at or after that moment, a user initiator, no parent, and an
 origin other than the side-chat plugin. Existing stored thread choices win.
@@ -33,7 +38,9 @@ starts judging its work.
 ## Work classification
 
 The classifier in `shared.ts` looks at timeline rows, rather than intercepting
-tool calls. File-change rows count as work. Command rows count unless the
+tool calls. Scans consume full rows or incremental `delta.upsertRows` patches
+and request nested rows so completed turn summaries still expose their work.
+File changes and image generation count as work. Command rows count unless the
 read-only command setting allows them. Generic tool rows are classified using
 their names; this is a heuristic, not a complete description of their effects.
 
@@ -41,6 +48,9 @@ Recognised research includes reads, searches, web fetches, plans and questions.
 Delegation rows remain available. Shell read-only checks reject writes through
 redirection and mutating command chains; consult `isReadOnlyCommand` and its
 tests for the exact recognised commands.
+Mixed Git subcommands require recognised query forms: listing branches or
+tags, inspecting remotes and showing reflogs. Creating or deleting branches
+and tags, changing remotes and rewriting reflogs count as work.
 
 In `instruct`, no watchdog classification runs. In `guard`, new violations are
 recorded and the thread receives corrective messages up to the nudge cap, with

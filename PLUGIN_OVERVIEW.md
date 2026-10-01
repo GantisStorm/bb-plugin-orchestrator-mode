@@ -32,7 +32,8 @@ a timeout leaves the worker running.
   corrective messages up to the configured cap.
 - **block:** also stop the offending turn after detection.
 
-Recognised read-only shell commands are allowed by default. You can treat all
+Direct image generation counts as work and must be delegated. Recognised
+read-only shell commands are allowed by default. You can treat all
 commands as work instead. Corrective messages default to three per enablement;
 recording and block-mode stops continue after the cap.
 

@@ -286,7 +286,7 @@ export default async function plugin(bb: BbPluginApi) {
   // input. The dispatch hook rewrites the mirror before every turn.
 
   let cache: Record<string, ThreadState> | null = null;
-  let writeQueue: Promise<unknown> = Promise.resolve();
+  let mutationQueue: Promise<unknown> = Promise.resolve();
 
   async function readAll(): Promise<Record<string, ThreadState>> {
     if (cache !== null) return cache;
@@ -314,12 +314,8 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function persist(next: Record<string, ThreadState>): Promise<void> {
+    await bb.storage.kv.set(STATE_KEY, next);
     cache = next;
-    const write = writeQueue.then(() => bb.storage.kv.set(STATE_KEY, next));
-    // Keep the chain alive even when one write fails, so a single error cannot
-    // wedge every later one.
-    writeQueue = write.catch(() => undefined);
-    await write;
     bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
   }
 
@@ -347,23 +343,40 @@ export default async function plugin(bb: BbPluginApi) {
     return stored === undefined ? undefined : normalize(stored);
   }
 
-  async function mutateState(
+  function mutateState(
     threadId: string,
     update: (current: ThreadState) => ThreadState | null,
   ): Promise<ThreadState | undefined> {
-    const all = { ...(await readAll()) };
-    const current = normalize(all[threadId] ?? emptyState(Date.now()));
-    const next = update(current);
-    if (next === null) {
-      if (all[threadId] === undefined) return undefined;
-      delete all[threadId];
+    // Serialize the read as well as the write: parallel delegations and thread
+    // toggles must derive their updates from the preceding committed state.
+    const mutation = mutationQueue.then(async () => {
+      const all = { ...(await readAll()) };
+      const current = normalize(all[threadId] ?? emptyState(Date.now()));
+      const next = update(current);
+      if (next === null) {
+        if (all[threadId] === undefined) return undefined;
+        delete all[threadId];
+        await persist(prune(all));
+        return undefined;
+      }
+      next.touchedAt = Date.now();
+      all[threadId] = next;
       await persist(prune(all));
-      return undefined;
-    }
-    next.touchedAt = Date.now();
-    all[threadId] = next;
-    await persist(prune(all));
-    return next;
+      return next;
+    });
+    // A failed mutation rejects its caller without wedging subsequent updates.
+    mutationQueue = mutation.catch(() => undefined);
+    return mutation;
+  }
+
+  function clearViolations(threadId: string): Promise<ThreadState | undefined> {
+    return mutateState(threadId, (current) => ({
+      ...current,
+      violations: [],
+      nudgeCount: 0,
+      lastNudgeTurnId: null,
+      lastStopTurnId: null,
+    }));
   }
 
   /** Drop the least recently touched threads once the map outgrows its cap. */
@@ -718,11 +731,14 @@ export default async function plugin(bb: BbPluginApi) {
 
     const timeline = await bb.sdk.threads.timeline({
       threadId,
+      includeNestedRows: "true",
       ...(state.lastSeq > 0 ? { afterSequence: String(state.lastSeq) } : {}),
     });
-    const rows = asScanRows((timeline as { rows?: unknown }).rows);
+    // Incremental responses carry row patches instead of full rows. Nested
+    // rows keep work visible after a completed turn collapses to a summary.
+    const rows = asScanRows(timeline.delta?.upsertRows ?? timeline.rows);
     const enabledAtMs = state.enabledAt === null ? 0 : Date.parse(state.enabledAt);
-    let maxSeq = state.lastSeq;
+    let maxSeq = Math.max(state.lastSeq, timeline.maxSeq);
     const graceTurnIds = [...state.graceTurnIds];
     const fresh: Violation[] = [];
     for (const row of rows) {
@@ -834,13 +850,7 @@ export default async function plugin(bb: BbPluginApi) {
     get_default: async () => ({ enabled: live.defaultForNewThreads }),
     set_default: async ({ enabled }) => ({ enabled: await setDefault(enabled) }),
     clear_violations: async ({ threadId }) => {
-      const state = await mutateState(threadId, (current) => ({
-        ...current,
-        violations: [],
-        nudgeCount: 0,
-        lastNudgeTurnId: null,
-        lastStopTurnId: null,
-      }));
+      const state = await clearViolations(threadId);
       return toDto(threadId, state);
     },
   });
@@ -954,13 +964,7 @@ export default async function plugin(bb: BbPluginApi) {
           async run(input, ctx) {
             const threadId = resolveThreadId(input.options.thread, ctx);
             if (input.options.clear === true) {
-              const state = await mutateState(threadId, (current) => ({
-                ...current,
-                violations: [],
-                nudgeCount: 0,
-                lastNudgeTurnId: null,
-                lastStopTurnId: null,
-              }));
+              const state = await clearViolations(threadId);
               return render(input.options.json, toDto(threadId, state), `Cleared for ${threadId}.`);
             }
             const state = await getState(threadId);

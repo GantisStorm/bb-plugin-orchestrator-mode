@@ -97,6 +97,16 @@ describe("read-only command detection", () => {
     "FOO=bar ls",
     "/usr/bin/git show HEAD",
     "git config --get user.email",
+    "git branch",
+    "git branch -avv",
+    "git branch --list feature-*",
+    "git tag",
+    "git tag --list v*",
+    "git tag -l v*",
+    "git remote -v",
+    "git remote show origin",
+    "git remote get-url origin",
+    "git reflog show HEAD",
     "bb status",
     "bb guide",
     "bb --version",
@@ -132,6 +142,16 @@ describe("read-only command detection", () => {
     "cat `whoami`",
     "ls; rm x",
     "git checkout -b feature",
+    "git branch review-temp",
+    "git branch -D review-temp",
+    "git branch --list --delete review-temp",
+    "git tag review-temp",
+    "git tag -d review-temp",
+    "git tag --list --delete review-temp",
+    "git remote remove origin",
+    "git remote set-url origin https://example.com/repo.git",
+    "git reflog expire --expire=now --all",
+    "git reflog delete HEAD@{0}",
     "bb thread spawn --prompt hi",
     "bb plugin reload x",
     "bb plugin install x",
@@ -164,6 +184,19 @@ describe("direct-work classification", () => {
 
   it("allows a read-only command by default", () => {
     expect(classifyRow(row({ id: "r3", workKind: "command", command: "git status" }))).toBeNull();
+  });
+
+  it("flags Git commands that mutate branches, tags or remotes", () => {
+    for (const command of ["git branch review-temp", "git tag review-temp", "git remote remove origin"]) {
+      expect(classifyRow(row({ id: command, workKind: "command", command }))).not.toBeNull();
+    }
+  });
+
+  it("flags image generation while allowing image inspection", () => {
+    expect(classifyRow(row({ id: "generated", workKind: "image-generation" }))).toMatchObject({
+      workKind: "image-generation",
+    });
+    expect(classifyRow(row({ id: "viewed", workKind: "image-view" }))).toBeNull();
   });
 
   it("flags a read-only command when the setting is off", () => {

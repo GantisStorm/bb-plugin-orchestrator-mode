@@ -345,6 +345,66 @@ describe("the dispatch checkpoint", () => {
 });
 
 describe("the watchdog", () => {
+  it("records and deduplicates work delivered in timeline delta patches", async () => {
+    const { bb, harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    const edit = workRow({
+      id: "row_delta", workKind: "file-change", turnId: "turn_2",
+      sourceSeqStart: 3, sourceSeqEnd: 4, change: { path: "delta.ts" },
+    });
+    harness.inspection.sdk.stub("threads.timeline", async () => ({
+      rows: [], maxSeq: 4, delta: { upsertRows: [edit] },
+    }));
+    await idle(harness);
+    await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
+    expect(sentTexts[0]).toContain("delta.ts");
+
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const state = await harness.behavior.callRpc("get_state", { threadId: THREAD });
+    expect(state).toMatchObject({ violations: [{ id: "row_delta" }], nudgeCount: 1 });
+    expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+    expect(sentTexts).toHaveLength(1);
+  });
+
+  it("inspects edits inside completed turn summaries", async () => {
+    const { harness } = await load({ enforcement: "block" });
+    await arm(harness);
+    const edit = workRow({
+      id: "row_nested", workKind: "file-change", turnId: "turn_2",
+      sourceSeqStart: 3, sourceSeqEnd: 4, change: { path: "nested.ts" },
+    });
+    harness.inspection.sdk.stub("threads.timeline", async ({ includeNestedRows }: { includeNestedRows?: string }) => ({
+      maxSeq: 5,
+      rows: [{
+        id: "summary_2", kind: "turn", turnId: "turn_2", status: "completed",
+        startedAt: edit.startedAt, sourceSeqStart: 3, sourceSeqEnd: 5,
+        children: includeNestedRows === "true" ? [edit] : null,
+      }],
+    }));
+    await idle(harness);
+    await vi.waitFor(() => expect(stoppedThreads).toEqual([THREAD]));
+    await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
+    expect(sentTexts[0]).toContain("nested.ts");
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      violations: [{ id: "row_nested" }],
+    });
+  });
+
+  it("advances past an empty timeline patch without recording work", async () => {
+    const { bb, harness } = await load();
+    await arm(harness);
+    harness.inspection.sdk.stub("threads.timeline", async () => ({
+      rows: [], maxSeq: 3, delta: { upsertRows: [] },
+    }));
+    await idle(harness);
+    await vi.waitFor(async () => {
+      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 3 } });
+    });
+    expect(sentTexts).toEqual([]);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({ violations: [] });
+  });
+
   it("records a violation and corrects the thread in guard mode", async () => {
     const { harness } = await load({ enforcement: "guard" });
     await arm(harness);
@@ -486,6 +546,23 @@ describe("the watchdog", () => {
 });
 
 describe("the delegation tool", () => {
+  it("retains every worker record when delegations start together", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    let workerNumber = 0;
+    harness.inspection.sdk.stub("threads.spawn", async () =>
+      makeThreadResponse({ id: `th_worker_${++workerNumber}`, parentThreadId: THREAD }),
+    );
+    await Promise.all(["First task", "Second task"].map((task) =>
+      harness.behavior.callAgentTool(
+        DELEGATE_TOOL, { task, waitForResult: false }, { threadId: THREAD, projectId: "proj_1" },
+      ),
+    ));
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      delegations: [{ threadId: "th_worker_1" }, { threadId: "th_worker_2" }],
+    });
+  });
+
   it("spawns a worker under the orchestrator and returns its result", async () => {
     const { harness } = await load();
     await enable(harness);
@@ -531,6 +608,34 @@ describe("the delegation tool", () => {
 });
 
 describe("rpc", () => {
+  it("preserves both thread choices when they are enabled together", async () => {
+    const { bb, harness } = await load();
+    await Promise.all([enable(harness, "th_first"), enable(harness, "th_second")]);
+    for (const threadId of ["th_first", "th_second"]) {
+      expect(await harness.behavior.callRpc("get_state", { threadId })).toMatchObject({ enabled: true });
+      expect(metadata[threadId]).toEqual(writeMirror({ enabled: true, enforcement: null }));
+    }
+    expect(await bb.storage.kv.get("state")).toMatchObject({
+      th_first: { enabled: true }, th_second: { enabled: true },
+    });
+  });
+
+  it("leaves failed writes uncommitted and accepts later mutations", async () => {
+    const { bb, harness } = await load();
+    const write = vi.spyOn(bb.storage.kv, "set").mockRejectedValueOnce(new Error("write failed"));
+    try {
+      await expect(enable(harness, "th_failed")).rejects.toThrow("write failed");
+      expect(await harness.behavior.callRpc("get_state", { threadId: "th_failed" })).toMatchObject({ enabled: false });
+      expect(metadata["th_failed"]).toBeUndefined();
+
+      await enable(harness, "th_later");
+      expect(await bb.storage.kv.get("state")).toMatchObject({ th_later: { enabled: true } });
+      expect(await harness.behavior.callRpc("get_state", { threadId: "th_later" })).toMatchObject({ enabled: true });
+    } finally {
+      write.mockRestore();
+    }
+  });
+
   it("reports the effective enforcement and the plugin defaults", async () => {
     const { harness } = await load({ enforcement: "block", maxNudges: 5 });
     const before = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {

@@ -152,7 +152,7 @@ const MUTATING_TOOL_PATTERN =
   /(write|edit|create|delete|remove|rename|move|copy|apply|patch|replace|append|insert|mkdir|touch|chmod|chown|commit|push|merge|rebase|reset|revert|checkout|install|build|compile|exec|execute|shell|bash|command|run|kill|upload|deploy|migrate|format|lint|test)/i;
 
 /** Work kinds that are always the orchestrator doing the work itself. */
-const ALWAYS_WORK: ReadonlySet<string> = new Set(["file-change", "command"]);
+const ALWAYS_WORK: ReadonlySet<string> = new Set(["file-change", "command", "image-generation"]);
 
 /** Work kinds that are always allowed: thinking, asking, and delegating. */
 const ALWAYS_ALLOWED: ReadonlySet<string> = new Set([
@@ -167,7 +167,6 @@ const ALWAYS_ALLOWED: ReadonlySet<string> = new Set([
   "web-search",
   "web-fetch",
   "image-view",
-  "image-generation",
 ]);
 
 /** Shell metacharacters that split one command line into separate commands. */
@@ -238,8 +237,6 @@ const READ_ONLY_GIT_SUBCOMMANDS: ReadonlySet<string> = new Set([
   "diff",
   "show",
   "blame",
-  "branch",
-  "remote",
   "ls-files",
   "ls-tree",
   "describe",
@@ -247,15 +244,45 @@ const READ_ONLY_GIT_SUBCOMMANDS: ReadonlySet<string> = new Set([
   "rev-list",
   "shortlog",
   "cat-file",
-  "tag",
   "whatchanged",
-  "reflog",
   "count-objects",
   "name-rev",
   "merge-base",
   "for-each-ref",
-  "config",
 ]);
+
+const GIT_BRANCH_LIST_OPTIONS: ReadonlySet<string> = new Set([
+  "--list", "--all", "--remotes", "--verbose",
+]);
+const GIT_TAG_LIST_OPTIONS: ReadonlySet<string> = new Set(["--list", "-l", "-n"]);
+
+/** Mixed Git subcommands need an explicit query form, not just a known name. */
+function isReadOnlyGitSegment(rest: readonly string[]): boolean {
+  const [subcommand, ...args] = rest;
+  if (subcommand === undefined) return true;
+  if (subcommand === "branch" || subcommand === "tag") {
+    const isBranch = subcommand === "branch";
+    const listing = args.includes("--list") || (!isBranch && args.includes("-l"));
+    const options = isBranch ? GIT_BRANCH_LIST_OPTIONS : GIT_TAG_LIST_OPTIONS;
+    return args.every((arg) =>
+      options.has(arg) ||
+      (isBranch && /^-[arv]+$/.test(arg)) ||
+      (!isBranch && /^-n\d+$/.test(arg)) ||
+      (listing && !arg.startsWith("-")),
+    );
+  }
+  if (subcommand === "remote") {
+    const query = args[0] === "-v" || args[0] === "--verbose" ? args.slice(1) : args;
+    return query.length === 0 || query[0] === "show" || query[0] === "get-url";
+  }
+  if (subcommand === "reflog") {
+    return args.length === 0 || args[0] === "show" || args[0] === "list" || args[0] === "exists";
+  }
+  if (subcommand === "config") {
+    return args.some((arg) => arg === "--get" || arg === "--list" || arg === "-l");
+  }
+  return READ_ONLY_GIT_SUBCOMMANDS.has(subcommand);
+}
 
 /**
  * `bb` subcommands that only report, with no second token to check.
@@ -321,18 +348,7 @@ function isReadOnlySegment(segment: string): boolean {
   const program = tokens[index];
   if (program === undefined) return true;
   const name = program.replace(/^.*\//, "");
-  if (name === "git") {
-    const subcommand = tokens[index + 1];
-    if (subcommand === undefined) return true;
-    if (subcommand.startsWith("-")) return false;
-    if (!READ_ONLY_GIT_SUBCOMMANDS.has(subcommand)) return false;
-    // `git config` writes unless it is only reading.
-    if (subcommand === "config") {
-      return tokens.slice(index + 2).some((token) => token === "--get" ||
-        token === "--list" || token === "-l");
-    }
-    return true;
-  }
+  if (name === "git") return isReadOnlyGitSegment(tokens.slice(index + 1));
   if (name === "bb") return isReadOnlyBbSegment(tokens.slice(index + 1));
   return READ_ONLY_PROGRAMS.has(name);
 }
@@ -375,6 +391,10 @@ export function classifyRow(
   if (workKind === "file-change") {
     const path = row.change?.path ?? "a file";
     return { ...base, detail: `changed ${path} itself` };
+  }
+
+  if (workKind === "image-generation") {
+    return { ...base, detail: "generated an image itself" };
   }
 
   if (workKind === "command") {
@@ -448,6 +468,7 @@ ${watching}
 ## Forbidden — doing the work yourself
 
 - Editing, creating, overwriting, moving or deleting any file.
+- Generating images instead of delegating their creation.
 - Running a command that changes anything: builds, installs, tests, git commits
   and pushes, code generation, migrations, formatters, scripts.
 - Writing the implementation yourself, even "just this one small fix", even

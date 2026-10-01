@@ -52,6 +52,9 @@ workers and side chats alone.
 Read-only shell commands (`ls`, `cat`, `rg`, `git status`, `git diff`,
 `git log`, `find`, `wc`) do not count as work unless the plugin's
 "Read-only shell commands are not work" setting is turned off.
+Creating images counts as work and must be delegated; inspecting images is
+allowed. Git commands that create or delete branches or tags, change remotes,
+or rewrite reflogs also count as work.
 
 ## Delegating
 

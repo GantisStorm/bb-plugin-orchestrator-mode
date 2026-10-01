@@ -25,6 +25,12 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ### Fixed
 
+- Read incremental timeline patches and nested work in completed turns so the
+  watchdog does not miss direct work.
+- Serialize state mutations to retain simultaneous thread choices and worker
+  delegation records.
+- Count mutating Git command forms and direct image generation as work.
+- Share violation clearing between RPC and CLI, and remove unused vendored UI.
 - Apply the new-thread default only to qualifying root threads created while
   it is enabled, on a user-initiated dispatch.
 - Refresh the metadata mirror from plugin storage before each dispatch.
