@@ -2,6 +2,11 @@ Make a BB thread delegate every unit of work. Your orchestrator reads, plans,
 asks, delegates and reports; child worker threads carry out its briefs in the
 same environment.
 
+Long-running threads can start out delegating correctly, then drift into
+editing files, running commands or fixing worker output themselves. In `guard`
+and `block`, the watchdog keeps checking new timeline work as the conversation
+continues, so detected direct work can be recorded, corrected or stopped.
+
 ## In the composer
 
 Use the delegation icon or the **Orchestrator mode** row in the `+` menu to

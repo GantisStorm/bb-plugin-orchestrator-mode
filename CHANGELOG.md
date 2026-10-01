@@ -18,6 +18,11 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 - Repository documentation, a logo using the plugin's delegation icon and an
   MIT licence.
 
+### Changed
+
+- Explain how long-running threads can drift from delegation into direct work,
+  and how ongoing watchdog checks help catch that behaviour.
+
 ### Fixed
 
 - Apply the new-thread default only to qualifying root threads created while

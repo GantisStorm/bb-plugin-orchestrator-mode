@@ -32,14 +32,20 @@ You ask a thread to coordinate a task, but it starts doing the work itself.
 The planning, implementation and review accumulate in one transcript, even
 when parts of the task could run independently.
 
+It can also start out delegating correctly, then drift during a long-running
+conversation. It begins editing files, running commands or fixing a worker's
+output itself, despite being asked to stay in the orchestrator role.
+
 Orchestrator Mode gives that thread a delegation contract and a worker tool.
-You keep the plan and final report in the parent, and can open each worker to
-inspect its work.
+In `guard` and `block`, the watchdog checks new timeline work as the conversation
+continues and can correct or stop detected direct work. You keep the plan and
+final report in the parent, and can open each worker to inspect its work.
 
 | You need | You get |
 | --- | --- |
 | A thread that coordinates | Instructions to read, plan, ask, delegate and report |
 | Separate units of work | Worker threads in the same environment |
+| A long-running thread that drifts into direct work | Ongoing timeline checks in `guard` and `block` |
 | Visibility when the parent does direct work | A violation record, corrective messages and an optional stop |
 
 ## Features
@@ -71,7 +77,8 @@ appear in the sidebar unless you request a hidden worker.
 ### 👁️ Three enforcement levels
 
 Choose instructions alone, a watchdog that records and corrects, or a watchdog
-that also stops the turn. Read-only shell exploration is allowed by default.
+that also stops the turn. The watchdog keeps checking new work as the
+conversation continues. Read-only shell exploration is allowed by default.
 
 </td>
 <td valign="top">
