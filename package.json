@@ -2,14 +2,15 @@
   "name": "bb-plugin-orchestrator-mode",
   "version": "0.1.0",
   "type": "module",
-  "description": "A composer toggle that turns a BB thread into a pure orchestrator: it may only read, plan, ask, delegate and report, and the plugin catches it doing the work itself.",
+  "description": "Make a BB thread delegate every unit of work, with a composer toggle, worker threads and a timeline watchdog.",
+  "license": "MIT",
   "engines": {
     "bb": ">=0.44",
     "bbPluginSdk": ">=0.5.29"
   },
   "bb": {
     "name": "Orchestrator Mode",
-    "description": "Force a thread to delegate every unit of work instead of doing it itself, with a composer toggle and a timeline watchdog.",
+    "description": "Make a BB thread delegate every unit of work, with a composer toggle, worker threads and a timeline watchdog.",
     "branding": {
       "icon": "./assets/icon.svg",
       "experimental_icons": {
@@ -74,8 +75,11 @@
     "components",
     "lib",
     "skills",
+    "docs",
     "README.md",
     "PLUGIN_OVERVIEW.md",
+    "CHANGELOG.md",
+    "LICENSE",
     "tsconfig.json"
   ],
   "allowScripts": {

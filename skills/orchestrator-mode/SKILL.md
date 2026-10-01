@@ -9,10 +9,11 @@ Orchestrator mode is a per-thread switch. When it is on, that thread does not
 do the work: it reads, plans, asks, delegates, and reports, and every unit of
 actual work goes to a worker thread.
 
-## Recognize it
+## Recognise it
 
-The composer shows a hub glyph and, while the mode is on, a strip above the
-input naming the enforcement level and any direct work already caught. The
+The composer shows a delegation icon (possibly under More plugin actions) and,
+while the mode is on, a strip above the input naming the enforcement level and
+any direct work already caught. The
 thread's own instructions carry the full contract when the mode is on — if you
 are reading a "# ORCHESTRATOR MODE IS ON" block, it is on for you.
 
@@ -36,7 +37,17 @@ constructed; a live session keeps the instructions it started with.
 - `guard` (default) — the timeline is watched; direct work is recorded and the
   thread gets a corrective message telling it to re-delegate.
 - `block` — as `guard`, plus the turn is stopped the moment direct work is
-  detected.
+  detected. Detection follows the action, so a fast write can finish before
+  the stop; there is no pre-tool-call veto.
+
+The watchdog grants grace turns while provider sessions gain the contract:
+one when enabled while idle, or the active turn and the next one when enabled
+mid-turn. Historical work is not judged. Follow the contract whenever your
+session receives it, including during watchdog grace turns.
+
+The new-thread default only reaches qualifying root threads created while
+it is on, at a user-initiated dispatch. It leaves existing threads, child
+workers and side chats alone.
 
 Read-only shell commands (`ls`, `cat`, `rg`, `git status`, `git diff`,
 `git log`, `find`, `wc`) do not count as work unless the plugin's
@@ -47,6 +58,16 @@ Read-only shell commands (`ls`, `cat`, `rg`, `git status`, `git diff`,
 Use the `orchestrator_delegate` tool, which the mode selects for the thread.
 Give it a complete, self-contained brief: the worker cannot see this
 conversation. Fan out independent units; sequence only real dependencies.
+
+Arguments are `task` (required, at most 20,000 characters), `title` (optional,
+at most 200), `waitForResult` (default `true`), `timeoutSeconds` (default `900`,
+integer range 10–3,600) and `hidden` (default `false`). A timeout or
+`waitForResult: false` leaves the worker running; inspect that worker later
+and review its result.
+
+The default corrective-message cap is three per enablement. Recording and
+block-mode stops continue after the cap. Clearing violations or disabling the
+thread resets correction counters.
 
 Do not try to turn the mode off yourself or work around it. If the work
 genuinely cannot be delegated, say so and stop, and ask the user to turn the

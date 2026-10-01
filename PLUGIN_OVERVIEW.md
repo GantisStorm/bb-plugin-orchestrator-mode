@@ -1,28 +1,53 @@
-Turn any thread into a pure orchestrator from the composer: it may only read,
-plan, ask, delegate and report, and every unit of real work goes to a worker
-thread.
+Make a BB thread delegate every unit of work. Your orchestrator reads, plans,
+asks, delegates and reports; child worker threads carry out its briefs in the
+same environment.
 
-## What you get
+## In the composer
 
-- A **hub toggle** in the composer, plus a `+` menu row for compact layout, and
-  a strip above the input that shows the enforcement level and any direct work
-  the watchdog caught.
-- A hard **contract** injected into every turn the mode is on for, and an
-  `orchestrator_delegate` tool that spawns a worker thread and brings back its
-  result.
-- A **watchdog** that reads the timeline and, depending on the level, records
-  direct work, corrects the thread, or stops the turn outright.
-- A `bb orchestrator-mode` command for the same switches from a terminal.
+Use the delegation icon or the **Orchestrator mode** row in the `+` menu to
+toggle one thread. The strip above the input shows the enforcement level,
+recent direct work and a **Turn off** button. The draft gains a left-edge
+accent. BB may group the icon under **More plugin actions**.
 
-## How it works
+In the root new-thread composer, the switch controls the new-thread default.
+It applies only to qualifying root threads created while the default is on,
+at a user-initiated dispatch. Existing threads, child workers and side chats
+are left alone.
 
-Authoritative per-thread state lives in this plugin's own storage, which the
-thread's agent cannot write; a mirror of it is written onto the thread's plugin
-metadata at every dispatch, because that is the only per-thread input the
-synchronous agent-configuration callback can read.
+## Delegation and enforcement
 
-## For agents
+Enabled provider sessions receive a delegation contract and the
+`orchestrator_delegate` tool. Give the worker a self-contained brief: it does
+not see the parent's conversation. You can wait for its result, delegate
+without waiting, or request a hidden worker. Waiting defaults to 900 seconds;
+a timeout leaves the worker running.
 
-The bundled skill tells an agent how to recognize the mode, delegate with
-`orchestrator_delegate`, and inspect or change the mode with
-`bb orchestrator-mode`.
+- **instruct:** contract only.
+- **guard** (default): watch the timeline, record direct work and send
+  corrective messages up to the configured cap.
+- **block:** also stop the offending turn after detection.
+
+Recognised read-only shell commands are allowed by default. You can treat all
+commands as work instead. Corrective messages default to three per enablement;
+recording and block-mode stops continue after the cap.
+
+## Timing and limits
+
+Instructions apply when the provider session is next constructed. A live
+session keeps its existing instructions. The watchdog skips historical work
+and grants grace turns during the transition: one when enabled while idle, or
+the active turn and the next one when enabled mid-turn.
+
+BB exposes no pre-tool-call veto. Block mode detects and stops; a fast write
+can complete before that stop. Classification uses timeline row kinds and tool
+names, so this is a coordination aid, not a security boundary. Workers share
+your environment and use ordinary provider resources.
+
+## CLI and settings
+
+`bb orchestrator-mode` provides `status`, `on`, `off`, `violations` (including
+`--clear`) and `default`. Thread commands accept `--thread`; every command
+supports `--json`. Settings control the new-thread default, enforcement,
+read-only command handling and the corrective-message cap.
+
+Requires bb 0.44+ and Plugin SDK 0.5.29+. Licensed under MIT.
