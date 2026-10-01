@@ -108,28 +108,11 @@ function message(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
 }
 
-/** The hub-and-spoke mark, registered so every surface draws the same glyph. */
-function HubIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      className={className}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.8"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <circle cx="12" cy="5" r="2.2" />
-      <circle cx="5" cy="18" r="2.2" />
-      <circle cx="19" cy="18" r="2.2" />
-      <path d="M12 7.2v4.3M10.4 12.8 6.3 16.4M13.6 12.8l4.1 3.6" />
-      <circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none" />
-    </svg>
-  );
-}
-
+/**
+ * The glyph every surface draws. The artwork itself is declared once, in the
+ * manifest under `bb.branding.experimental_icons`, and BB serves it hashed and
+ * tinted — so there is exactly one drawing of it to keep in step.
+ */
 const ICON_NAME = "orchestrator-mode/hub";
 
 /**
@@ -330,8 +313,6 @@ function OrchestratorToggle() {
 }
 
 export default definePluginApp((app) => {
-  app.experimental_icons.register({ name: ICON_NAME, component: HubIcon });
-
   app.composer.customize({
     id: "orchestrator-mode",
     scopes: ["thread", "new-thread"],

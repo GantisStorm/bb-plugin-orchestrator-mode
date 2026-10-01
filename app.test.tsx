@@ -156,8 +156,17 @@ describe("registration", () => {
     expect(customization.plusMenu).toHaveLength(1);
   });
 
-  it("registers the hub glyph every surface draws", () => {
-    expect(app.icons.map((icon) => icon.name)).toContain("orchestrator-mode/hub");
+  it("draws the manifest-declared glyph on every surface", async () => {
+    const rpc = makeRpc({ enabled: true });
+    const host = mount(Host, rpc, threadOptions());
+    const toggle = mount(Toggle, rpc, threadOptions());
+    await flush();
+    expect(
+      host.container.querySelectorAll('[data-icon="orchestrator-mode/hub"]'),
+    ).toHaveLength(1);
+    expect(
+      toggle.container.querySelectorAll('[data-icon="orchestrator-mode/hub"]'),
+    ).toHaveLength(1);
   });
 });
 

@@ -11,7 +11,10 @@
     "name": "Orchestrator Mode",
     "description": "Force a thread to delegate every unit of work instead of doing it itself, with a composer toggle and a timeline watchdog.",
     "branding": {
-      "icon": "./assets/icon.svg"
+      "icon": "./assets/icon.svg",
+      "experimental_icons": {
+        "hub": "./assets/icon.svg"
+      }
     },
     "server": "./server.ts",
     "app": "./app.tsx",
