@@ -41,6 +41,77 @@ export function isEnforcementLevel(value: unknown): value is EnforcementLevel {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Worker execution control
+// ---------------------------------------------------------------------------
+
+/**
+ * The reasoning levels a spawn accepts, mirroring the SDK's `ReasoningLevel`.
+ * Narrower in practice: a provider only honours the rungs its model ladder has.
+ */
+export const REASONING_LEVELS = [
+  "none",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+  "ultracode",
+] as const;
+export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
+
+/** The permission modes a spawn accepts, mirroring the SDK's `PermissionMode`. */
+export const PERMISSION_MODES = ["auto", "accept-edits", "full"] as const;
+export type PermissionMode = (typeof PERMISSION_MODES)[number];
+
+export function isReasoningLevel(value: unknown): value is ReasoningLevel {
+  return (
+    typeof value === "string" &&
+    (REASONING_LEVELS as readonly string[]).includes(value)
+  );
+}
+
+export function isPermissionMode(value: unknown): value is PermissionMode {
+  return (
+    typeof value === "string" &&
+    (PERMISSION_MODES as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * Execution overrides for a spawned worker. An absent field is not "no value",
+ * it is "inherit": the thread is spawned without it and BB resolves the
+ * project's remembered default, then the provider catalog default.
+ *
+ * The block is forwarded to `threads.spawn` together with an
+ * `executionInputSources` provenance stamp, because the server drops a
+ * requested `providerId`/`model` that carries no source and silently re-derives
+ * it from the project defaults.
+ */
+export interface WorkerExecution {
+  providerId?: string;
+  model?: string;
+  reasoningLevel?: ReasoningLevel;
+  permissionMode?: PermissionMode;
+}
+
+/** One model the SDK's own picker offers, with the provider that serves it. */
+export interface WorkerModelOption {
+  id: string;
+  providerId: string;
+}
+
+/**
+ * The provider/model catalog this plugin offers for workers, read from the same
+ * `bb.sdk.providers` source the new-thread composer's pickers use. An empty
+ * catalog means the read failed: nothing is offered and nothing is validated.
+ */
+export interface WorkerCatalog {
+  providers: readonly string[];
+  models: readonly WorkerModelOption[];
+}
+
 /**
  * The thread-metadata mirror of the plugin's authoritative state.
  *
@@ -299,6 +370,8 @@ const READ_ONLY_BB_SUBCOMMANDS: ReadonlySet<string> = new Set(["status", "guide"
  */
 const READ_ONLY_BB_VERBS: Record<string, ReadonlySet<string>> = {
   plugin: new Set(["list", "logs", "source", "search", "rpc", "outdated"]),
+  // The orchestrator needs these to pick worker models the catalog can serve.
+  provider: new Set(["list", "models"]),
   thread: new Set([
     "list",
     "show",
@@ -429,6 +502,30 @@ export interface InstructionInput {
   allowReadCommands: boolean;
   /** Extra lines a caller wants appended, e.g. recent violations. */
   reminders?: readonly string[];
+  /** The worker execution defaults this plugin configures; absent = inherit. */
+  workerExecution?: WorkerExecution;
+}
+
+/**
+ * One sentence naming the execution the workers get, or the fact that this
+ * plugin overrides nothing. Kept next to the contract it is spliced into, and
+ * deliberately short: `configure` truncates the whole block at 4096 characters.
+ */
+export function workerBudget(execution: WorkerExecution | undefined): string {
+  const exec = execution ?? {};
+  const parts = [
+    exec.model === undefined ? null : `model \`${exec.model}\``,
+    exec.providerId === undefined ? null : `provider \`${exec.providerId}\``,
+    exec.reasoningLevel === undefined
+      ? null
+      : `reasoning \`${exec.reasoningLevel}\``,
+    exec.permissionMode === undefined
+      ? null
+      : `permission mode \`${exec.permissionMode}\``,
+  ].filter((part): part is string => part !== null);
+  return parts.length === 0
+    ? "Workers run on this project's own execution defaults."
+    : `Workers default to ${parts.join(", ")}, set by this plugin.`;
 }
 
 /**
@@ -500,6 +597,15 @@ ${commands}
 Only these: reading, searching, planning, asking the user a question,
 delegating, and reporting. If you are about to call a tool that changes
 something, stop and delegate it instead.
+
+## Choosing the worker's model
+
+${workerBudget(input.workerExecution)} Override it per delegation with the
+\`model\`, \`provider\`, \`reasoning\` and \`permissionMode\` arguments of
+\`${DELEGATE_TOOL}\` — give a hard unit a stronger model and a mechanical one a
+cheaper one. Valid ids come from the catalog: \`bb provider list\` names the
+providers, \`bb provider models <provider>\` lists their models. Both are
+read-only.
 
 ## If you cannot delegate
 

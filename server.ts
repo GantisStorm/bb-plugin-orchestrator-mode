@@ -22,6 +22,8 @@ import {
   defineCli,
   defineRpcContract,
   type BbPluginApi,
+  type PluginSettingDescriptor,
+  type PluginSettingsValues,
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
@@ -29,15 +31,24 @@ import {
   DELEGATE_TOOL,
   ENFORCEMENT_DESCRIPTIONS,
   ENFORCEMENT_LEVELS,
+  PERMISSION_MODES,
+  REASONING_LEVELS,
   buildInstructions,
   buildNudge,
   classifyRow,
   defaultAppliesTo,
   isEnforcementLevel,
+  isPermissionMode,
+  isReasoningLevel,
   readMirror,
   writeMirror,
   type EnforcementLevel,
+  type PermissionMode,
+  type ReasoningLevel,
   type Violation,
+  type WorkerCatalog,
+  type WorkerExecution,
+  type WorkerModelOption,
 } from "./shared";
 
 export type { EnforcementLevel, Violation };
@@ -54,6 +65,9 @@ const MAX_THREADS = 300;
 const MAX_VIOLATIONS = 100;
 const MAX_SEEN_ROWS = 500;
 const MAX_DELEGATIONS = 50;
+
+/** The select value that means "do not set this field on the worker". */
+const INHERIT = "inherit";
 
 export interface Delegation {
   threadId: string;
@@ -116,7 +130,17 @@ const stateSchema = z.object({
   defaultForNewThreads: z.boolean(),
   allowReadCommands: z.boolean(),
   maxNudges: z.number(),
+  /** The execution every delegation defaults to; absent fields inherit. */
+  workerExecution: z.object({
+    providerId: z.string().optional(),
+    model: z.string().optional(),
+    reasoningLevel: z.enum(REASONING_LEVELS).optional(),
+    permissionMode: z.enum(PERMISSION_MODES).optional(),
+  }),
 });
+
+/** The shape every RPC call returns; the schema above owns it. */
+export type OrchestratorStateDto = z.infer<typeof stateSchema>;
 
 export const rpcContract = defineRpcContract({
   get_state: {
@@ -172,10 +196,70 @@ function asScanRows(rows: unknown): ScanRow[] {
   return out;
 }
 
-export default async function plugin(bb: BbPluginApi) {
-  // --- settings ------------------------------------------------------------
+// --- settings --------------------------------------------------------------
 
-  const settings = bb.settings.define({
+/**
+ * Every model the SDK's own picker would offer, with the provider that serves
+ * it. Read from `bb.sdk.providers.models()` — the same source the new-thread
+ * composer's provider and model pickers use, so a worker runs on something the
+ * user can actually select there.
+ *
+ * A failed read is not fatal: the catalog comes back empty, the pickers offer
+ * only "inherit", and nothing is validated against it.
+ */
+async function loadWorkerCatalog(bb: BbPluginApi): Promise<WorkerCatalog> {
+  try {
+    // The unfiltered response enumerates providers, including which are
+    // available; each provider's models need a call of its own. Providers are a
+    // handful, so this is a few requests once per plugin load.
+    const system = await bb.sdk.providers.models();
+    const providers: string[] = [];
+    const models: WorkerModelOption[] = [];
+    for (const provider of system.providers) {
+      if (!provider.available) continue;
+      providers.push(provider.id);
+      const listed = (await bb.sdk.providers.models({ providerId: provider.id })).models;
+      for (const model of listed) {
+        if (models.some((existing) => existing.id === model.id)) continue;
+        models.push({ id: model.id, providerId: provider.id });
+      }
+    }
+    return { providers, models };
+  } catch (cause) {
+    bb.log.warn(`worker provider catalog unavailable, offering inherit only: ${String(cause)}`);
+    return { providers: [], models: [] };
+  }
+}
+
+/** `explicit` means the caller named the value, so the server must keep it. */
+type ExecutionSource = "explicit";
+
+/** The provenance map `threads.spawn` reads for each execution field it gets. */
+interface WorkerExecutionSources {
+  providerId?: ExecutionSource;
+  model?: ExecutionSource;
+  reasoningLevel?: ExecutionSource;
+  permissionMode?: ExecutionSource;
+}
+
+/**
+ * Stamp every field present in `exec` as caller-chosen. Without this the server
+ * drops a requested `providerId`/`model` and re-derives it from the project's
+ * remembered defaults, so the worker would silently ignore what was asked for.
+ */
+function executionSources(exec: WorkerExecution): WorkerExecutionSources {
+  return {
+    ...(exec.providerId === undefined ? {} : { providerId: "explicit" as const }),
+    ...(exec.model === undefined ? {} : { model: "explicit" as const }),
+    ...(exec.reasoningLevel === undefined ? {} : { reasoningLevel: "explicit" as const }),
+    ...(exec.permissionMode === undefined ? {} : { permissionMode: "explicit" as const }),
+  };
+}
+
+export default async function plugin(bb: BbPluginApi) {
+  const catalog = await loadWorkerCatalog(bb);
+
+  const SETTING_DESCRIPTORS = {
     defaultForNewThreads: {
       type: "boolean",
       label: "New threads start in orchestrator mode",
@@ -203,7 +287,47 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Violations keep being recorded after the cap is reached.",
       default: 3,
     },
-  });
+    workerProviderId: {
+      type: "select",
+      label: "Worker provider",
+      description:
+        "Provider every delegated worker is spawned on, chosen from the providers this machine offers. `inherit` uses the project's remembered provider.",
+      options: [INHERIT, ...catalog.providers],
+      default: INHERIT,
+    },
+    workerModel: {
+      type: "select",
+      label: "Worker model",
+      description:
+        "Model every delegated worker is spawned on, chosen from the models the provider catalog offers. `inherit` uses the project's remembered model. A single delegation may override it.",
+      options: [INHERIT, ...catalog.models.map((model) => model.id)],
+      default: INHERIT,
+    },
+    workerReasoningLevel: {
+      type: "select",
+      label: "Worker reasoning level",
+      description:
+        "Reasoning level for delegated workers. `inherit` uses the project's remembered level.",
+      options: [INHERIT, ...REASONING_LEVELS],
+      default: INHERIT,
+    },
+    workerPermissionMode: {
+      type: "select",
+      label: "Worker permission mode",
+      description:
+        "Permission mode for delegated workers — `full` lets them act without asking. `inherit` uses the project's remembered mode.",
+      options: [INHERIT, ...PERMISSION_MODES],
+      default: INHERIT,
+    },
+  } satisfies Record<string, PluginSettingDescriptor>;
+
+  /**
+   * The resolved settings this plugin defines. Named here rather than published
+   * through `ReturnType` of the handle, so `applySettings` takes a real type.
+   */
+  type OrchestratorSettings = PluginSettingsValues<typeof SETTING_DESCRIPTORS>;
+
+  const settings = bb.settings.define(SETTING_DESCRIPTORS);
 
   /** In-memory mirror of the effective settings, for the sync configure path. */
   const live = {
@@ -217,9 +341,58 @@ export default async function plugin(bb: BbPluginApi) {
     enforcement: DEFAULT_ENFORCEMENT as EnforcementLevel,
     allowReadCommands: true,
     maxNudges: 3,
+    /** Worker execution defaults; an absent field means "inherit". */
+    worker: {} as WorkerExecution,
   };
 
-  function applySettings(values: Awaited<ReturnType<typeof settings.get>>): void {
+  /**
+   * The worker execution this plugin configures, in the shape `threads.spawn`
+   * takes and `buildInstructions` describes. Absent fields are omitted rather
+   * than sent empty, so a thread spawned without them resolves the project's
+   * remembered defaults exactly as it did before this fork.
+   */
+  function workerDefaults(): WorkerExecution {
+    return { ...live.worker };
+  }
+
+  /**
+   * Resolve one select. `inherit` (and a blank) means "do not set it"; a value
+   * the live catalog no longer lists is dropped with a warning rather than
+   * spawned, because the pickers only offer catalog ids: this means the
+   * provider's models changed under a stored setting, and a worker on the
+   * project's own default beats one whose start fails.
+   */
+  function workerChoice(
+    value: string | undefined,
+    options: readonly string[],
+    setting: string,
+  ): string | undefined {
+    if (value === undefined || value === "" || value === INHERIT) return undefined;
+    if (options.length > 0 && !options.includes(value)) {
+      bb.log.warn(`${setting} "${value}" is not in the current catalog; ignoring it`);
+      return undefined;
+    }
+    return value;
+  }
+
+  /**
+   * Keep provider and model coherent. A model belongs to exactly one provider,
+   * so naming a provider that does not serve the chosen model would guarantee a
+   * failed start; the model wins and the mismatch is logged.
+   */
+  function reconcile(exec: WorkerExecution): WorkerExecution {
+    if (exec.model === undefined) return exec;
+    const owner = catalog.models.find((option) => option.id === exec.model)?.providerId;
+    if (owner === undefined || owner === exec.providerId) return exec;
+    if (exec.providerId !== undefined) {
+      bb.log.warn(
+        `worker provider ${exec.providerId} does not serve ${exec.model}; using ${owner}`,
+      );
+    }
+    return { ...exec, providerId: owner };
+  }
+
+  function applySettings(values: OrchestratorSettings): void {
     live.defaultForNewThreads = values.defaultForNewThreads === true;
     live.enforcement = isEnforcementLevel(values.enforcement)
       ? values.enforcement
@@ -227,6 +400,53 @@ export default async function plugin(bb: BbPluginApi) {
     live.allowReadCommands = values.allowReadCommands !== false;
     const nudges = Number(values.maxNudges);
     live.maxNudges = Number.isFinite(nudges) && nudges >= 0 ? Math.floor(nudges) : 3;
+    const providerId = workerChoice(values.workerProviderId, catalog.providers, "workerProviderId");
+    const model = workerChoice(
+      values.workerModel,
+      catalog.models.map((option) => option.id),
+      "workerModel",
+    );
+    live.worker = reconcile({
+      ...(providerId === undefined ? {} : { providerId }),
+      ...(model === undefined ? {} : { model }),
+      ...(isReasoningLevel(values.workerReasoningLevel)
+        ? { reasoningLevel: values.workerReasoningLevel }
+        : {}),
+      ...(isPermissionMode(values.workerPermissionMode)
+        ? { permissionMode: values.workerPermissionMode }
+        : {}),
+    });
+  }
+
+  /**
+   * Refuse a worker the provider catalog cannot serve, naming the alternatives
+   * so the agent can correct itself instead of handing back a broken worker.
+   * Nothing is asserted while the catalog is empty — an unreadable catalog must
+   * not make delegation impossible.
+   */
+  function assertInCatalog(exec: WorkerExecution): void {
+    if (
+      exec.model !== undefined &&
+      catalog.models.length > 0 &&
+      !catalog.models.some((option) => option.id === exec.model)
+    ) {
+      const sample = catalog.models
+        .slice(0, 12)
+        .map((option) => option.id)
+        .join(", ");
+      throw new Error(
+        `Unknown worker model "${exec.model}". Models this machine offers include: ${sample}. Run \`bb provider models <provider>\` for the full list, or omit model to inherit the project default.`,
+      );
+    }
+    if (
+      exec.providerId !== undefined &&
+      catalog.providers.length > 0 &&
+      !catalog.providers.includes(exec.providerId)
+    ) {
+      throw new Error(
+        `Unknown worker provider "${exec.providerId}". Providers this machine offers: ${catalog.providers.join(", ")}. Omit provider to inherit the project default.`,
+      );
+    }
   }
 
   async function persistDefaultEnabledAt(): Promise<void> {
@@ -393,7 +613,7 @@ export default async function plugin(bb: BbPluginApi) {
     return state?.enforcement ?? live.enforcement;
   }
 
-  function toDto(threadId: string, state: ThreadState | undefined) {
+  function toDto(threadId: string, state: ThreadState | undefined): OrchestratorStateDto {
     const base = state ?? emptyState(Date.now());
     return {
       enabled: state?.enabled ?? false,
@@ -406,6 +626,7 @@ export default async function plugin(bb: BbPluginApi) {
       defaultForNewThreads: live.defaultForNewThreads,
       allowReadCommands: live.allowReadCommands,
       maxNudges: live.maxNudges,
+      workerExecution: workerDefaults(),
     };
   }
 
@@ -527,9 +748,47 @@ export default async function plugin(bb: BbPluginApi) {
         .boolean()
         .optional()
         .describe("Keep the worker out of the sidebar. Default false."),
+      model: z
+        .string()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe(
+          "Model id for this worker, taken from the provider catalog (`bb provider models <provider>`). Defaults to the plugin's worker model, then the project's remembered model.",
+        ),
+      provider: z
+        .string()
+        .min(1)
+        .max(120)
+        .optional()
+        .describe(
+          "Provider id for this worker, taken from the provider catalog (`bb provider list`). Defaults to the plugin's worker provider, then the project's remembered provider.",
+        ),
+      reasoning: z
+        .enum(REASONING_LEVELS)
+        .optional()
+        .describe(
+          "Reasoning level for this worker. Defaults to the plugin's worker reasoning level, then the project's remembered level.",
+        ),
+      permissionMode: z
+        .enum(PERMISSION_MODES)
+        .optional()
+        .describe(
+          "Permission mode for this worker. Defaults to the plugin's worker permission mode, then the project's remembered mode.",
+        ),
     }),
     async execute(
-      { task, title, waitForResult, timeoutSeconds, hidden },
+      {
+        task,
+        title,
+        waitForResult,
+        timeoutSeconds,
+        hidden,
+        model,
+        provider,
+        reasoning,
+        permissionMode,
+      },
       { threadId, projectId, signal },
     ) {
       if (threadId === undefined || projectId === undefined) {
@@ -542,6 +801,17 @@ export default async function plugin(bb: BbPluginApi) {
           : { type: "reuse" as const, environmentId: parent.environmentId };
       const workerTitle = title?.trim() || task.trim().split("\n")[0]!.slice(0, 120);
 
+      // Per-delegation arguments win over the plugin's worker settings; a field
+      // neither names is left out so the worker resolves the project default.
+      const workerExec = reconcile({
+        ...workerDefaults(),
+        ...(provider === undefined ? {} : { providerId: provider }),
+        ...(model === undefined ? {} : { model }),
+        ...(reasoning === undefined ? {} : { reasoningLevel: reasoning }),
+        ...(permissionMode === undefined ? {} : { permissionMode }),
+      });
+      assertInCatalog(workerExec);
+
       const worker = await bb.sdk.threads.spawn({
         projectId,
         environment,
@@ -549,6 +819,13 @@ export default async function plugin(bb: BbPluginApi) {
         title: workerTitle,
         parentThreadId: threadId,
         ...(hidden === true ? { visibility: "hidden" as const } : {}),
+        ...workerExec,
+        // The server drops a requested provider/model that carries no
+        // provenance source and re-derives it from the project's remembered
+        // defaults, which would silently undo everything above.
+        ...(Object.keys(workerExec).length === 0
+          ? {}
+          : { executionInputSources: executionSources(workerExec) }),
         pluginMetadata: { workerFor: threadId },
       });
 
@@ -636,6 +913,7 @@ export default async function plugin(bb: BbPluginApi) {
         enforcement,
         allowReadCommands: live.allowReadCommands,
         reminders,
+        workerExecution: workerDefaults(),
       }),
     };
   });
@@ -885,7 +1163,18 @@ export default async function plugin(bb: BbPluginApi) {
     return { exitCode: 0, stdout: json === true ? JSON.stringify(value, null, 2) : text };
   }
 
-  function describeState(threadId: string, state: ReturnType<typeof toDto>): string {
+  /** One line naming what a delegation's worker will run on. */
+  function describeWorkerExecution(exec: OrchestratorStateDto["workerExecution"]): string {
+    const parts = [
+      exec.providerId === undefined ? null : `provider ${exec.providerId}`,
+      exec.model === undefined ? null : `model ${exec.model}`,
+      exec.reasoningLevel === undefined ? null : `reasoning ${exec.reasoningLevel}`,
+      exec.permissionMode === undefined ? null : `permission ${exec.permissionMode}`,
+    ].filter((part): part is string => part !== null);
+    return parts.length === 0 ? "project default (no worker override)" : parts.join(", ");
+  }
+
+  function describeState(threadId: string, state: OrchestratorStateDto): string {
     const lines = [
       `thread ${threadId}`,
       `  orchestrator mode: ${state.enabled ? "ON" : "off"}`,
@@ -895,6 +1184,7 @@ export default async function plugin(bb: BbPluginApi) {
       `  violations:        ${state.violations.length}`,
       `  nudges sent:       ${state.nudgeCount} of ${state.maxNudges}`,
       `  delegations:       ${state.delegations.length}`,
+      `  workers run as:    ${describeWorkerExecution(state.workerExecution)}`,
     ];
     if (state.violations.length > 0) {
       lines.push("  recent direct work:");

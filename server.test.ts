@@ -25,6 +25,27 @@ let spawned: Record<string, unknown>[] = [];
 /** Every loaded host, disposed after each test so no scan timer leaks into the next. */
 const hosts: FakePluginHarness[] = [];
 
+/** A provider/model catalog the fake host serves to the plugin at load. */
+interface ProviderCatalogFixture {
+  providers?: { id: string; available: boolean }[];
+  models?: Record<string, { id: string }[]>;
+}
+
+/** The catalog the delegation tests resolve worker ids against. */
+const CATALOG: ProviderCatalogFixture = {
+  providers: [
+    { id: "acp-omp", available: true },
+    { id: "claude-code", available: true },
+  ],
+  models: {
+    "acp-omp": [{ id: "command-code/deepseek/deepseek-v4.1-flash-fast" }],
+    "claude-code": [
+      { id: "claude-opus-5-5" },
+      { id: "claude-haiku-4-5-20251001" },
+    ],
+  },
+};
+
 function workRow(overrides: Record<string, unknown>): Record<string, unknown> {
   return {
     kind: "work",
@@ -55,11 +76,41 @@ function textOf(input: unknown): string {
 async function load(
   settings: Record<string, PluginSettingValue> = {},
   seedState?: Record<string, unknown>,
+  catalog: ProviderCatalogFixture = {},
 ): Promise<{ bb: BbPluginApi; harness: FakePluginHarness }> {
+  const providers = catalog.providers ?? [{ id: "acp-omp", available: true }];
+  const modelsByProvider = catalog.models ?? {
+    "acp-omp": [{ id: "command-code/deepseek/deepseek-v4.1-flash-fast" }],
+  };
   const host = createFakePluginHost({
     pluginId: "orchestrator-mode",
     settings,
     sdk: {
+      providers: {
+        models: async ({ providerId }: { providerId?: string } = {}) => {
+          if (providerId !== undefined) {
+            return {
+              providers: [],
+              models: (modelsByProvider[providerId] ?? []).map((model) => ({
+                ...model,
+                model: model.id,
+                description: "",
+                isDefault: false,
+                supportedReasoningEfforts: [],
+                defaultReasoningEffort: "medium" as const,
+              })),
+            };
+          }
+          return {
+            providers: providers.map((provider) => ({
+              id: provider.id,
+              available: provider.available,
+              displayName: provider.id,
+            })),
+            models: [],
+          };
+        },
+      },
       threads: {
         getPluginMetadata: async ({ threadId }: { threadId: string }) =>
           metadata[threadId] ?? {},
@@ -106,6 +157,10 @@ async function load(
     await host.bb.storage.kv.set("state", seedState);
   }
   await plugin(host.bb);
+  // Loading reads the provider catalog once. No test asserts on that, and every
+  // call-count assertion below is about what a request or a turn does, so the
+  // load-time reads are dropped rather than counted as request activity.
+  host.harness.inspection.sdk.calls.length = 0;
   hosts.push(host.harness);
   return host;
 }
@@ -597,6 +652,128 @@ describe("the delegation tool", () => {
     );
     expect(String(result)).toContain("without waiting");
     expect(harness.inspection.sdk.callsTo("threads.wait")).toEqual([]);
+  });
+
+  it("leaves the worker on the project default when no execution is configured", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it", waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).not.toHaveProperty("providerId");
+    expect(spawned[0]).not.toHaveProperty("model");
+    expect(spawned[0]).not.toHaveProperty("reasoningLevel");
+    expect(spawned[0]).not.toHaveProperty("permissionMode");
+    expect(spawned[0]).not.toHaveProperty("executionInputSources");
+  });
+
+  it("treats the inherit choices as no override", async () => {
+    const { harness } = await load({
+      workerProviderId: "inherit",
+      workerModel: "inherit",
+      workerReasoningLevel: "inherit",
+      workerPermissionMode: "inherit",
+    });
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it", waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned[0]).not.toHaveProperty("executionInputSources");
+  });
+
+  it("spawns workers on the configured execution, stamped as caller-chosen", async () => {
+    const { harness } = await load(
+      {
+        workerProviderId: "acp-omp",
+        workerModel: "command-code/deepseek/deepseek-v4.1-flash-fast",
+        workerReasoningLevel: "high",
+        workerPermissionMode: "full",
+      },
+      undefined,
+      CATALOG,
+    );
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it", waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned[0]).toMatchObject({
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      reasoningLevel: "high",
+      permissionMode: "full",
+      // Without these the server drops the request and re-derives the
+      // project's remembered defaults.
+      executionInputSources: {
+        providerId: "explicit",
+        model: "explicit",
+        reasoningLevel: "explicit",
+        permissionMode: "explicit",
+      },
+    });
+  });
+
+  it("drops a configured model the catalog no longer offers", async () => {
+    const { harness } = await load({ workerModel: "command-code/retired/model" }, undefined, CATALOG);
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it", waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned[0]).not.toHaveProperty("model");
+    expect(spawned[0]).not.toHaveProperty("executionInputSources");
+  });
+
+  it("lets one delegation override the configured worker execution", async () => {
+    const { harness } = await load(
+      { workerModel: "command-code/deepseek/deepseek-v4.1-flash-fast" },
+      undefined,
+      CATALOG,
+    );
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      {
+        task: "The hard unit",
+        model: "claude-opus-5-5",
+        permissionMode: "auto",
+        waitForResult: false,
+      },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned[0]).toMatchObject({
+      model: "claude-opus-5-5",
+      permissionMode: "auto",
+      // The model's own provider replaces the configured one, which does not
+      // serve it.
+      providerId: "claude-code",
+      executionInputSources: {
+        providerId: "explicit",
+        model: "explicit",
+        permissionMode: "explicit",
+      },
+    });
+    expect(spawned[0]).not.toHaveProperty("reasoningLevel");
+  });
+
+  it("refuses a worker model the catalog does not offer", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await enable(harness);
+    await expect(
+      harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task: "Do it", model: "gpt-9-imaginary", waitForResult: false },
+        { threadId: THREAD, projectId: "proj_1" },
+      ),
+    ).rejects.toThrow(/Unknown worker model "gpt-9-imaginary"/);
+    expect(spawned).toHaveLength(0);
   });
 
   it("rejects an empty brief", async () => {

@@ -8,6 +8,18 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ### Added
 
+- **Worker execution control.** `workerProviderId`, `workerModel`,
+  `workerReasoningLevel` and `workerPermissionMode` settings, and matching
+  `provider`, `model`, `reasoning` and `permissionMode` arguments on
+  `orchestrator_delegate`, so each worker thread can run on a chosen model and
+  permission mode instead of inheriting the project default. Provider and model
+  options are read from `bb.sdk.providers` — the same catalog the new-thread
+  composer's pickers use — and every requested field is stamped in
+  `threads.spawn`'s `executionInputSources`, without which the server drops it.
+  A model the catalog does not offer is refused with the available ids named.
+- `bb provider list` and `bb provider models` count as read-only commands, so an
+  orchestrator can discover valid worker ids.
+- `bb orchestrator-mode status` reports the execution delegations default to.
 - Composer toggle, `+` menu fallback and status strip for orchestrator threads.
 - Instructions that limit the orchestrator to reading, planning, asking,
   delegating and reporting, with a tool that creates worker threads.
