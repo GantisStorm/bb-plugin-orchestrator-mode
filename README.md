@@ -78,8 +78,8 @@ The `orchestrator_delegate` tool creates a child thread from a self-contained
 brief and can wait for its result. Workers use the parent's environment and
 appear in the sidebar unless you request a hidden worker.
 
-You choose their provider and model — from BB's own provider catalog — in the
-plugin settings, or per delegation in the tool call. See
+You choose their provider and model with BB's own picker in the plugin's
+settings, or per delegation in the tool call. See
 [Worker execution](#worker-execution).
 
 </td>
@@ -170,22 +170,23 @@ session timing in more detail.
 
 ## Worker execution
 
-Workers run on the project's remembered provider and model unless you pick
-different ones. **Settings → Installed plugins → Orchestrator Mode** offers:
+Workers run on the project's remembered provider and model unless you give them
+their own. **Settings → Installed plugins → Orchestrator Mode → Worker
+execution** has one switch, which opens BB's own provider and model picker:
 
-| Setting | Default | Effect |
-| --- | --- | --- |
-| `workerProviderId` | `inherit` | Provider every delegated worker is spawned on, listed from the providers this machine offers. |
-| `workerModel` | `inherit` | Model every delegated worker is spawned on, listed from the provider catalog. |
-| `workerReasoningLevel` | `inherit` | Reasoning level for delegated workers. |
-| `workerPermissionMode` | `inherit` | Permission mode for delegated workers; `full` lets them act without asking. |
+- **Off** — every delegation inherits the project's remembered provider and
+  model.
+- **On** — delegated workers start on the provider, model, reasoning level and
+  service tier you pick. **Reset to project default** clears it again.
 
-The provider and model lists come from the same `bb.sdk.providers` catalog BB's
-own new-thread pickers read, so a worker runs on something you can also select
-when starting a thread by hand. Each list has an `inherit` entry that leaves
-that field to the project's remembered default.
+The picker is BB's, not a copy: choosing a provider shows that provider's
+models, and one pick resolves provider, model, reasoning level and service tier
+as a single coherent value — the same value `threads.spawn` takes. That is why
+this is not a plugin setting: a settings `select` cannot make its options depend
+on another `select`, so a flat model list would offer models for providers you
+did not choose.
 
-Tool arguments override the settings for one delegation:
+A single delegation overrides it with the tool's arguments:
 
 ```json
 {
@@ -200,15 +201,20 @@ Give the hard units a stronger model and the mechanical ones a cheaper one. The
 orchestrator discovers valid IDs with `bb provider list` and
 `bb provider models <provider>`; both count as read-only orientation. An ID the
 catalog does not offer is refused, naming the options that are available, rather
-than spawning a worker whose start cannot succeed. A model and a provider that
-disagree resolve to the model: a model belongs to one provider, so the provider
-that serves it wins and the mismatch is logged.
+than spawning a worker whose start cannot succeed. Naming a provider that does
+not serve the chosen model resolves to the model's own provider, and the
+mismatch is logged.
+
+`bb orchestrator-mode worker` prints the stored execution, sets it with
+`--provider`, `--model`, `--reasoning`, `--tier` and `--permission`, and clears
+it with `--clear`. It needs both a provider and a model, because those two are
+what the stored record and the pickers describe.
 
 **Provider support:** changing a worker's model needs the target provider to
 switch models at session start. `codex` and `claude-code` do. The `acp-omp`
 provider answers an ACP `session/set_model` call with *Unknown ACP ext method*,
 so asking for any model other than the one it already runs fails that worker's
-start — leave the worker model on `inherit` when delegating to `acp-omp`.
+start — leave workers on the project default when delegating to `acp-omp`.
 
 ## Enforcement limits
 
@@ -228,6 +234,7 @@ start — leave the worker model on `inherit` when delegating to `acp-omp`.
 bb orchestrator-mode status
 bb orchestrator-mode on --enforcement guard
 bb orchestrator-mode violations --json
+bb orchestrator-mode worker --model claude-haiku-4-5-20251001
 bb orchestrator-mode off
 ```
 
@@ -241,6 +248,7 @@ bb orchestrator-mode off
 | `off [--thread <id>] [--json]` | Disable the thread and clear its enforcement override. |
 | `violations [--thread <id>] [--clear] [--json]` | List violations, or clear them and reset correction counters. |
 | `default [on\|off] [--json]` | Show or set the default for new threads. |
+| `worker [--provider <id>] [--model <id>] [--reasoning <level>] [--tier <default\|fast>] [--permission <mode>] [--clear] [--json]` | Show, set or clear the execution every delegated worker defaults to. |
 
 `--thread` (alias `-t`) defaults to the thread running the command. In an
 ordinary terminal, provide a thread ID for thread commands.
@@ -253,7 +261,7 @@ The brief is required and limited to 20,000 characters; the title is limited to
 200. Waiting defaults to `true`, with a 900-second timeout (range 10–3,600).
 `hidden` defaults to `false`. A timeout returns the worker's status and leaves it
 running. The four execution arguments are optional and fall back to the
-[worker execution](#worker-execution) settings, then the project defaults. The
+[worker execution](#worker-execution), then the project defaults. The
 bundled [skill](skills/orchestrator-mode/SKILL.md) explains the mode, delegation
 and CLI; enabled sessions receive the contract directly.
 
@@ -271,10 +279,10 @@ Orchestrator Mode**.
 | `enforcement` | `guard` | `instruct`: contract only. `guard`: record and correct. `block`: also stop. A thread override takes precedence. |
 | `allowReadCommands` | `true` | Treat recognised read-only shell commands as exploration; when off, all commands count as work. |
 | `maxNudges` | `3` | Corrective messages per enablement; non-negative numbers are rounded down. `0` disables nudges. Recording and `block` stops continue after the cap. |
-| `workerProviderId` | `inherit` | Provider every delegated worker is spawned on, listed from this machine's providers. |
-| `workerModel` | `inherit` | Model every delegated worker is spawned on, listed from the provider catalog. |
-| `workerReasoningLevel` | `inherit` | Reasoning level for delegated workers. |
-| `workerPermissionMode` | `inherit` | Permission mode for delegated workers. |
+
+The worker execution above is stored by the plugin rather than set here, so it
+can use BB's own provider and model picker. See
+[Worker execution](#worker-execution).
 
 Re-enabling an already enabled thread preserves its nudge count. Disabling it
 or clearing violations resets the correction counters.

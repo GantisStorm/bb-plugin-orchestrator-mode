@@ -27,12 +27,11 @@ not see the parent's conversation. You can wait for its result, delegate
 without waiting, or request a hidden worker. Waiting defaults to 900 seconds;
 a timeout leaves the worker running.
 
-Workers run on the project's remembered provider and model unless the worker
-settings pick different ones. The provider and model lists are read from
-`bb.sdk.providers` — the catalog the new-thread composer's own pickers use — and
-a single delegation can override either of them, plus the reasoning level and
-permission mode, in the tool call. An id the catalog does not offer is refused
-with the alternatives named.
+Workers run on the project's remembered provider and model unless the **Worker
+execution** settings section gives them their own, using BB's own provider and
+model picker: picking a provider scopes the models to it, and a single
+delegation can override the result in the tool call. An id the catalog does not
+offer is refused with the alternatives named.
 
 - **instruct:** contract only.
 - **guard** (default): watch the timeline, record direct work and send
@@ -59,9 +58,10 @@ your environment and use ordinary provider resources.
 ## CLI and settings
 
 `bb orchestrator-mode` provides `status`, `on`, `off`, `violations` (including
-`--clear`) and `default`. Thread commands accept `--thread`; every command
-supports `--json`. Settings control the new-thread default, enforcement,
-read-only command handling, the corrective-message cap and the worker provider,
-model, reasoning level and permission mode.
+`--clear`), `default` and `worker`. Thread commands accept `--thread`; every
+command supports `--json`. Settings control the new-thread default, enforcement,
+read-only command handling and the corrective-message cap; the worker execution
+is stored by the plugin and edited in Settings or with `bb orchestrator-mode
+worker`.
 
 Requires bb 0.44+ and Plugin SDK 0.5.29+. Licensed under MIT.

@@ -33,6 +33,7 @@ import {
   ENFORCEMENT_LEVELS,
   PERMISSION_MODES,
   REASONING_LEVELS,
+  SERVICE_TIERS,
   buildInstructions,
   buildNudge,
   classifyRow,
@@ -40,11 +41,13 @@ import {
   isEnforcementLevel,
   isPermissionMode,
   isReasoningLevel,
+  isServiceTier,
   readMirror,
   writeMirror,
   type EnforcementLevel,
   type PermissionMode,
   type ReasoningLevel,
+  type ServiceTier,
   type Violation,
   type WorkerCatalog,
   type WorkerExecution,
@@ -60,14 +63,13 @@ const STATE_CHANGED = "orchestrator-state";
 const STATE_KEY = "state";
 /** When the "new threads" default was last switched on; null while it is off. */
 const DEFAULT_KEY = "default";
+/** The stored worker execution every delegation defaults to. */
+const WORKER_KEY = "worker";
 /** Threads kept in the KV map before the least recently touched is dropped. */
 const MAX_THREADS = 300;
 const MAX_VIOLATIONS = 100;
 const MAX_SEEN_ROWS = 500;
 const MAX_DELEGATIONS = 50;
-
-/** The select value that means "do not set this field on the worker". */
-const INHERIT = "inherit";
 
 export interface Delegation {
   threadId: string;
@@ -118,6 +120,15 @@ const violationSchema = z.object({
   detectedAt: z.number(),
 });
 
+/** The execution a delegation defaults to; an absent field inherits. */
+const workerExecutionSchema = z.object({
+  providerId: z.string().min(1).max(120).optional(),
+  model: z.string().min(1).max(200).optional(),
+  reasoningLevel: z.enum(REASONING_LEVELS).optional(),
+  serviceTier: z.enum(SERVICE_TIERS).optional(),
+  permissionMode: z.enum(PERMISSION_MODES).optional(),
+});
+
 const stateSchema = z.object({
   enabled: z.boolean(),
   enforcement: z.enum(ENFORCEMENT_LEVELS as readonly ["instruct", ...EnforcementLevel[]]).nullable(),
@@ -131,12 +142,7 @@ const stateSchema = z.object({
   allowReadCommands: z.boolean(),
   maxNudges: z.number(),
   /** The execution every delegation defaults to; absent fields inherit. */
-  workerExecution: z.object({
-    providerId: z.string().optional(),
-    model: z.string().optional(),
-    reasoningLevel: z.enum(REASONING_LEVELS).optional(),
-    permissionMode: z.enum(PERMISSION_MODES).optional(),
-  }),
+  workerExecution: workerExecutionSchema,
 });
 
 /** The shape every RPC call returns; the schema above owns it. */
@@ -161,6 +167,11 @@ export const rpcContract = defineRpcContract({
   set_default: {
     input: z.object({ enabled: z.boolean() }).strict(),
     output: z.object({ enabled: z.boolean() }),
+  },
+  get_worker_execution: { input: z.null(), output: workerExecutionSchema },
+  set_worker_execution: {
+    input: workerExecutionSchema.nullable(),
+    output: workerExecutionSchema,
   },
   clear_violations: {
     input: z.object({ threadId: z.string().min(1).max(120) }).strict(),
@@ -239,6 +250,7 @@ interface WorkerExecutionSources {
   providerId?: ExecutionSource;
   model?: ExecutionSource;
   reasoningLevel?: ExecutionSource;
+  serviceTier?: ExecutionSource;
   permissionMode?: ExecutionSource;
 }
 
@@ -252,6 +264,7 @@ function executionSources(exec: WorkerExecution): WorkerExecutionSources {
     ...(exec.providerId === undefined ? {} : { providerId: "explicit" as const }),
     ...(exec.model === undefined ? {} : { model: "explicit" as const }),
     ...(exec.reasoningLevel === undefined ? {} : { reasoningLevel: "explicit" as const }),
+    ...(exec.serviceTier === undefined ? {} : { serviceTier: "explicit" as const }),
     ...(exec.permissionMode === undefined ? {} : { permissionMode: "explicit" as const }),
   };
 }
@@ -286,38 +299,6 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Maximum corrective nudges per thread",
       description: "Violations keep being recorded after the cap is reached.",
       default: 3,
-    },
-    workerProviderId: {
-      type: "select",
-      label: "Worker provider",
-      description:
-        "Provider every delegated worker is spawned on, chosen from the providers this machine offers. `inherit` uses the project's remembered provider.",
-      options: [INHERIT, ...catalog.providers],
-      default: INHERIT,
-    },
-    workerModel: {
-      type: "select",
-      label: "Worker model",
-      description:
-        "Model every delegated worker is spawned on, chosen from the models the provider catalog offers. `inherit` uses the project's remembered model. A single delegation may override it.",
-      options: [INHERIT, ...catalog.models.map((model) => model.id)],
-      default: INHERIT,
-    },
-    workerReasoningLevel: {
-      type: "select",
-      label: "Worker reasoning level",
-      description:
-        "Reasoning level for delegated workers. `inherit` uses the project's remembered level.",
-      options: [INHERIT, ...REASONING_LEVELS],
-      default: INHERIT,
-    },
-    workerPermissionMode: {
-      type: "select",
-      label: "Worker permission mode",
-      description:
-        "Permission mode for delegated workers — `full` lets them act without asking. `inherit` uses the project's remembered mode.",
-      options: [INHERIT, ...PERMISSION_MODES],
-      default: INHERIT,
     },
   } satisfies Record<string, PluginSettingDescriptor>;
 
@@ -356,18 +337,18 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
-   * Resolve one select. `inherit` (and a blank) means "do not set it"; a value
-   * the live catalog no longer lists is dropped with a warning rather than
-   * spawned, because the pickers only offer catalog ids: this means the
-   * provider's models changed under a stored setting, and a worker on the
-   * project's own default beats one whose start fails.
+   * Resolve one stored id. A blank one means "not set"; a value the live
+   * catalog no longer lists is dropped with a warning rather than spawned,
+   * because both writers (the settings section and the CLI) choose from the
+   * catalog: this means the provider's models changed under a saved choice, and
+   * a worker on the project's own default beats one whose start fails.
    */
   function workerChoice(
     value: string | undefined,
     options: readonly string[],
     setting: string,
   ): string | undefined {
-    if (value === undefined || value === "" || value === INHERIT) return undefined;
+    if (value === undefined || value === "") return undefined;
     if (options.length > 0 && !options.includes(value)) {
       bb.log.warn(`${setting} "${value}" is not in the current catalog; ignoring it`);
       return undefined;
@@ -400,20 +381,33 @@ export default async function plugin(bb: BbPluginApi) {
     live.allowReadCommands = values.allowReadCommands !== false;
     const nudges = Number(values.maxNudges);
     live.maxNudges = Number.isFinite(nudges) && nudges >= 0 ? Math.floor(nudges) : 3;
-    const providerId = workerChoice(values.workerProviderId, catalog.providers, "workerProviderId");
-    const model = workerChoice(
-      values.workerModel,
-      catalog.models.map((option) => option.id),
-      "workerModel",
+  }
+
+  /**
+   * The stored worker execution, with any id the live catalog no longer lists
+   * dropped. The store is written by this plugin's own surfaces, so an unknown
+   * id means a provider's models changed under a saved choice.
+   */
+  function storedWorkerExecution(stored: unknown): WorkerExecution {
+    if (stored === null || typeof stored !== "object") return {};
+    const record = stored as Record<string, unknown>;
+    const providerId = workerChoice(
+      typeof record.providerId === "string" ? record.providerId : undefined,
+      catalog.providers,
+      "worker provider",
     );
-    live.worker = reconcile({
+    const model = workerChoice(
+      typeof record.model === "string" ? record.model : undefined,
+      catalog.models.map((option) => option.id),
+      "worker model",
+    );
+    return reconcile({
       ...(providerId === undefined ? {} : { providerId }),
       ...(model === undefined ? {} : { model }),
-      ...(isReasoningLevel(values.workerReasoningLevel)
-        ? { reasoningLevel: values.workerReasoningLevel }
-        : {}),
-      ...(isPermissionMode(values.workerPermissionMode)
-        ? { permissionMode: values.workerPermissionMode }
+      ...(isReasoningLevel(record.reasoningLevel) ? { reasoningLevel: record.reasoningLevel } : {}),
+      ...(isServiceTier(record.serviceTier) ? { serviceTier: record.serviceTier } : {}),
+      ...(isPermissionMode(record.permissionMode)
+        ? { permissionMode: record.permissionMode }
         : {}),
     });
   }
@@ -469,7 +463,29 @@ export default async function plugin(bb: BbPluginApi) {
     return enabled;
   }
 
+  /**
+   * Replace the stored worker execution. `null` clears it, leaving every
+   * delegation on the project's remembered defaults. A record must name both a
+   * provider and a model — the settings section renders them with BB's picker,
+   * which resolves the pair against the live catalog, and every id it cannot
+   * serve is refused here rather than spawned.
+   */
+  async function setWorkerExecution(next: WorkerExecution | null): Promise<WorkerExecution> {
+    if (next !== null) {
+      if (next.providerId === undefined || next.model === undefined) {
+        throw new Error("A worker execution needs both a provider and a model.");
+      }
+      assertInCatalog(next);
+    }
+    const stored = next === null ? {} : reconcile(next);
+    await bb.storage.kv.set(WORKER_KEY, stored);
+    live.worker = stored;
+    bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
+    return stored;
+  }
+
   applySettings(await settings.get());
+  live.worker = storedWorkerExecution(await bb.storage.kv.get<unknown>(WORKER_KEY));
   {
     const stored = await bb.storage.kv.get<{ enabledAtMs?: unknown }>(DEFAULT_KEY);
     const storedAt =
@@ -1127,6 +1143,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
     get_default: async () => ({ enabled: live.defaultForNewThreads }),
     set_default: async ({ enabled }) => ({ enabled: await setDefault(enabled) }),
+    get_worker_execution: async () => workerDefaults(),
+    set_worker_execution: async (next) => setWorkerExecution(next),
     clear_violations: async ({ threadId }) => {
       const state = await clearViolations(threadId);
       return toDto(threadId, state);
@@ -1169,6 +1187,7 @@ export default async function plugin(bb: BbPluginApi) {
       exec.providerId === undefined ? null : `provider ${exec.providerId}`,
       exec.model === undefined ? null : `model ${exec.model}`,
       exec.reasoningLevel === undefined ? null : `reasoning ${exec.reasoningLevel}`,
+      exec.serviceTier === undefined ? null : `tier ${exec.serviceTier}`,
       exec.permissionMode === undefined ? null : `permission ${exec.permissionMode}`,
     ].filter((part): part is string => part !== null);
     return parts.length === 0 ? "project default (no worker override)" : parts.join(", ");
@@ -1292,6 +1311,62 @@ export default async function plugin(bb: BbPluginApi) {
             await setDefault(enabled);
             return render(input.options.json, { enabled }, 
               `New threads start in orchestrator mode: ${enabled ? "yes" : "no"}`);
+          },
+        }),
+        worker: cliCommand({
+          summary: "Show or set the execution every delegated worker defaults to",
+          options: {
+            clear: { type: "boolean", description: "Clear it, so workers inherit again" },
+            provider: { type: "string", description: "Provider id, from `bb provider list`" },
+            model: {
+              type: "string",
+              description: "Model id, from `bb provider models <provider>`",
+            },
+            reasoning: {
+              type: "enum",
+              values: [...REASONING_LEVELS],
+              description: "Reasoning level for workers",
+            },
+            tier: {
+              type: "enum",
+              values: [...SERVICE_TIERS],
+              description: "Service tier for workers",
+            },
+            permission: {
+              type: "enum",
+              values: [...PERMISSION_MODES],
+              description: "Permission mode for workers",
+            },
+            json: { type: "boolean", description: "Emit machine-readable JSON" },
+          },
+          async run(input) {
+            const chosen = {
+              ...(input.options.provider === undefined ? {} : { providerId: input.options.provider }),
+              ...(input.options.model === undefined ? {} : { model: input.options.model }),
+              ...(input.options.reasoning === undefined
+                ? {}
+                : { reasoningLevel: input.options.reasoning as ReasoningLevel }),
+              ...(input.options.tier === undefined
+                ? {}
+                : { serviceTier: input.options.tier as ServiceTier }),
+              ...(input.options.permission === undefined
+                ? {}
+                : { permissionMode: input.options.permission as PermissionMode }),
+            };
+            const clearing = input.options.clear === true;
+            if (!clearing && Object.keys(chosen).length === 0) {
+              return render(
+                input.options.json,
+                workerDefaults(),
+                `Workers run as: ${describeWorkerExecution(workerDefaults())}`,
+              );
+            }
+            const stored = await setWorkerExecution(clearing ? null : chosen);
+            return render(
+              input.options.json,
+              stored,
+              `Workers run as: ${describeWorkerExecution(stored)}`,
+            );
           },
         }),
       },

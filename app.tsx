@@ -19,10 +19,13 @@
 import { useCallback, useEffect, useReducer, useState } from "react";
 import {
   definePluginApp,
+  experimental_PermissionModePicker as PermissionModePicker,
+  experimental_ProviderModelPicker as ProviderModelPicker,
   useComposer,
   useComposerView,
   useRealtime,
   useRpc,
+  useSdk,
   type ComposerView,
   type PluginComposerScope,
 } from "@get-bb/plugin-sdk/app";
@@ -60,6 +63,39 @@ interface OrchestratorState {
   defaultForNewThreads: boolean;
   allowReadCommands: boolean;
   maxNudges: number;
+}
+
+/** Mirrors the SDK's own unions; the pickers take the SDK's types, not these. */
+type ReasoningLevelDto =
+  | "none"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max"
+  | "ultra"
+  | "ultracode";
+type ServiceTierDto = "default" | "fast";
+type PermissionModeDto = "auto" | "accept-edits" | "full";
+
+/**
+ * What every delegation will ask for. An absent field is inherited from the
+ * project, not "unset": `{}` means workers follow the project's own execution.
+ */
+interface WorkerExecutionDto {
+  providerId?: string;
+  model?: string;
+  reasoningLevel?: ReasoningLevelDto;
+  serviceTier?: ServiceTierDto;
+  permissionMode?: PermissionModeDto;
+}
+
+/** The SDK's value shape for the provider/model picker. */
+interface ExecutionSelection {
+  providerId: string;
+  model: string;
+  reasoningLevel: ReasoningLevelDto;
+  serviceTier?: ServiceTierDto;
 }
 
 /** The mutable handle every surface in one composer shares. */
@@ -312,7 +348,152 @@ function OrchestratorToggle() {
   );
 }
 
+/**
+ * The Settings → Installed plugins → Orchestrator Mode surface.
+ *
+ * Worker execution is not a plugin setting: the model list has to follow the
+ * chosen provider, and a `select` cannot depend on another `select`. BB's own
+ * provider/model picker resolves provider, model, reasoning level and service
+ * tier against the live catalog as one coherent value — the same value
+ * `threads.spawn` takes — so the choice is stored through this plugin's RPC and
+ * rendered with that picker.
+ */
+function WorkerExecutionSettings() {
+  const rpc = useRpc<typeof rpcContract>();
+  const sdk = useSdk();
+  const [stored, setStored] = useState<WorkerExecutionDto | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setStored(await rpc.call("get_worker_execution"));
+    } catch {
+      // Keep whatever is on screen; every write reports its own failure.
+    } finally {
+      setLoading(false);
+    }
+  }, [rpc]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+  useRealtime("orchestrator-state", () => {
+    void load();
+  });
+
+  const save = useCallback(
+    async (next: WorkerExecutionDto | null) => {
+      setBusy(true);
+      try {
+        setStored(await rpc.call("set_worker_execution", next));
+      } catch (cause) {
+        toast.error(message(cause));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [rpc],
+  );
+
+  const configured = stored !== null && stored.providerId !== undefined && stored.model !== undefined;
+
+  /**
+   * Start from this machine's catalog default, so every field the picker shows
+   * is one the provider it names can actually serve.
+   */
+  const choose = useCallback(async () => {
+    setBusy(true);
+    try {
+      const system = await sdk.providers.models();
+      const provider = system.providers.find((entry) => entry.available);
+      if (provider === undefined) throw new Error("No provider is available on this machine.");
+      const listed = await sdk.providers.models({ providerId: provider.id });
+      const model = listed.models.find((entry) => entry.isDefault) ?? listed.models[0];
+      if (model === undefined) throw new Error(`${provider.id} offers no models.`);
+      setStored(
+        await rpc.call("set_worker_execution", {
+          providerId: provider.id,
+          model: model.id,
+          reasoningLevel: model.defaultReasoningEffort,
+          permissionMode: system.permissionCeiling,
+        }),
+      );
+    } catch (cause) {
+      toast.error(message(cause));
+    } finally {
+      setBusy(false);
+    }
+  }, [rpc, sdk]);
+
+  return (
+    <div className="rounded-md border border-border bg-surface-recessed/70 p-3">
+      <div className="flex items-start justify-between gap-6">
+        <div className="min-w-0">
+          <div className="text-sm font-medium">Give workers their own execution</div>
+          <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
+            {configured
+              ? "Workers start on the provider and model below. A delegation can still override them."
+              : "Delegated workers inherit this project's remembered provider and model."}
+          </p>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          className="shrink-0"
+          disabled={loading || busy}
+          onClick={() => void (configured ? save(null) : choose())}
+        >
+          {configured ? "Reset to project default" : "Choose provider and model"}
+        </Button>
+      </div>
+
+      {configured ? (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <ProviderModelPicker
+            value={selectionOf(stored)}
+            disabled={busy}
+            className="h-8 max-w-full"
+            onChange={(next) =>
+              void save({
+                ...next,
+                ...(stored.permissionMode === undefined
+                  ? {}
+                  : { permissionMode: stored.permissionMode }),
+              })
+            }
+          />
+          <PermissionModePicker
+            providerId={stored.providerId!}
+            value={stored.permissionMode ?? "full"}
+            disabled={busy}
+            className="h-8 shrink-0"
+            onChange={(permissionMode) => void save({ ...stored, permissionMode })}
+          />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** The picker's own value shape, filled from what is stored. */
+function selectionOf(stored: WorkerExecutionDto): ExecutionSelection {
+  return {
+    providerId: stored.providerId!,
+    model: stored.model!,
+    reasoningLevel: stored.reasoningLevel ?? "medium",
+    ...(stored.serviceTier === undefined ? {} : { serviceTier: stored.serviceTier }),
+  };
+}
+
 export default definePluginApp((app) => {
+  app.slots.settingsSection({
+    id: "worker-execution",
+    title: "Worker execution",
+    description: "What every delegated worker thread runs on.",
+    component: WorkerExecutionSettings,
+  });
+
   app.composer.customize({
     id: "orchestrator-mode",
     scopes: ["thread", "new-thread"],
