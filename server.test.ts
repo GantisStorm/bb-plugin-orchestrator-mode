@@ -77,6 +77,7 @@ async function load(
   settings: Record<string, PluginSettingValue> = {},
   seedState?: Record<string, unknown>,
   catalog: ProviderCatalogFixture = {},
+  seedKv?: Record<string, unknown>,
 ): Promise<{ bb: BbPluginApi; harness: FakePluginHarness }> {
   const providers = catalog.providers ?? [{ id: "acp-omp", available: true }];
   const modelsByProvider = catalog.models ?? {
@@ -155,6 +156,9 @@ async function load(
   });
   if (seedState !== undefined) {
     await host.bb.storage.kv.set("state", seedState);
+  }
+  for (const [key, value] of Object.entries(seedKv ?? {})) {
+    await host.bb.storage.kv.set(key, value);
   }
   await plugin(host.bb);
   // Loading reads the provider catalog once. No test asserts on that, and every
@@ -670,13 +674,9 @@ describe("the delegation tool", () => {
     expect(spawned[0]).not.toHaveProperty("executionInputSources");
   });
 
-  it("treats the inherit choices as no override", async () => {
-    const { harness } = await load({
-      workerProviderId: "inherit",
-      workerModel: "inherit",
-      workerReasoningLevel: "inherit",
-      workerPermissionMode: "inherit",
-    });
+  it("leaves workers inherited until an execution is stored", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    expect(await harness.behavior.callRpc("get_worker_execution", null)).toEqual({});
     await enable(harness);
     await harness.behavior.callAgentTool(
       DELEGATE_TOOL,
@@ -686,17 +686,15 @@ describe("the delegation tool", () => {
     expect(spawned[0]).not.toHaveProperty("executionInputSources");
   });
 
-  it("spawns workers on the configured execution, stamped as caller-chosen", async () => {
-    const { harness } = await load(
-      {
-        workerProviderId: "acp-omp",
-        workerModel: "command-code/deepseek/deepseek-v4.1-flash-fast",
-        workerReasoningLevel: "high",
-        workerPermissionMode: "full",
-      },
-      undefined,
-      CATALOG,
-    );
+  it("spawns workers on the stored execution, stamped as caller-chosen", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      reasoningLevel: "high",
+      serviceTier: "fast",
+      permissionMode: "full",
+    });
     await enable(harness);
     await harness.behavior.callAgentTool(
       DELEGATE_TOOL,
@@ -719,24 +717,53 @@ describe("the delegation tool", () => {
     });
   });
 
-  it("drops a configured model the catalog no longer offers", async () => {
-    const { harness } = await load({ workerModel: "command-code/retired/model" }, undefined, CATALOG);
+  it("refuses storing a provider the catalog does not offer", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await expect(
+      harness.behavior.callRpc("set_worker_execution", {
+        providerId: "gone-provider",
+        model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      }),
+    ).rejects.toThrow(/Unknown worker provider "gone-provider"/);
+    expect(await harness.behavior.callRpc("get_worker_execution", null)).toEqual({});
+  });
+
+  it("refuses a stored execution that names no model", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await expect(
+      harness.behavior.callRpc("set_worker_execution", { providerId: "acp-omp" }),
+    ).rejects.toThrow(/needs both a provider and a model/);
+  });
+
+  it("drops a stored model the catalog no longer offers", async () => {
+    // Seeded straight into the store, as an older build with a wider catalog
+    // would have left it.
+    const { harness } = await load({}, undefined, CATALOG, {
+      worker: { providerId: "acp-omp", model: "command-code/retired/model" },
+    });
+    expect(await harness.behavior.callRpc("get_worker_execution", null)).toEqual({
+      providerId: "acp-omp",
+    });
     await enable(harness);
     await harness.behavior.callAgentTool(
       DELEGATE_TOOL,
       { task: "Do it", waitForResult: false },
       { threadId: THREAD, projectId: "proj_1" },
     );
+    // The model is gone, the provider that served it survives.
+    expect(spawned[0]).toMatchObject({
+      providerId: "acp-omp",
+      executionInputSources: { providerId: "explicit" },
+    });
     expect(spawned[0]).not.toHaveProperty("model");
-    expect(spawned[0]).not.toHaveProperty("executionInputSources");
   });
 
-  it("lets one delegation override the configured worker execution", async () => {
-    const { harness } = await load(
-      { workerModel: "command-code/deepseek/deepseek-v4.1-flash-fast" },
-      undefined,
-      CATALOG,
-    );
+  it("lets one delegation override the stored worker execution", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+    });
     await enable(harness);
     await harness.behavior.callAgentTool(
       DELEGATE_TOOL,

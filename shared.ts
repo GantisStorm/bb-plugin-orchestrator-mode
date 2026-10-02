@@ -65,6 +65,10 @@ export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 export const PERMISSION_MODES = ["auto", "accept-edits", "full"] as const;
 export type PermissionMode = (typeof PERMISSION_MODES)[number];
 
+/** The service tiers a spawn accepts, mirroring the SDK's `ServiceTier`. */
+export const SERVICE_TIERS = ["default", "fast"] as const;
+export type ServiceTier = (typeof SERVICE_TIERS)[number];
+
 export function isReasoningLevel(value: unknown): value is ReasoningLevel {
   return (
     typeof value === "string" &&
@@ -76,6 +80,13 @@ export function isPermissionMode(value: unknown): value is PermissionMode {
   return (
     typeof value === "string" &&
     (PERMISSION_MODES as readonly string[]).includes(value)
+  );
+}
+
+export function isServiceTier(value: unknown): value is ServiceTier {
+  return (
+    typeof value === "string" &&
+    (SERVICE_TIERS as readonly string[]).includes(value)
   );
 }
 
@@ -93,6 +104,7 @@ export interface WorkerExecution {
   providerId?: string;
   model?: string;
   reasoningLevel?: ReasoningLevel;
+  serviceTier?: ServiceTier;
   permissionMode?: PermissionMode;
 }
 
@@ -519,6 +531,7 @@ export function workerBudget(execution: WorkerExecution | undefined): string {
     exec.reasoningLevel === undefined
       ? null
       : `reasoning \`${exec.reasoningLevel}\``,
+    exec.serviceTier === undefined ? null : `tier \`${exec.serviceTier}\``,
     exec.permissionMode === undefined
       ? null
       : `permission mode \`${exec.permissionMode}\``,

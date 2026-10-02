@@ -8,15 +8,19 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ### Added
 
-- **Worker execution control.** `workerProviderId`, `workerModel`,
-  `workerReasoningLevel` and `workerPermissionMode` settings, and matching
+- **Worker execution control.** A **Worker execution** settings section with a
+  switch that opens BB's own provider and model picker, plus matching
   `provider`, `model`, `reasoning` and `permissionMode` arguments on
-  `orchestrator_delegate`, so each worker thread can run on a chosen model and
-  permission mode instead of inheriting the project default. Provider and model
-  options are read from `bb.sdk.providers` — the same catalog the new-thread
-  composer's pickers use — and every requested field is stamped in
-  `threads.spawn`'s `executionInputSources`, without which the server drops it.
-  A model the catalog does not offer is refused with the available ids named.
+  `orchestrator_delegate`, so a worker thread can run on a chosen model and
+  permission mode instead of inheriting the project default. Picking a provider
+  scopes the model list to that provider, and one pick resolves provider, model,
+  reasoning level and service tier as a single value — the same value
+  `threads.spawn` takes, which is why the choice is stored by the plugin rather
+  than as a settings `select` whose options cannot depend on another. Every
+  requested field is stamped in `threads.spawn`'s `executionInputSources`,
+  without which the server drops it and re-derives the project defaults. A model
+  the catalog does not offer is refused with the available ids named.
+- `bb orchestrator-mode worker` shows, sets and clears the stored execution.
 - `bb provider list` and `bb provider models` count as read-only commands, so an
   orchestrator can discover valid worker ids.
 - `bb orchestrator-mode status` reports the execution delegations default to.
