@@ -68,6 +68,18 @@ integer range 10–3,600) and `hidden` (default `false`). A timeout or
 `waitForResult: false` leaves the worker running; inspect that worker later
 and review its result.
 
+## Choosing the worker's execution
+
+Workers run on the model and permission mode the plugin's worker settings name,
+falling back to this project's remembered defaults. Override them for one unit
+with `provider`, `model`, `reasoning` and `permissionMode` — a stronger model
+for a hard unit, a cheaper one for a mechanical unit. Valid ids come from
+`bb provider list` and `bb provider models <provider>`, both read-only. A model
+the catalog does not offer is refused with the available ids named, so pass a
+model you have seen there rather than guessing.
+
+
+
 The default corrective-message cap is three per enablement. Recording and
 block-mode stops continue after the cap. Clearing violations or disabling the
 thread resets correction counters.

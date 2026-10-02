@@ -78,6 +78,10 @@ The `orchestrator_delegate` tool creates a child thread from a self-contained
 brief and can wait for its result. Workers use the parent's environment and
 appear in the sidebar unless you request a hidden worker.
 
+You choose their provider and model — from BB's own provider catalog — in the
+plugin settings, or per delegation in the tool call. See
+[Worker execution](#worker-execution).
+
 </td>
 </tr>
 <tr>
@@ -164,6 +168,48 @@ flowchart TD
 The [design notes](docs/DESIGN.md) cover classification, retained state and
 session timing in more detail.
 
+## Worker execution
+
+Workers run on the project's remembered provider and model unless you pick
+different ones. **Settings → Installed plugins → Orchestrator Mode** offers:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `workerProviderId` | `inherit` | Provider every delegated worker is spawned on, listed from the providers this machine offers. |
+| `workerModel` | `inherit` | Model every delegated worker is spawned on, listed from the provider catalog. |
+| `workerReasoningLevel` | `inherit` | Reasoning level for delegated workers. |
+| `workerPermissionMode` | `inherit` | Permission mode for delegated workers; `full` lets them act without asking. |
+
+The provider and model lists come from the same `bb.sdk.providers` catalog BB's
+own new-thread pickers read, so a worker runs on something you can also select
+when starting a thread by hand. Each list has an `inherit` entry that leaves
+that field to the project's remembered default.
+
+Tool arguments override the settings for one delegation:
+
+```json
+{
+  "task": "Rebuild the index and report timings",
+  "model": "claude-opus-5-5",
+  "reasoning": "high",
+  "permissionMode": "full"
+}
+```
+
+Give the hard units a stronger model and the mechanical ones a cheaper one. The
+orchestrator discovers valid IDs with `bb provider list` and
+`bb provider models <provider>`; both count as read-only orientation. An ID the
+catalog does not offer is refused, naming the options that are available, rather
+than spawning a worker whose start cannot succeed. A model and a provider that
+disagree resolve to the model: a model belongs to one provider, so the provider
+that serves it wins and the mismatch is logged.
+
+**Provider support:** changing a worker's model needs the target provider to
+switch models at session start. `codex` and `claude-code` do. The `acp-omp`
+provider answers an ACP `session/set_model` call with *Unknown ACP ext method*,
+so asking for any model other than the one it already runs fails that worker's
+start — leave the worker model on `inherit` when delegating to `acp-omp`.
+
 ## Enforcement limits
 
 - **Detection follows the action.** BB exposes no pre-tool-call veto. `block`
@@ -202,12 +248,14 @@ ordinary terminal, provide a thread ID for thread commands.
 </details>
 
 **Agent tool:**
-`orchestrator_delegate({ task, title?, waitForResult?, timeoutSeconds?, hidden? })`.
+`orchestrator_delegate({ task, title?, waitForResult?, timeoutSeconds?, hidden?, provider?, model?, reasoning?, permissionMode? })`.
 The brief is required and limited to 20,000 characters; the title is limited to
 200. Waiting defaults to `true`, with a 900-second timeout (range 10–3,600).
 `hidden` defaults to `false`. A timeout returns the worker's status and leaves it
-running. The bundled [skill](skills/orchestrator-mode/SKILL.md) explains the mode,
-delegation and CLI; enabled sessions receive the contract directly.
+running. The four execution arguments are optional and fall back to the
+[worker execution](#worker-execution) settings, then the project defaults. The
+bundled [skill](skills/orchestrator-mode/SKILL.md) explains the mode, delegation
+and CLI; enabled sessions receive the contract directly.
 
 ## Settings
 
@@ -223,6 +271,10 @@ Orchestrator Mode**.
 | `enforcement` | `guard` | `instruct`: contract only. `guard`: record and correct. `block`: also stop. A thread override takes precedence. |
 | `allowReadCommands` | `true` | Treat recognised read-only shell commands as exploration; when off, all commands count as work. |
 | `maxNudges` | `3` | Corrective messages per enablement; non-negative numbers are rounded down. `0` disables nudges. Recording and `block` stops continue after the cap. |
+| `workerProviderId` | `inherit` | Provider every delegated worker is spawned on, listed from this machine's providers. |
+| `workerModel` | `inherit` | Model every delegated worker is spawned on, listed from the provider catalog. |
+| `workerReasoningLevel` | `inherit` | Reasoning level for delegated workers. |
+| `workerPermissionMode` | `inherit` | Permission mode for delegated workers. |
 
 Re-enabling an already enabled thread preserves its nudge count. Disabling it
 or clearing violations resets the correction counters.
