@@ -256,6 +256,107 @@ describe("read-only command detection", () => {
   }
 });
 
+// Every case below is a defect that the oracle fuzzer (a real `/bin/bash` run
+// in a sandbox, against a PATH holding only the read-only allowlist) found and
+// reproduced: the "refuses" side wrote a file or ran a program off the
+// allowlist while the classifier called it read-only, and the "allows" side
+// confirms the fix did not over-reach. The fuzzer is a fuzzing tool, not a
+// test; these are the cases it pinned.
+describe("read-only classifier soundness (oracle-found defects)", () => {
+  const cases: Array<[string, boolean]> = [
+    // A writer flag the table did not name: `tree -o <file> FILE` writes the file.
+    ["tree -o out.txt .", false],
+    ["tree -oout.txt .", false],
+    ["tree --output=out.txt .", false],
+    // `file -C -m <magic>` compiles the magic file and writes `magic.mgc`.
+    ["file -C -m mgc", false],
+    ["file --compile -m mgc", false],
+    ["file -c -m mgc", true],
+    // `less -o`/`-O`/`--log-file` write a log; `+!cmd` runs a shell command.
+    ["less -o out.txt canary.txt", false],
+    ["less -O out.txt canary.txt", false],
+    ["less --log-file=out.txt canary.txt", false],
+    ["less --save-marks canary.txt", false],
+    ["less +!rm canary.txt canary.txt", false],
+    ["less +F canary.txt", true],
+    // `--pager` runs whatever it names, for `bat` and `ag`.
+    ["bat --pager 'rm -rf x' --paging=always canary.txt", false],
+    ["bat --pager=rm canary.txt", false],
+    ["ag --pager 'rm -rf x' keep .", false],
+    // A value attached to a value-taking short flag is the same request.
+    ["date -s2020-01-01", false],
+    ["date --set=2020-01-01", false],
+    ["date 010112002020", false],
+    ["date -Iseconds", true],
+    ["hostname pwned", false],
+    ["hostname -s 2>&1", true],
+    ["yq -i '.a = 1' f.yaml", false],
+    ["yq -i'.a=1' f.yaml", false],
+    ["yq --inplace=.a=1 f.yaml", false],
+    // Quoting a flag is not changing it: the shell hands over the same word.
+    ["find . '-delete'", false],
+    ['find . "-exec" rm {} +', false],
+    ["find '--delete' .", false],
+    ["fd '--exec=rm'", false],
+    ["fd -xrm", false],
+    ["rg '--pre=cat' pattern", false],
+    ["git diff '--output=out.patch'", false],
+    ['git diff "--output" out.patch', false],
+    ["tree '-o out.txt' .", false],
+    // `--help` only reports for a program the classifier models, and only for a
+    // Git subcommand whose writer form does not run first.
+    ["unknown-tool --help", false],
+    ["foo --version", false],
+    ["rm -rf x --help", false],
+    ["find . -delete --help", false],
+    ["git config --global user.email x --help", false],
+    ["git commit --help", true],
+    ["bb plugin new --help", true],
+    // A comment does not remove the command before it.
+    ["rm canary.txt # --help", false],
+    ["find . -delete # --help", false],
+    ["ls # rm canary.txt", true],
+    // `env -S`/`--split-string` carries a whole command line, not an argument.
+    ["env -S 'sh'", false],
+    ["env -S 'rm'", false],
+    ['env --split-string="rm canary.txt"', false],
+    ["env -S 'ls -la'", true],
+    ["env FOO=bar ls 2>&1", true],
+    // Command substitution runs inside double quotes too.
+    ['find . -name "$(touch CANARY)"', false],
+    ['cat "$(rm canary.txt)"', false],
+    ["echo '$(rm canary.txt)'", true],
+    // An escaped quote must not desynchronise the quote state: `\" ;` still
+    // separates, and `$'\\''` is one word.
+    ['echo \\" ; rm canary.txt', false],
+    ["printf $'\\'' ; rm canary.txt", false],
+    ['echo "a\\" ; rm canary.txt"', true],
+    ["echo \\; rm canary.txt", true],
+    // A leading assignment that names a program another command runs: `PATH=`
+    // changes which `ls` runs, and the pager/editor/diff variables are commands.
+    ["PATH=/nonexistent ls", false],
+    ["PAGER='rm canary.txt' git log", false],
+    ["GIT_EXTERNAL_DIFF='touch CANARY' git diff", false],
+    ["LD_PRELOAD=./evil.so ls", false],
+    ["GIT_DIR=/nonexistent git status", false],
+    ["FOO=bar ls", true],
+    // A heredoc delimiter may be backslash-quoted, and the terminator is the
+    // unquoted word: `<<\\EOF` ends at `EOF`, so the lines after the real
+    // terminator still run. This one deleted a file while reading as read-only.
+    ["cat <<\\EOF\nEOF\nrm canary.txt\nE\necho done", false],
+    ["cat <<\\EOF\nrm canary.txt\nEOF", true],
+    // A file-descriptor redirect is not an argument to the program.
+    ["hostname -f 2>&1", true],
+    ["hostname pwned 2>&1", false],
+    ["ls -la 2>&1", true],
+  ];
+  for (const [command, readOnly] of cases) {
+    it(`${readOnly ? "allows" : "refuses"} \`${command}\``, () => {
+      expect(isReadOnlyCommand(command)).toBe(readOnly);
+    });
+  }
+});
+
 describe("direct-work classification", () => {
   it("flags a file change", () => {
     const violation = classifyRow(

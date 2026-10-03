@@ -8,6 +8,35 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ### Fixed
 
+- The read-only classifier is sound before permissive. A line is now only
+  read-only when every program in it is one the module models and no argument
+  can make it write, because a missed work act is the harm the watchdog exists
+  to prevent. Closed against a real-`bash` oracle: `--help`/`--version` no
+  longer launder a program the module does not know or a flag that writes
+  (`unknown-tool --help`, `rm -rf x --help`, `find . -delete --help`);
+  `--help` cannot stand in for the read check on the mixed `git` subcommands
+  (`git config --global user.email x --help` writes first); the scanner tracks
+  backslash escapes and `$'...'` quoting, so `echo \" ; rm x` no longer hides
+  the command after the escaped quote; command substitution inside double
+  quotes is caught (`find . -name "$(touch x)"`); a heredoc delimiter read with
+  backslash quoting is bounded correctly (`cat <<\EOF` ends at `EOF`, so the
+  lines past the real terminator are still judged); quoted flags are still
+  flags (`find . '-delete'`, `git diff '--output=pat.ch'`); value-attached and
+  clustered write flags are refused (`date -s2020`, `yq -i'.a=1'`,
+  `tree -oFILE`, `file --compile`, `fd -xrm`, `find --exec`); `tree -o`/
+  `--output`, `less -o`/`-O`/`--log-file`/`--save-marks`/`+!cmd` and
+  `bat`/`ag --pager` join the write table; `env -S`/`--split-string` is judged
+  as the command line it is (`env -S 'sh'` runs `sh`); a leading assignment
+  that names a program the shell or a tool runs later (`PATH`, `PAGER`,
+  `GIT_EXTERNAL_DIFF`, `EDITOR`, `LD_PRELOAD`, `GIT_DIR`, …) is work; and a
+  file-descriptor redirect is not an argument, so `hostname -f 2>&1` reads as
+  `hostname -f`. Measured on a 60,000-line generated corpus under real
+  `/bin/bash` with only the allowlist on `PATH`: 0 unsound read-only
+  classifications (3,062 for the previous classifier on the same lines), and
+  the accusation rate on genuinely read-only lines fell from 23.7% to 2.2%
+  because the same pass fixed pre-existing misreads of quoted words, escaped
+  separators, fd redirects and backslash-quoted heredocs. 66 regression cases
+  cover the defects.
 - A redirection's `&` is no longer a command separator: `ls 2>&1`, `git log >&2`
   and `ls 2>&-` are read-only again, while `&&` and a standalone `&` still
   separate, and a real redirect (`ls 2>&1 > out.txt`, `ls &> out.txt`) is still

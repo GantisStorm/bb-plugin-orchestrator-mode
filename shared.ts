@@ -304,39 +304,129 @@ function isCommandSeparator(text: string, index: number): boolean {
   return index !== 0;
 }
 
+/** Quote state of a shell word: none, `'...'`, `"..."`, or ANSI-C `$'...'`. */
+type QuoteState = "" | "'" | '"' | "ansi";
+
 /**
- * Walk a shell line once. `unquoted` is the text outside quotes, for the
- * metacharacter tests, and `segments` are the pieces between unquoted
- * separators, so `rg "a|b"` stays one command, a quoted `>` is not a redirect,
- * and the `&` in `ls 2>&1` does not cut the line in two.
+ * Walk a shell line once, tracking quotes and backslash escapes, and hand every
+ * character to `visit` with the facts both callers need: the quote state that
+ * governs it, whether it was written with a backslash, and whether it was
+ * syntax rather than content (a quote delimiter, a `$` that opens one, or the
+ * backslash itself). A backslash escapes the next character outside quotes and
+ * inside `"..."` and `$'...'`; inside `'...'` it is an ordinary character,
+ * exactly as the shell reads it. Without this, `echo \" ; rm x` desynchronises
+ * the quote state and a separator after an escaped quote looks like quoted
+ * text.
  */
-function scanCommandLine(text: string): { unquoted: string; segments: string[] } {
-  const segments: string[] = [];
-  let current = "";
-  let unquoted = "";
-  let quote = "";
+function walkShell(
+  text: string,
+  visit: (char: string, quote: QuoteState, escaped: boolean, delimiter: boolean, index: number) => void,
+): void {
+  let quote: QuoteState = "";
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index]!;
     if (quote !== "") {
-      current += char;
-      if (char === quote) quote = "";
+      if (char === "\\" && quote !== "'") {
+        visit(char, quote, false, true, index);
+        const next = text[index + 1];
+        if (next !== undefined) {
+          visit(next, quote, true, false, index + 1);
+          index += 1;
+        }
+        continue;
+      }
+      const closes = char === quote || (quote === "ansi" && char === "'");
+      visit(char, quote, false, closes, index);
+      if (closes) quote = "";
+      continue;
+    }
+    if (char === "\\") {
+      visit(char, "", false, true, index);
+      const next = text[index + 1];
+      if (next !== undefined) {
+        visit(next, "", true, false, index + 1);
+        index += 1;
+      }
+      continue;
+    }
+    // `$'...'` is ANSI-C quoting and `$"..."` behaves like `"..."`: both hold
+    // their content as one word, and both let a backslash escape a closing quote.
+    if (char === "$" && (text[index + 1] === "'" || text[index + 1] === '"')) {
+      visit(char, "", false, true, index);
+      visit(text[index + 1]!, "", false, true, index + 1);
+      quote = text[index + 1] === "'" ? "ansi" : '"';
+      index += 1;
       continue;
     }
     if (char === "'" || char === '"') {
+      visit(char, "", false, true, index);
       quote = char;
-      current += char;
       continue;
     }
-    unquoted += char;
-    if (isCommandSeparator(text, index)) {
+    visit(char, "", false, false, index);
+  }
+}
+
+/** Characters the shell treats as unquoted whitespace between words. */
+const WORD_BREAK = /[ \t]/;
+
+/**
+ * The words of one command, with quotes removed and escapes resolved the way
+ * the shell resolves them, so `find . '-delete'` and `tree "-o out.txt" .` hand
+ * their flags to the write-flag table as the single arguments they are.
+ */
+function shellWords(segment: string): string[] {
+  const words: string[] = [];
+  let word = "";
+  let started = false;
+  walkShell(segment, (char, quote, escaped, delimiter) => {
+    if (delimiter) {
+      // A quoted empty word is still a word: `''`.
+      started = true;
+      return;
+    }
+    if (quote === "" && !escaped && WORD_BREAK.test(char)) {
+      if (started) words.push(word);
+      word = "";
+      started = false;
+      return;
+    }
+    word += char;
+    started = true;
+  });
+  if (started) words.push(word);
+  return words;
+}
+
+/**
+ * Walk a shell line once. `unquoted` is the text outside quotes, for the
+ * word-level metacharacter tests, `live` is the text the shell would run an
+ * expansion in — everything except single-quoted and `$'...'` content, because
+ * a command substitution runs inside `"..."` too — and `segments` are the
+ * pieces between unquoted separators, so `rg "a|b"` stays one command, a quoted
+ * `>` is not a redirect, and the `&` in `ls 2>&1` does not cut the line in two.
+ * Escaped characters count as unquoted on purpose: `\$(rm x)` still runs a
+ * subshell, so the conservative reading is the correct one.
+ */
+function scanCommandLine(text: string): { unquoted: string; live: string; segments: string[] } {
+  const segments: string[] = [];
+  let current = "";
+  let unquoted = "";
+  let live = "";
+  walkShell(text, (char, quote, escaped, _delimiter, index) => {
+    if (quote === "" || quote === '"') live += char;
+    // An escaped `\;` is a literal character, not a command separator.
+    if (quote === "" && !escaped && isCommandSeparator(text, index)) {
+      unquoted += char;
       segments.push(current);
       current = "";
-      continue;
+      return;
     }
     current += char;
-  }
+    if (quote === "") unquoted += char;
+  });
   segments.push(current);
-  return { unquoted, segments };
+  return { unquoted, live, segments };
 }
 
 /** Leading `FOO=bar` environment assignments before the actual program. */
@@ -503,24 +593,96 @@ const PLAUSIBLE_PROGRAMS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Flags that turn an otherwise read-only program into a writer or a runner, so
- * `find . -delete`, `fd -x rm`, `rg --pre <cmd>` and `yq -i` are not read as
- * searches. Only programs on the read-only list can appear here.
- *
- * Each pattern accepts the bare flag and its `=<value>` spelling, because
- * `rg --pre=cat`, `fd --exec=rm` and `fd -X=rm` are the same request as their
- * space-separated forms. `(?:=|$)` does both: the explicit `=`, or the end of
- * the token that a detached value leaves behind.
+ * A short option, or a cluster of them, that contains `letter` — `-o`, `-oFILE`
+ * and `-aofile` all count, while a long option does not.
  */
-const MUTATING_PROGRAM_FLAGS: Record<string, RegExp> = {
-  find: /^-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)(?:=|$)/,
-  fd: /^(?:-x|--exec|-X|--exec-batch)(?:=|$)/,
-  rg: /^--pre(?:=|$)/,
-  yq: /^(?:-i|--inplace|--in-place)(?:=|$)/,
-  date: /^(?:-s|--set)(?:=|$)/,
+function hasShortFlag(arg: string, letter: string): boolean {
+  return /^-[^-]/.test(arg) && arg.slice(1).includes(letter);
+}
+
+/**
+ * Flags that turn an otherwise read-only program into a writer or a runner, so
+ * `find . -delete`, `fd -x rm`, `rg --pre <cmd>`, `tree -o <file>`, `less -o`,
+ * `file -C` and `bat --pager <cmd>` are not read as searches. Only programs on
+ * the read-only list can appear here, and every predicate runs on the token
+ * with its quotes removed, because `find . '-delete'` deletes and
+ * `git diff '--output=out.patch'` writes: quoting a flag is not changing it.
+ *
+ * Each predicate accepts the detached, `=<value>`, value-attached and clustered
+ * spellings, since `rg --pre=cat`, `fd -X=rm`, `date -s2020` and `tree -oFILE`
+ * are the same request as their space-separated forms.
+ */
+const MUTATING_PROGRAM_FLAGS: Record<string, (arg: string) => boolean> = {
+  // BSD `find` accepts its actions with one or two leading dashes (`--exec`),
+  // and `-fprintFILE`/`-fprintf FILE` take the file the action writes.
+  find: (arg) => /^--?(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)(?:=|$)/.test(arg),
+  // `fd -x rm` and its attached `-xrm` are the same request.
+  fd: (arg) => /^(?:--exec|--exec-batch)(?:=|$)/.test(arg) || /^-[xX]/.test(arg),
+  rg: (arg) => /^--pre(?:=|$)/.test(arg),
+  yq: (arg) => /^--in-?place(?:=|$)/.test(arg) || hasShortFlag(arg, "i"),
+  // `date -s`/`date -s2020` sets the clock; on BSD a bare date operand does too.
+  date: (arg) => /^-s/.test(arg) || /^--set(?:=|$)/.test(arg) || /^\d{6,}$/.test(arg),
   // `hostname` prints on its own and sets the name when it is given one.
-  hostname: /^[^-]/,
+  hostname: (arg) => !arg.startsWith("-"),
+  // `tree -oFILE`, `file -C` (compile a magic file), `less -o` (log file) and
+  // `less +!cmd` (run a shell command), `bat`/`ag --pager <cmd>`.
+  tree: (arg) => arg === "--output" || arg.startsWith("--output=") || hasShortFlag(arg, "o"),
+  file: (arg) => arg === "--compile" || arg.startsWith("--compile=") || hasShortFlag(arg, "C"),
+  less: (arg) =>
+    /^--(?:log-file|LOG-FILE|save-marks)(?:=|$)/.test(arg) ||
+    /^\+[!|]/.test(arg) ||
+    hasShortFlag(arg, "o") ||
+    hasShortFlag(arg, "O"),
+  bat: (arg) => arg === "--pager" || arg.startsWith("--pager="),
+  ag: (arg) => arg === "--pager" || arg.startsWith("--pager="),
 };
+
+/**
+ * Environment variables that name a program something else will run, or move
+ * where a program looks for one. `FOO=bar ls` only sets an argument, but
+ * `PATH=/tmp ls` runs a different `ls`, `GIT_EXTERNAL_DIFF=x git diff` runs
+ * `x`, `BAT_PAGER=x bat` runs `x`, and `GIT_DIR=x git status` retargets a write.
+ */
+const ENV_COMMAND_VARIABLES: Record<string, true> = {
+  PATH: true,
+  PAGER: true,
+  GIT_PAGER: true,
+  BAT_PAGER: true,
+  MANPAGER: true,
+  LESS: true,
+  GIT_EXTERNAL_DIFF: true,
+  GIT_EDITOR: true,
+  GIT_SEQUENCE_EDITOR: true,
+  GIT_ASKPASS: true,
+  SSH_ASKPASS: true,
+  EDITOR: true,
+  VISUAL: true,
+  LD_PRELOAD: true,
+  LD_LIBRARY_PATH: true,
+  DYLD_INSERT_LIBRARIES: true,
+  DYLD_LIBRARY_PATH: true,
+  BASH_ENV: true,
+  ENV: true,
+  PERL5OPT: true,
+  NODE_OPTIONS: true,
+  PYTHONSTARTUP: true,
+  GIT_SSH: true,
+  GIT_SSH_COMMAND: true,
+  GIT_DIR: true,
+  GIT_WORK_TREE: true,
+  GIT_INDEX_FILE: true,
+  GIT_OBJECT_DIRECTORY: true,
+  GIT_CONFIG_GLOBAL: true,
+  GIT_CONFIG_SYSTEM: true,
+};
+
+/**
+ * A file-descriptor redirect token — `2>&1`, `>&2`, `2>&-`, `<`, `0<&3`. It is
+ * not an argument to the program, so `hostname -f 2>&1` is `hostname -f`.
+ * File-writing redirects (`>`, `>>`, `&>`) never reach here: the line-level
+ * check refuses them first.
+ */
+const FD_REDIRECT = /^(?:\d*[<>]&(?:-|\d+)|[<>]|\d+[<>])$/;
 
 /** A later token that reads as a lowercase English word rather than a shout. */
 const SENTENCE_WORD = /^[a-z][a-z'-]*$/;
@@ -660,6 +822,25 @@ function isReadOnlyGitSegment(rest: readonly string[]): boolean {
 }
 
 /**
+ * Git subcommands whose writer forms are flag-driven, so `--help` cannot be
+ * trusted to short-circuit them. `git config --global user.email x --help`
+ * resolves the config path, writes it, and only then reports.
+ */
+const GIT_MIXED_SUBCOMMANDS: Record<string, true> = {
+  config: true,
+  branch: true,
+  tag: true,
+  remote: true,
+  reflog: true,
+};
+
+/** Whether `--help` may stand in for the read check on this Git call. */
+function gitHelpIsSafe(rest: readonly string[]): boolean {
+  const { subcommand } = gitSubcommandAndArgs(rest);
+  return subcommand === undefined || GIT_MIXED_SUBCOMMANDS[subcommand] !== true;
+}
+
+/**
  * `bb` subcommands that only report, with no second token to check.
  * Deliberately short: `bb thread`, `bb plugin` and `bb workflows` can all start
  * work, and an orchestrator has `orchestrator_delegate` for that anyway.
@@ -703,68 +884,82 @@ const SHELL_WORD_BREAK = /[\s;&|()<>]/;
 
 /**
  * Read the heredoc delimiter word at `start`, skipping the whitespace between
- * `<<` and the word. Quotes are removed from the result, because the shell
- * compares the terminator against the unquoted text: `<<'EOF'` ends at `EOF`.
- * Returns null when there is no word to read, which is not a heredoc we can
+ * `<<` and the word. The word is read the way the shell reads it — quotes and
+ * the quote characters are removed, and a backslash escapes only the one
+ * character after it, so `<<\EOF` ends at `EOF` and `<<'EOF'` ends at `EOF` —
+ * because the terminator line is compared against the unquoted text. Returns
+ * null when there is no complete word to read, which is not a heredoc we can
  * bound.
  */
 function readHeredocDelimiter(text: string, start: number): { delimiter: string; end: number } | null {
   let index = start;
   while (index < text.length && (text[index] === " " || text[index] === "\t")) index += 1;
-  if (index >= text.length) return null;
-  const first = text[index]!;
-  if (first === "'" || first === '"') {
-    index += 1;
-    let delimiter = "";
-    while (index < text.length && text[index] !== first) {
-      delimiter += text[index];
-      index += 1;
-    }
-    if (index >= text.length) return null; // Unterminated quote: not a bounded word.
-    return delimiter === "" ? null : { delimiter, end: index + 1 };
-  }
   let delimiter = "";
-  if (first === "\\") {
-    // `<\word>` quotes a single character.
-    index += 1;
-    if (index >= text.length) return null;
-    delimiter = text[index]!;
-    index += 1;
-  } else {
-    while (index < text.length && !SHELL_WORD_BREAK.test(text[index]!)) {
-      delimiter += text[index];
+  let quote = "";
+  let sawChar = false;
+  while (index < text.length) {
+    const char = text[index]!;
+    if (quote !== "") {
+      if (char === "\\" && quote !== "'") {
+        const next = text[index + 1];
+        if (next === undefined) return null;
+        delimiter += next;
+        index += 2;
+        continue;
+      }
+      if (char === quote) {
+        quote = "";
+        index += 1;
+        continue;
+      }
+      delimiter += char;
+      sawChar = true;
       index += 1;
+      continue;
     }
+    if (char === "\\") {
+      const next = text[index + 1];
+      if (next === undefined) return null;
+      delimiter += next;
+      sawChar = true;
+      index += 2;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      index += 1;
+      continue;
+    }
+    if (SHELL_WORD_BREAK.test(char)) break;
+    delimiter += char;
+    sawChar = true;
+    index += 1;
   }
-  return delimiter === "" ? null : { delimiter, end: index };
+  if (quote !== "" || !sawChar) return null;
+  return { delimiter, end: index };
 }
 
 /**
  * The first unquoted heredoc operator in `text`, with the delimiter its body
  * ends at and whether `<<-` strips leading tabs from the terminator line.
- * Quote-aware, so a `<<` inside quotes is text; `<<<` is a here-string whose
- * word stays on the same line, so it has no body and is skipped.
+ * Quote-aware, so a `<<` inside quotes is text; an escaped `\<` is a literal
+ * character rather than an operator; `<<<` is a here-string whose word stays on
+ * the same line, so it has no body and is skipped.
  */
 function findHeredocOpener(
   text: string,
 ): { operatorStart: number; operatorEnd: number; delimiter: string; stripTabs: boolean } | null {
-  let quote = "";
-  for (let index = 0; index < text.length; index += 1) {
-    const char = text[index]!;
-    if (quote !== "") {
-      if (char === "\\" && quote === '"') index += 1;
-      else if (char === quote) quote = "";
-      continue;
-    }
-    if (char === "\\") { index += 1; continue; }
-    if (char === "'" || char === '"') { quote = char; continue; }
-    if (char !== "<" || text[index + 1] !== "<" || text[index + 2] === "<") continue;
-    const stripTabs = text[index + 2] === "-";
-    const word = readHeredocDelimiter(text, index + (stripTabs ? 3 : 2));
-    if (word === null) return null;
-    return { operatorStart: index, operatorEnd: word.end, delimiter: word.delimiter, stripTabs };
-  }
-  return null;
+  let operatorStart = -1;
+  walkShell(text, (char, quote, escaped, delimiter, index) => {
+    if (operatorStart !== -1 || quote !== "" || escaped || delimiter || char !== "<") return;
+    if (text[index + 1] !== "<" || text[index + 2] === "<") return;
+    operatorStart = index;
+  });
+  if (operatorStart === -1) return null;
+  const stripTabs = text[operatorStart + 2] === "-";
+  const word = readHeredocDelimiter(text, operatorStart + (stripTabs ? 3 : 2));
+  if (word === null) return null;
+  return { operatorStart, operatorEnd: word.end, delimiter: word.delimiter, stripTabs };
 }
 
 /**
@@ -813,44 +1008,83 @@ function stripHeredocBodies(text: string): string {
 export function isReadOnlyCommand(command: string): boolean {
   const trimmed = command.trim();
   if (trimmed === "") return true;
-  const { unquoted, segments } = scanCommandLine(stripHeredocBodies(trimmed));
+  const { unquoted, live, segments } = scanCommandLine(stripHeredocBodies(trimmed));
   // A redirect writes, whatever the program is. Only unquoted text counts: `echo 'a > b'` writes nothing.
   if (/(^|[^>])>(?!&)/.test(unquoted) || />>/.test(unquoted)) return false;
   if (/\btee\b/.test(unquoted)) return false;
-  // Command and process substitution can hide a whole command in a read-only one.
-  if (/\$\(|`|[<(]\(/.test(unquoted)) return false;
+  // `$(...)` and backticks run inside double quotes as well, so they are looked
+  // for in every character the shell expands; `<( )`/`>( )` and `( )` are
+  // word-level syntax, so `echo "<(x)"` stays a plain argument.
+  if (/\$\(|`/.test(live)) return false;
+  if (/[<(]\(/.test(unquoted)) return false;
 
   return segments.every((segment) => isReadOnlySegment(segment.trim()));
 }
 
+/**
+ * True when one command in a line only reads.
+ *
+ * The rule, in order. The program must be one this file models — an allowlisted
+ * read-only program, or `git`, `bb` or `env` — because an unmodelled program is
+ * work whatever its arguments: `--help` does not launder `rm -rf x --help`, an
+ * unknown tool, or a wrapper. Then the program must carry no flag the table
+ * records as a write or a runner, and only then may a read flag such as
+ * `--help`/`--version` speak for the call. Arguments are read with their quotes
+ * removed, because the shell removes them too: `find . '-delete'` deletes.
+ *
+ * Anything this does not fully model is work, not a read: the fallthrough for
+ * an unknown program, the `MUTATING_PROGRAM_FLAGS` table for a known one, and
+ * the whole-line checks for redirects, `tee` and substitution. The cost is a
+ * nudge on a read the table has no entry for; the alternative is a write that
+ * the watchdog exists to catch.
+ */
 function isReadOnlySegment(segment: string): boolean {
   if (segment === "") return true;
-  // `foo --help`, `foo -h` and `foo --version` report; they never mutate.
-  if (HELP_OR_VERSION.test(segment)) return true;
-  const tokens = segment.split(/\s+/);
+  const tokens = shellWords(segment);
   let index = 0;
-  while (index < tokens.length && ENV_ASSIGNMENT.test(tokens[index]!)) index += 1;
+  while (index < tokens.length && ENV_ASSIGNMENT.test(tokens[index]!)) {
+    // An assignment that names a program another command will run is a wrapper
+    // in disguise: `PATH=/tmp ls` runs a different `ls`.
+    const assignment = tokens[index]!;
+    if (ENV_COMMAND_VARIABLES[assignment.slice(0, assignment.indexOf("="))] === true) return false;
+    index += 1;
+  }
   const program = tokens[index];
   if (program === undefined) return true;
   const name = program.replace(/^.*\//, "");
-  const args = tokens.slice(index + 1);
-  if (name === "git") return isReadOnlyGitSegment(args);
-  if (name === "bb") return isReadOnlyBbSegment(args);
+  const args = tokens.slice(index + 1).filter((token) => !FD_REDIRECT.test(token));
+  if (name === "git") {
+    // Git answers `--help` before running a plain subcommand, but not before a
+    // mixed one: `git config --global user.email x --help` still writes.
+    if (!gitHelpIsSafe(args)) return isReadOnlyGitSegment(args);
+    return HELP_OR_VERSION.test(segment) || isReadOnlyGitSegment(args);
+  }
+  // `bb plugin new --help` reports, `bb plugin install x` does not.
+  if (name === "bb") return HELP_OR_VERSION.test(segment) || isReadOnlyBbSegment(args);
   if (name === "env") return isReadOnlyEnvSegment(args);
   if (!READ_ONLY_PROGRAMS.has(name)) return false;
   const mutating = MUTATING_PROGRAM_FLAGS[name];
-  return mutating === undefined || !args.some((arg) => mutating.test(arg));
+  return mutating === undefined || !args.some((arg) => mutating(arg));
 }
 
 /**
- * `env` only reads when it is not running a program: `env`, `env FOO=1` and `env -i` report, `env rm -rf x` does not.
- * `-u`/`--unset` and `-S`/`--split-string` take a separate value, so the token after them is not the program.
+ * `env` only reads when it is not running a program: `env`, `env FOO=1` and
+ * `env -i` report, `env rm -rf x` does not.
+ * `-u`/`--unset` takes a variable name, so the token after it is not the
+ * program. `-S`/`--split-string` is the opposite: its value *is* a command
+ * line, so it is judged as one — `env -S 'sh'` runs `sh`.
  */
 function isReadOnlyEnvSegment(rest: readonly string[]): boolean {
   let index = 0;
   while (index < rest.length) {
     const token = rest[index]!;
-    if (token === "-u" || token === "--unset" || token === "-S" || token === "--split-string") { index += 2; continue; }
+    if (token === "-u" || token === "--unset") { index += 2; continue; }
+    if (token === "-S" || token === "--split-string" || token.startsWith("--split-string=")) {
+      const value = token.startsWith("--split-string=")
+        ? token.slice("--split-string=".length) + " " + rest.slice(index + 1).join(" ")
+        : rest.slice(index + 1).join(" ");
+      return isReadOnlyCommand(value);
+    }
     if (token.startsWith("-") || ENV_ASSIGNMENT.test(token)) { index += 1; continue; }
     break;
   }
