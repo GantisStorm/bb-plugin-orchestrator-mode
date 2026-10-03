@@ -45,13 +45,8 @@ import {
   buildVerifierBrief,
   classifyRow,
   defaultAppliesTo,
-  isContractPreset,
   isEnforcementLevel,
   isOneOf,
-  isPermissionMode,
-  isReasoningLevel,
-  isWorkerPreset,
-  isServiceTier,
   readMirror,
   writeMirror,
   type EnforcementLevel,
@@ -64,11 +59,11 @@ import {
   type WorkerConfig,
   type WorkerPresetName,
   type ContractPresetId,
+  type WorkRowLike,
   type WorkerExecution,
   type WorkerModelOption,
 } from "./shared";
 
-export type { EnforcementLevel, Violation };
 export { DELEGATE_TOOL };
 
 /** Realtime channel the composer surfaces listen on. */
@@ -195,10 +190,18 @@ const workerConfigSchema = workerExecutionSchema.extend({
     .optional(),
 });
 
+/** The enforcement union as a zod enum, shared by the state shape and the writes. */
+const enforcementSchema = z.enum(
+  ENFORCEMENT_LEVELS as readonly ["instruct", ...EnforcementLevel[]],
+);
+
+/** The `{ threadId }` input every per-thread RPC call takes. */
+const threadIdSchema = z.object({ threadId: z.string().min(1).max(120) });
+
 const stateSchema = z.object({
   enabled: z.boolean(),
-  enforcement: z.enum(ENFORCEMENT_LEVELS as readonly ["instruct", ...EnforcementLevel[]]).nullable(),
-  effectiveEnforcement: z.enum(ENFORCEMENT_LEVELS as readonly ["instruct", ...EnforcementLevel[]]),
+  enforcement: enforcementSchema.nullable(),
+  effectiveEnforcement: enforcementSchema,
   enabledAt: z.string().nullable(),
   violations: z.array(violationSchema),
   delegations: z.array(delegationSchema),
@@ -227,7 +230,7 @@ export type OrchestratorStateDto = z.infer<typeof stateSchema>;
 
 export const rpcContract = defineRpcContract({
   get_state: {
-    input: z.object({ threadId: z.string().min(1).max(120) }).strict(),
+    input: threadIdSchema.strict(),
     output: stateSchema,
   },
   set_enabled: {
@@ -235,7 +238,7 @@ export const rpcContract = defineRpcContract({
       .object({
         threadId: z.string().min(1).max(120),
         enabled: z.boolean(),
-        enforcement: z.enum(ENFORCEMENT_LEVELS as readonly ["instruct", ...EnforcementLevel[]]).nullable().optional(),
+        enforcement: enforcementSchema.nullable().optional(),
       })
       .strict(),
     output: stateSchema,
@@ -261,7 +264,7 @@ export const rpcContract = defineRpcContract({
     output: workerConfigSchema,
   },
   clear_violations: {
-    input: z.object({ threadId: z.string().min(1).max(120) }).strict(),
+    input: threadIdSchema.strict(),
     output: stateSchema,
   },
 });
@@ -274,10 +277,6 @@ export const rpcContract = defineRpcContract({
 const WORKER_RETENTION = ["keep", "archive-checks", "archive-all"] as const;
 type WorkerRetention = (typeof WORKER_RETENTION)[number];
 
-function isWorkerRetention(value: unknown): value is WorkerRetention {
-  return isOneOf(WORKER_RETENTION, value);
-}
-
 /**
  * Thrown when a delegation would exceed a fan-out cap. A distinct type because
  * the delegation tool retries a *provider* failure on the fallback, and a cap
@@ -288,14 +287,8 @@ class WorkerBudgetError extends Error {
 }
 
 /** A timeline row, narrowed to the fields the classifier reads. */
-interface ScanRow {
+interface ScanRow extends WorkRowLike {
   id: string;
-  kind: string;
-  workKind?: string;
-  status?: string;
-  toolName?: string | null;
-  command?: string | null;
-  change?: { path?: string | null } | null;
   turnId?: string | null;
   sourceSeqEnd?: number;
   startedAt?: number;
@@ -360,17 +353,11 @@ async function loadWorkerCatalog(bb: BbPluginApi): Promise<WorkerCatalog> {
   }
 }
 
-/** `explicit` means the caller named the value, so the server must keep it. */
-type ExecutionSource = "explicit";
-
-/** The provenance map `threads.spawn` reads for each execution field it gets. */
-interface WorkerExecutionSources {
-  providerId?: ExecutionSource;
-  model?: ExecutionSource;
-  reasoningLevel?: ExecutionSource;
-  serviceTier?: ExecutionSource;
-  permissionMode?: ExecutionSource;
-}
+/**
+ * The provenance map `threads.spawn` reads for each execution field it gets:
+ * `explicit` means the caller named the value, so the server must keep it.
+ */
+type WorkerExecutionSources = Partial<Record<keyof WorkerExecution, "explicit">>;
 
 /**
  * Stamp every field present in `exec` as caller-chosen. Without this the server
@@ -546,14 +533,13 @@ export default async function plugin(bb: BbPluginApi) {
       ? values.enforcement
       : DEFAULT_ENFORCEMENT;
     live.allowReadCommands = values.allowReadCommands !== false;
-    const nudges = Number(values.maxNudges);
-    live.maxNudges = Number.isFinite(nudges) && nudges >= 0 ? Math.floor(nudges) : 3;
+    live.maxNudges = capOf(values.maxNudges, 3);
     live.maxParallelWorkers = capOf(values.maxParallelWorkers, 6);
     live.maxDelegationsPerTurn = capOf(values.maxDelegationsPerTurn, 20);
-    live.contractPreset = isContractPreset(values.contractPreset)
+    live.contractPreset = isOneOf(CONTRACT_PRESETS, values.contractPreset)
       ? values.contractPreset
       : "standard";
-    live.workerRetention = isWorkerRetention(values.workerRetention)
+    live.workerRetention = isOneOf(WORKER_RETENTION, values.workerRetention)
       ? values.workerRetention
       : "keep";
   }
@@ -582,7 +568,7 @@ export default async function plugin(bb: BbPluginApi) {
       for (const [name, value] of Object.entries(record.presets as Record<string, unknown>)) {
         // A preset is a partial override, so it only loses the ids the catalog
         // no longer lists, and is dropped when nothing usable is left.
-        if (!isWorkerPreset(name) || value === null || typeof value !== "object") continue;
+        if (!isOneOf(WORKER_PRESETS, name) || value === null || typeof value !== "object") continue;
         const sanitized = sanitizeExecution(value as Record<string, unknown>);
         if (Object.keys(sanitized).length > 0) presets[name] = sanitized;
       }
@@ -613,9 +599,11 @@ export default async function plugin(bb: BbPluginApi) {
     return reconcile({
       ...(providerId === undefined ? {} : { providerId }),
       ...(model === undefined ? {} : { model }),
-      ...(isReasoningLevel(record.reasoningLevel) ? { reasoningLevel: record.reasoningLevel } : {}),
-      ...(isServiceTier(record.serviceTier) ? { serviceTier: record.serviceTier } : {}),
-      ...(isPermissionMode(record.permissionMode)
+      ...(isOneOf(REASONING_LEVELS, record.reasoningLevel)
+        ? { reasoningLevel: record.reasoningLevel }
+        : {}),
+      ...(isOneOf(SERVICE_TIERS, record.serviceTier) ? { serviceTier: record.serviceTier } : {}),
+      ...(isOneOf(PERMISSION_MODES, record.permissionMode)
         ? { permissionMode: record.permissionMode }
         : {}),
     });
@@ -2091,7 +2079,6 @@ export default async function plugin(bb: BbPluginApi) {
     return { exitCode: 0, stdout: json === true ? JSON.stringify(value, null, 2) : text };
   }
 
-  /** One line naming what a delegation's worker will run on. */
   /** The stored presets, one line each. */
   function describePresets(presets: WorkerConfig["presets"]): string {
     const entries = Object.entries(presets ?? {});
@@ -2109,6 +2096,7 @@ export default async function plugin(bb: BbPluginApi) {
       : `\nA failed worker is retried on: ${describeWorkerExecution(fallback)}`;
   }
 
+  /** One line naming what a delegation's worker will run on. */
   function describeWorkerExecution(exec: OrchestratorStateDto["workerExecution"]): string {
     const parts = [
       exec.providerId === undefined ? null : `provider ${exec.providerId}`,

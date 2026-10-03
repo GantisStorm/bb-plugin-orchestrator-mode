@@ -81,18 +81,6 @@ export type PermissionMode = (typeof PERMISSION_MODES)[number];
 export const SERVICE_TIERS = ["default", "fast"] as const;
 export type ServiceTier = (typeof SERVICE_TIERS)[number];
 
-export function isReasoningLevel(value: unknown): value is ReasoningLevel {
-  return isOneOf(REASONING_LEVELS, value);
-}
-
-export function isPermissionMode(value: unknown): value is PermissionMode {
-  return isOneOf(PERMISSION_MODES, value);
-}
-
-export function isServiceTier(value: unknown): value is ServiceTier {
-  return isOneOf(SERVICE_TIERS, value);
-}
-
 /**
  * Execution overrides for a spawned worker. An absent field is not "no value",
  * it is "inherit": the thread is spawned without it and BB resolves the
@@ -117,10 +105,6 @@ export interface WorkerExecution {
  */
 export const WORKER_PRESETS = ["build", "review", "research"] as const;
 export type WorkerPresetName = (typeof WORKER_PRESETS)[number];
-
-export function isWorkerPreset(value: unknown): value is WorkerPresetName {
-  return isOneOf(WORKER_PRESETS, value);
-}
 
 /**
  * What the plugin stores for workers: the execution every delegation starts on,
@@ -168,7 +152,7 @@ export interface WorkerCatalog {
  */
 // A type alias, not an interface: BB's `JsonObject` needs an implicit index
 // signature, which only object-literal type aliases get.
-export type OrchestratorMirror = {
+type OrchestratorMirror = {
   /** True while this thread must orchestrate instead of working. */
   enabled: boolean;
   /** Per-thread override, or null to follow the plugin setting. */
@@ -177,7 +161,7 @@ export type OrchestratorMirror = {
   source: "orchestrator-mode";
 };
 
-export const MIRROR_SOURCE = "orchestrator-mode" as const;
+const MIRROR_SOURCE = "orchestrator-mode" as const;
 
 /** Parse an untrusted metadata namespace into a mirror, or null when absent. */
 export function readMirror(
@@ -236,7 +220,6 @@ export function defaultAppliesTo(thread: {
 export interface WorkRowLike {
   kind: string;
   workKind?: string | undefined;
-  status?: string | undefined;
   toolName?: string | null | undefined;
   command?: string | null | undefined;
   change?: { path?: string | null } | null | undefined;
@@ -252,7 +235,7 @@ export interface Violation {
   detectedAt: number;
 }
 
-export interface ClassifierOptions {
+interface ClassifierOptions {
   /** Read-only shell commands are research, not work. Default true. */
   allowReadCommands: boolean;
 }
@@ -706,7 +689,7 @@ const SENTENCE_WORD = /^[a-z][a-z'-]*$/;
  * lowercase form (`gradlew build`) and the path form (`./Gradlew build`) are
  * both caught.
  */
-export function looksLikeShellCommand(command: string): boolean {
+function looksLikeShellCommand(command: string): boolean {
   const text = command.trim();
   if (text === "") return false;
   const tokens = text.split(/\s+/);
@@ -1010,7 +993,7 @@ export function isReadOnlyCommand(command: string): boolean {
   if (trimmed === "") return true;
   const { unquoted, live, segments } = scanCommandLine(stripHeredocBodies(trimmed));
   // A redirect writes, whatever the program is. Only unquoted text counts: `echo 'a > b'` writes nothing.
-  if (/(^|[^>])>(?!&)/.test(unquoted) || />>/.test(unquoted)) return false;
+  if (/(^|[^>])>(?!&)/.test(unquoted)) return false;
   if (/\btee\b/.test(unquoted)) return false;
   // `$(...)` and backticks run inside double quotes as well, so they are looked
   // for in every character the shell expands; `<( )`/`>( )` and `( )` are
@@ -1184,10 +1167,6 @@ export const CONTRACT_PRESETS = [
 ] as const;
 export type ContractPresetId = (typeof CONTRACT_PRESETS)[number];
 
-export function isContractPreset(value: unknown): value is ContractPresetId {
-  return isOneOf(CONTRACT_PRESETS, value);
-}
-
 /**
  * How much appended instruction text the plugin accepts. `configure` truncates
  * the whole block at 4096 characters, and the tail is the part that explains
@@ -1204,7 +1183,7 @@ export const INSTRUCTION_LIMIT = 4096;
 /** One reminder line, so a long file path cannot crowd out the contract it corrects. */
 const REMINDER_LINE_LIMIT = 120;
 
-export interface InstructionInput {
+interface InstructionInput {
   enforcement: EnforcementLevel;
   allowReadCommands: boolean;
   /** Extra lines a caller wants appended, e.g. recent violations. */
@@ -1222,7 +1201,7 @@ export interface InstructionInput {
  * plugin overrides nothing. Kept next to the contract it is spliced into, and
  * deliberately short: `configure` truncates the whole block at 4096 characters.
  */
-export function workerBudget(config: WorkerConfig | undefined): string {
+function workerBudget(config: WorkerConfig | undefined): string {
   const exec = config ?? {};
   const parts = [
     exec.model === undefined ? null : `model \`${exec.model}\``,
@@ -1411,21 +1390,21 @@ Do not modify any file. If the work is wrong, say so plainly.`;
 }
 
 /**
+ * The user's appended rules, under a heading that names where they come from.
+ * Kept after the plugin's own sections so a project rule adds to the contract
+ * rather than silently replacing the parts the watchdog enforces.
+ */
+function extraBudget(extra: string | undefined): string {
+  const text = extra?.trim() ?? "";
+  return text === "" ? "" : `## Rules for this project\n\n${text}\n\n`;
+}
+
+/**
  * The corrective message sent when a turn ended with workers nobody judged.
  * Deliberately separate from {@link buildNudge}: that one is about doing the
  * work yourself, and telling an orchestrator off for the wrong thing is how a
  * watchdog loses its authority.
  */
-/**
- * The user's appended rules, under a heading that names where they come from.
- * Kept after the plugin's own sections so a project rule adds to the contract
- * rather than silently replacing the parts the watchdog enforces.
- */
-export function extraBudget(extra: string | undefined): string {
-  const text = extra?.trim() ?? "";
-  return text === "" ? "" : `## Rules for this project\n\n${text}\n\n`;
-}
-
 export function buildReviewNudge(
   unreviewed: readonly string[],
   enforcement: EnforcementLevel,
