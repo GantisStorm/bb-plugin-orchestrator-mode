@@ -47,6 +47,7 @@ import {
   defaultAppliesTo,
   isContractPreset,
   isEnforcementLevel,
+  isOneOf,
   isPermissionMode,
   isReasoningLevel,
   isWorkerPreset,
@@ -164,6 +165,19 @@ const violationSchema = z.object({
   detectedAt: z.number(),
 });
 
+/**
+ * The stored arrays are read by consumers that assume their declared element
+ * shape (`violation.detail`, `delegation.status`), so a foreign value in the
+ * store is dropped on the way out instead of crashing an RPC read or a scan.
+ */
+function sanitizeElements<T>(value: unknown, schema: z.ZodType<T>): T[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const parsed = schema.safeParse(entry);
+    return parsed.success ? [parsed.data] : [];
+  });
+}
+
 /** The execution a delegation defaults to; an absent field inherits. */
 const workerExecutionSchema = z.object({
   providerId: z.string().min(1).max(120).optional(),
@@ -204,6 +218,10 @@ const stateSchema = z.object({
   reviewed: z.number(),
 });
 
+/** The contract text, the project rules appended to it, and the room left. */
+const contractSchema = z.object({ text: z.string(), extra: z.string(), limit: z.number() });
+export type ContractDto = z.infer<typeof contractSchema>;
+
 /** The shape every RPC call returns; the schema above owns it. */
 export type OrchestratorStateDto = z.infer<typeof stateSchema>;
 
@@ -229,17 +247,13 @@ export const rpcContract = defineRpcContract({
   },
   get_contract: {
     input: z.object({ threadId: z.string().min(1).max(120).nullable() }).strict(),
-    output: z.object({
-      text: z.string(),
-      extra: z.string(),
-      limit: z.number(),
-    }),
+    output: contractSchema,
   },
   set_contract: {
     input: z
       .object({ extra: z.string().max(EXTRA_INSTRUCTION_LIMIT) })
       .strict(),
-    output: z.object({ text: z.string(), extra: z.string(), limit: z.number() }),
+    output: contractSchema,
   },
   get_worker_execution: { input: z.null(), output: workerConfigSchema },
   set_worker_execution: {
@@ -261,10 +275,7 @@ const WORKER_RETENTION = ["keep", "archive-checks", "archive-all"] as const;
 type WorkerRetention = (typeof WORKER_RETENTION)[number];
 
 function isWorkerRetention(value: unknown): value is WorkerRetention {
-  return (
-    typeof value === "string" &&
-    (WORKER_RETENTION as readonly string[]).includes(value)
-  );
+  return isOneOf(WORKER_RETENTION, value);
 }
 
 /**
@@ -294,11 +305,21 @@ interface ScanRow {
 function asScanRows(rows: unknown): ScanRow[] {
   if (!Array.isArray(rows)) return [];
   const out: ScanRow[] = [];
-  for (const row of rows) {
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
     if (row === null || typeof row !== "object") continue;
-    const candidate = row as ScanRow;
-    if (typeof candidate.id !== "string") continue;
-    out.push(candidate);
+    const candidate = row as Omit<ScanRow, "id"> & { id?: unknown };
+    // A delivered work row is judged even when the provider omitted its id:
+    // dropping it would make the act invisible to a watchdog that exists to see
+    // it. The sequence keys it stably, so a re-delivery in the next delta is
+    // still deduped; only the id-less, sequence-less row falls back to position.
+    const id =
+      typeof candidate.id === "string"
+        ? candidate.id
+        : typeof candidate.sourceSeqEnd === "number"
+          ? `seq:${candidate.sourceSeqEnd}`
+          : `row:${index}`;
+    out.push({ ...candidate, id });
     if (Array.isArray(candidate.children)) out.push(...asScanRows(candidate.children));
   }
   return out;
@@ -797,26 +818,83 @@ export default async function plugin(bb: BbPluginApi) {
   let cache: Record<string, ThreadState> | null = null;
   let mutationQueue: Promise<unknown> = Promise.resolve();
 
+  /**
+   * Claims this process has made but not yet recorded. A cap check that counted
+   * only the recorded delegations would let two simultaneous claims both pass,
+   * so in-flight claims are counted too. `turn` tracks the ones that count
+   * toward the per-turn cap, which excludes check units and retries.
+   */
+  const pendingClaims = new Map<string, { parallel: number; turn: number }>();
+
+  function reserveClaim(threadId: string, countPerTurn: boolean): void {
+    const counts = pendingClaims.get(threadId) ?? { parallel: 0, turn: 0 };
+    pendingClaims.set(threadId, {
+      parallel: counts.parallel + 1,
+      turn: counts.turn + (countPerTurn ? 1 : 0),
+    });
+  }
+
+  function releaseClaim(threadId: string, countPerTurn: boolean): void {
+    const counts = pendingClaims.get(threadId) ?? { parallel: 0, turn: 0 };
+    const next = {
+      parallel: Math.max(0, counts.parallel - 1),
+      turn: Math.max(0, counts.turn - (countPerTurn ? 1 : 0)),
+    };
+    if (next.parallel === 0 && next.turn === 0) pendingClaims.delete(threadId);
+    else pendingClaims.set(threadId, next);
+  }
+
+  /**
+   * Run `work` in the same queue as the state writes, so a check that reads the
+   * state cannot interleave with another claim on the same thread. A failed
+   * unit rejects its caller without wedging the queue.
+   */
+  function enqueue<T>(work: () => Promise<T>): Promise<T> {
+    const queued = mutationQueue.then(work, work);
+    mutationQueue = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
+  }
+
   async function readAll(): Promise<Record<string, ThreadState>> {
     if (cache !== null) return cache;
     const stored = await bb.storage.kv.get<Record<string, ThreadState>>(STATE_KEY);
-    cache = stored !== undefined && typeof stored === "object" && stored !== null ? stored : {};
+    const rows = stored !== undefined && typeof stored === "object" && stored !== null ? stored : {};
+    // Normalize here, not only in getState and mutateState: every reader shares this
+    // cache, including the agent-configuration path, and a row written by an older
+    // build must not reach a caller with a missing array.
+    cache = Object.fromEntries(
+      Object.entries(rows).map(([threadId, state]) => [threadId, normalize(state)]),
+    );
     return cache;
   }
 
   /**
-   * Fill in fields added after a state row was written. A thread enabled by an
-   * older build of this plugin must keep being watched after an update instead
-   * of crashing the scan on a missing array.
+   * Fill in fields added after a state row was written, and tolerate a row that is
+   * not the shape this build writes at all: a thread enabled by an older build, or
+   * a foreign value in the store, must not crash a scan or an RPC read. That
+   * covers the array *elements* too: a stored `violations: [null]` reaches
+   * `violation.detail` in the contract and the RPC output, so a bad element is
+   * dropped rather than passed on.
    */
-  function normalize(state: ThreadState): ThreadState {
+  function normalize(state: ThreadState | null | undefined): ThreadState {
+    if (state === null || state === undefined) return emptyState(Date.now());
     return {
       ...state,
-      violations: Array.isArray(state.violations) ? state.violations : [],
-      seenRowIds: Array.isArray(state.seenRowIds) ? state.seenRowIds : [],
-      delegations: Array.isArray(state.delegations) ? state.delegations : [],
-      graceTurnIds: Array.isArray(state.graceTurnIds) ? state.graceTurnIds : [],
+      enabled: state.enabled === true,
+      enforcement:
+        state.enforcement === "instruct" || state.enforcement === "guard" || state.enforcement === "block"
+          ? state.enforcement
+          : null,
+      enabledAt: typeof state.enabledAt === "string" ? state.enabledAt : null,
+      violations: sanitizeElements(state.violations, violationSchema),
+      seenRowIds: sanitizeElements(state.seenRowIds, z.string()),
+      delegations: sanitizeElements(state.delegations, delegationSchema),
+      graceTurnIds: sanitizeElements(state.graceTurnIds, z.string()),
       lastReviewNudge: typeof state.lastReviewNudge === "string" ? state.lastReviewNudge : null,
+      touchedAt: typeof state.touchedAt === "number" && Number.isFinite(state.touchedAt) ? state.touchedAt : 0,
       turnStartedAt: typeof state.turnStartedAt === "number" ? state.turnStartedAt : 0,
       graceSlots: typeof state.graceSlots === "number" ? state.graceSlots : 1,
       lastSeq: typeof state.lastSeq === "number" ? state.lastSeq : 0,
@@ -862,7 +940,7 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<ThreadState | undefined> {
     // Serialize the read as well as the write: parallel delegations and thread
     // toggles must derive their updates from the preceding committed state.
-    const mutation = mutationQueue.then(async () => {
+    return enqueue(async () => {
       const all = { ...(await readAll()) };
       const current = normalize(all[threadId] ?? emptyState(Date.now()));
       const next = update(current);
@@ -877,9 +955,6 @@ export default async function plugin(bb: BbPluginApi) {
       await persist(prune(all));
       return next;
     });
-    // A failed mutation rejects its caller without wedging subsequent updates.
-    mutationQueue = mutation.catch(() => undefined);
-    return mutation;
   }
 
   function clearViolations(threadId: string): Promise<ThreadState | undefined> {
@@ -918,7 +993,7 @@ export default async function plugin(bb: BbPluginApi) {
       effectiveEnforcement: effectiveEnforcement(state),
       enabledAt: base.enabledAt,
       violations: base.violations.slice(-MAX_VIOLATIONS),
-      delegations: base.delegations.slice(-MAX_DELEGATIONS),
+      delegations: trimDelegations(base.delegations),
       nudgeCount: base.nudgeCount,
       defaultForNewThreads: live.defaultForNewThreads,
       allowReadCommands: live.allowReadCommands,
@@ -935,15 +1010,39 @@ export default async function plugin(bb: BbPluginApi) {
    * Settled workers whose result nobody has judged. A worker still running has
    * nothing to review yet, so it is not counted.
    */
-  function unreviewedOf(delegations: readonly Delegation[]): Delegation[] {
-    return delegations.filter(
-      (delegation) =>
-        delegation.status !== null &&
-        delegation.verdict == null &&
-        // A check unit is evidence for the unit it checks: judging the checker
-        // as well would double the ceremony without adding a decision.
-        delegation.verifierFor === undefined,
+  /** Settled, unjudged, and not a check unit: a delegation the orchestrator still owes a verdict. */
+  function needsVerdict(delegation: Delegation): boolean {
+    return (
+      delegation.status !== null &&
+      delegation.verdict == null &&
+      // A check unit is evidence for the unit it checks: judging the checker
+      // as well would double the ceremony without adding a decision.
+      delegation.verifierFor === undefined
     );
+  }
+
+  /**
+   * Keep the newest records plus every worker still owed a verdict: dropping an
+   * unjudged record would refuse its verdict later and hide it from the counts.
+   */
+  function trimDelegations(delegations: readonly Delegation[]): Delegation[] {
+    if (delegations.length <= MAX_DELEGATIONS) return [...delegations];
+    const recent = delegations.slice(-MAX_DELEGATIONS);
+    const kept = new Set(recent.map((delegation) => delegation.threadId));
+    return [
+      ...delegations.filter((delegation) => !kept.has(delegation.threadId) && needsVerdict(delegation)),
+      ...recent,
+    ];
+  }
+
+  function unreviewedOf(delegations: readonly Delegation[]): Delegation[] {
+    return delegations.filter(needsVerdict);
+  }
+
+  /** One row's dedupe key: a later turn may reuse a row id, so the sequence disambiguates it. */
+  function seenKey(row: ScanRow): string {
+    const seq = typeof row.sourceSeqEnd === "number" ? row.sourceSeqEnd : 0;
+    return seq === 0 ? row.id : `${row.id}:${seq}`;
   }
 
   /** Read the thread's current timeline head so a scan starts after it. */
@@ -1141,6 +1240,16 @@ export default async function plugin(bb: BbPluginApi) {
       const orchestratorId = threadId;
       const targetProjectId = projectId;
 
+      // The mode has to be on: a stale session can keep this tool after the
+      // thread was switched off, and the review gate does not monitor a thread
+      // that is off, so those workers would never be nudged for a verdict.
+      const orchestratorState = await getState(orchestratorId);
+      if (orchestratorState?.enabled !== true) {
+        throw new Error(
+          "This thread is not in orchestrator mode, so delegations are refused. Turn the mode on in the composer first.",
+        );
+      }
+
       // A named preset must be stored: silently ignoring one would leave the
       // orchestrator believing it had asked for a different model.
       let presetExec: WorkerExecution = {};
@@ -1174,40 +1283,46 @@ export default async function plugin(bb: BbPluginApi) {
         workerLabel: string,
         options: { brief?: string; verifierFor?: string; pluginInitiated?: boolean } = {},
       ): Promise<string> {
-        await assertWithinBudget(orchestratorId, options.pluginInitiated !== true);
-        const spawned = await bb.sdk.threads.spawn({
-          projectId: targetProjectId,
-          environment,
-          prompt: options.brief ?? task,
-          title: workerLabel,
-          parentThreadId: orchestratorId,
-          ...(hidden === true ? { visibility: "hidden" as const } : {}),
-          ...exec,
-          // The server drops a requested provider/model that carries no
-          // provenance source and re-derives it from the project's remembered
-          // defaults, which would silently undo everything above.
-          ...(Object.keys(exec).length === 0
-            ? {}
-            : { executionInputSources: executionSources(exec) }),
-          pluginMetadata: { workerFor: orchestratorId },
-        });
-        await mutateState(orchestratorId, (current) => ({
-          ...current,
-          delegations: [
-            ...current.delegations,
-            {
-              threadId: spawned.id,
-              title: workerLabel,
-              task: (options.brief ?? task).slice(0, 400),
-              createdAt: Date.now(),
-              status: null,
-              ...(options.verifierFor === undefined
-                ? {}
-                : { verifierFor: options.verifierFor, verifiedBy: null, verdict: null }),
-            },
-          ].slice(-MAX_DELEGATIONS),
-        }));
-        return spawned.id;
+        const countPerTurn = options.pluginInitiated !== true;
+        await assertWithinBudget(orchestratorId, countPerTurn);
+        try {
+          const spawned = await bb.sdk.threads.spawn({
+            projectId: targetProjectId,
+            environment,
+            prompt: options.brief ?? task,
+            title: workerLabel,
+            parentThreadId: orchestratorId,
+            ...(hidden === true ? { visibility: "hidden" as const } : {}),
+            ...exec,
+            // The server drops a requested provider/model that carries no
+            // provenance source and re-derives it from the project's remembered
+            // defaults, which would silently undo everything above.
+            ...(Object.keys(exec).length === 0
+              ? {}
+              : { executionInputSources: executionSources(exec) }),
+            pluginMetadata: { workerFor: orchestratorId },
+          });
+          await mutateState(orchestratorId, (current) => ({
+            ...current,
+            delegations: trimDelegations([
+              ...current.delegations,
+              {
+                threadId: spawned.id,
+                title: workerLabel,
+                task: (options.brief ?? task).slice(0, 400),
+                createdAt: Date.now(),
+                status: null,
+                ...(options.verifierFor === undefined
+                  ? {}
+                  : { verifierFor: options.verifierFor, verifiedBy: null, verdict: null }),
+              },
+            ]),
+          }));
+          return spawned.id;
+        } finally {
+          // However the spawn ended, its claim stops counting against the caps.
+          releaseClaim(orchestratorId, countPerTurn);
+        }
       }
 
       interface Settled {
@@ -1582,29 +1697,57 @@ export default async function plugin(bb: BbPluginApi) {
     // rows keep work visible after a completed turn collapses to a summary.
     const rows = asScanRows(timeline.delta?.upsertRows ?? timeline.rows);
     const enabledAtMs = state.enabledAt === null ? 0 : Date.parse(state.enabledAt);
-    let maxSeq = Math.max(state.lastSeq, timeline.maxSeq);
+    // A missing or malformed maxSeq must not poison the cursor: Math.max(2, undefined) is NaN, which persists as null.
+    const reportedMaxSeq = typeof timeline.maxSeq === "number" && Number.isFinite(timeline.maxSeq) ? timeline.maxSeq : 0;
+    let maxSeq = Math.max(state.lastSeq, reportedMaxSeq);
     const graceTurnIds = [...state.graceTurnIds];
     const fresh: Violation[] = [];
+    // The turn the batch is about: the newest row that produced a violation.
+    // Block mode stops and nudges this turn, not the first one in the batch.
+    let liveTurnKey: string | null = null;
+    let liveSeq = -1;
     for (const row of rows) {
       const seq = typeof row.sourceSeqEnd === "number" ? row.sourceSeqEnd : 0;
       if (seq > maxSeq) maxSeq = seq;
       if (seq !== 0 && seq <= state.lastSeq) continue;
-      if (state.seenRowIds.includes(row.id)) continue;
-      const turnId = row.turnId ?? null;
-      const startedAt = typeof row.startedAt === "number" ? row.startedAt : 0;
-      if (
-        turnId !== null &&
-        !graceTurnIds.includes(turnId) &&
-        graceTurnIds.length < state.graceSlots &&
-        startedAt >= enabledAtMs
-      ) {
-        graceTurnIds.push(turnId);
+      try {
+        // A later turn can reuse a row id, so the sequence disambiguates a genuine second delivery from a new act.
+        if (state.seenRowIds.includes(seenKey(row))) continue;
+        const turnId = row.turnId ?? null;
+        // Which turns predate the enable is decided by `startedAt` where the row
+        // carries one: an earlier timestamp is history, and history must not
+        // spend a grace slot. A row without one is a partial or delta row (the
+        // timeline puts startedAt on the completed summary, not on every
+        // patch), so "unknown" counts as present and the first post-enable turn
+        // is still excused.
+        const startedAt = typeof row.startedAt === "number" ? row.startedAt : enabledAtMs;
+        if (
+          turnId !== null &&
+          !graceTurnIds.includes(turnId) &&
+          graceTurnIds.length < state.graceSlots &&
+          startedAt >= enabledAtMs
+        ) {
+          graceTurnIds.push(turnId);
+        }
+        // Turns that ran before the session could gain the contract are never
+        // judged, only recorded.
+        if (turnId !== null && graceTurnIds.includes(turnId)) continue;
+        const violation = classifyRow(row, { allowReadCommands: live.allowReadCommands });
+        if (violation !== null) {
+          fresh.push(violation);
+          if (seq >= liveSeq) {
+            liveSeq = seq;
+            // A turn with no id cannot share the sentinel with the next such
+            // turn: "unknown" would suppress every later stop. The row id is
+            // unique per delivery, so the key still names one live turn.
+            liveTurnKey = turnId ?? `unknown:${violation.id}`;
+          }
+        }
+      } catch (cause) {
+        // A malformed row must not wedge the watchdog: the cursor still advances
+        // past it, so the next scan keeps enforcing instead of failing forever.
+        bb.log.warn(`scan skipped a malformed row in ${threadId}: ${String(cause)}`);
       }
-      // Turns that ran before the session could gain the contract are never
-      // judged, only recorded.
-      if (turnId !== null && graceTurnIds.includes(turnId)) continue;
-      const violation = classifyRow(row, { allowReadCommands: live.allowReadCommands });
-      if (violation !== null) fresh.push(violation);
     }
 
     if (fresh.length === 0 && maxSeq === state.lastSeq) return;
@@ -1613,7 +1756,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...current,
       lastSeq: Math.max(current.lastSeq, maxSeq),
       graceTurnIds,
-      seenRowIds: [...current.seenRowIds, ...rows.map((row) => row.id)].slice(-MAX_SEEN_ROWS),
+      seenRowIds: [...current.seenRowIds, ...rows.map(seenKey)].slice(-MAX_SEEN_ROWS),
       violations: [...current.violations, ...fresh].slice(-MAX_VIOLATIONS),
     }));
     if (fresh.length === 0) return;
@@ -1624,7 +1767,7 @@ export default async function plugin(bb: BbPluginApi) {
         .join("; ")}`,
     );
     bb.realtime.publish(STATE_CHANGED, { at: Date.now(), threadId, violations: fresh.length });
-    await intervene(threadId, updated, fresh, enforcement);
+    await intervene(threadId, updated, fresh, enforcement, liveTurnKey ?? fresh[fresh.length - 1]!.id);
   }
 
   async function intervene(
@@ -1632,21 +1775,22 @@ export default async function plugin(bb: BbPluginApi) {
     state: ThreadState | undefined,
     violations: readonly Violation[],
     enforcement: EnforcementLevel,
+    /** Names the live turn for `lastStopTurnId`/`lastNudgeTurnId`. */
+    liveTurnKey: string,
   ): Promise<void> {
     if (state === undefined) return;
-    const turnId = violations.find((violation) => violation.turnId !== null)?.turnId ?? "unknown";
 
-    if (enforcement === "block" && state.lastStopTurnId !== turnId) {
+    if (enforcement === "block" && state.lastStopTurnId !== liveTurnKey) {
       try {
         await bb.sdk.threads.stop({ threadId });
-        await mutateState(threadId, (current) => ({ ...current, lastStopTurnId: turnId }));
+        await mutateState(threadId, (current) => ({ ...current, lastStopTurnId: liveTurnKey }));
         bb.log.warn(`stopped ${threadId} for doing direct work`);
       } catch (cause) {
         bb.log.warn(`stop failed for ${threadId}: ${String(cause)}`);
       }
     }
 
-    if (state.lastNudgeTurnId === turnId) return;
+    if (state.lastNudgeTurnId === liveTurnKey) return;
     if (state.nudgeCount >= live.maxNudges) return;
     const text = buildNudge(violations, enforcement);
     try {
@@ -1658,7 +1802,7 @@ export default async function plugin(bb: BbPluginApi) {
       await mutateState(threadId, (current) => ({
         ...current,
         nudgeCount: current.nudgeCount + 1,
-        lastNudgeTurnId: turnId,
+        lastNudgeTurnId: liveTurnKey,
       }));
     } catch (cause) {
       bb.log.warn(`nudge failed for ${threadId}: ${String(cause)}`);
@@ -1775,43 +1919,65 @@ export default async function plugin(bb: BbPluginApi) {
     threadId: string,
     countPerTurn: boolean,
   ): Promise<void> {
-    const state = await getState(threadId);
-    if (state === undefined) return;
-    if (live.maxParallelWorkers > 0) {
-      const inFlight = state.delegations.filter((delegation) => delegation.status === null).length;
-      if (inFlight >= live.maxParallelWorkers) {
-        throw new WorkerBudgetError(
-          `${inFlight} workers are still running and this plugin caps parallel workers at ${live.maxParallelWorkers}. Wait for one to finish, or raise maxParallelWorkers (0 removes the cap).`,
-        );
+    // Inside the write queue, and counting the claims already in flight: a check
+    // that reads the state beside another claim lets two simultaneous
+    // delegations both pass their cap.
+    await enqueue(async () => {
+      const state = await getState(threadId);
+      if (state === undefined) return;
+      const pending = pendingClaims.get(threadId) ?? { parallel: 0, turn: 0 };
+      if (live.maxParallelWorkers > 0) {
+        const inFlight =
+          state.delegations.filter((delegation) => delegation.status === null).length + pending.parallel;
+        if (inFlight >= live.maxParallelWorkers) {
+          throw new WorkerBudgetError(
+            `${inFlight} workers are still running and this plugin caps parallel workers at ${live.maxParallelWorkers}. Wait for one to finish, or raise maxParallelWorkers (0 removes the cap).`,
+          );
+        }
       }
-    }
-    // The per-turn cap governs what the orchestrator chose to fan out. A check
-    // unit or a fallback retry is this plugin's own decision, and counting it
-    // would let a tight cap silently defeat `verify: true`.
-    if (countPerTurn && live.maxDelegationsPerTurn > 0 && state.turnStartedAt > 0) {
-      const thisTurn = state.delegations.filter(
-        (delegation) => delegation.createdAt >= state.turnStartedAt,
-      ).length;
-      if (thisTurn >= live.maxDelegationsPerTurn) {
-        throw new WorkerBudgetError(
-          `This turn has delegated ${thisTurn} workers and this plugin caps a turn at ${live.maxDelegationsPerTurn}. Fold what came back into a report, or raise maxDelegationsPerTurn (0 removes the cap).`,
-        );
+      // The per-turn cap governs what the orchestrator chose to fan out. A check
+      // unit or a fallback retry is this plugin's own decision, and counting it
+      // would let a tight cap silently defeat `verify: true`.
+      if (countPerTurn && live.maxDelegationsPerTurn > 0) {
+        // Until the first dispatch of a session there is no turn yet, so the
+        // window starts when the mode was enabled rather than being ignored.
+        const enabledAtMs = state.enabledAt === null ? 0 : Date.parse(state.enabledAt);
+        const since = Math.max(state.turnStartedAt, Number.isNaN(enabledAtMs) ? 0 : enabledAtMs);
+        const thisTurn =
+          state.delegations.filter((delegation) => delegation.createdAt >= since).length + pending.turn;
+        if (thisTurn >= live.maxDelegationsPerTurn) {
+          throw new WorkerBudgetError(
+            `This turn has delegated ${thisTurn} workers and this plugin caps a turn at ${live.maxDelegationsPerTurn}. Fold what came back into a report, or raise maxDelegationsPerTurn (0 removes the cap).`,
+          );
+        }
       }
-    }
+      reserveClaim(threadId, countPerTurn);
+    });
   }
 
-  async function checkReviews(threadId: string): Promise<void> {
-    const state = await getState(threadId);
-    if (state === undefined || !state.enabled) return;
-    if (effectiveEnforcement(state) === "instruct") return;
+  /**
+   * The marker for the unjudged set when a reminder is due, or undefined when the
+   * gate is closed: not enabled, instruct level, nothing unjudged, already
+   * reminded for this set, or out of reminders.
+   */
+  function reviewNudgeMarker(state: ThreadState): string | undefined {
+    if (!state.enabled) return undefined;
+    if (effectiveEnforcement(state) === "instruct") return undefined;
     const unreviewed = unreviewedOf(state.delegations);
-    if (unreviewed.length === 0) return;
+    if (unreviewed.length === 0) return undefined;
     const marker = unreviewed
       .map((delegation) => delegation.threadId)
       .sort()
       .join(",");
-    if (state.lastReviewNudge === marker) return;
-    if (state.nudgeCount >= live.maxNudges) return;
+    if (state.lastReviewNudge === marker) return undefined;
+    if (state.nudgeCount >= live.maxNudges) return undefined;
+    return marker;
+  }
+
+  async function checkReviews(threadId: string): Promise<void> {
+    // Cheap guard first: an unrelated idle event should not cost a thread read.
+    const before = await getState(threadId);
+    if (reviewNudgeMarker(before ?? emptyState(Date.now())) === undefined) return;
     try {
       const thread = await bb.sdk.threads.get({ threadId });
       if (thread.status !== "idle" && thread.status !== "error") return;
@@ -1819,6 +1985,23 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(`review gate could not read ${threadId}: ${String(cause)}`);
       return;
     }
+    // Claim inside the serialized mutation: two events for the same unjudged set
+    // must not both send a reminder and spend two of the budget.
+    let claimed: { titles: string[]; count: number; marker: string; enforcement: EnforcementLevel } | undefined;
+    await mutateState(threadId, (current) => {
+      const marker = reviewNudgeMarker(current);
+      if (marker === undefined) return current;
+      const unreviewed = unreviewedOf(current.delegations);
+      claimed = {
+        titles: unreviewed.map((delegation) => delegation.title),
+        count: unreviewed.length,
+        marker,
+        enforcement: effectiveEnforcement(current),
+      };
+      return { ...current, nudgeCount: current.nudgeCount + 1, lastReviewNudge: marker };
+    });
+    if (claimed === undefined) return;
+    const { titles, count, marker, enforcement } = claimed;
     try {
       await bb.sdk.threads.send({
         threadId,
@@ -1826,22 +2009,20 @@ export default async function plugin(bb: BbPluginApi) {
         input: [
           {
             type: "text",
-            text: buildReviewNudge(
-              unreviewed.map((delegation) => delegation.title),
-              effectiveEnforcement(state),
-            ),
+            text: buildReviewNudge(titles, enforcement),
             mentions: [],
           },
         ],
       });
-      await mutateState(threadId, (current) => ({
-        ...current,
-        nudgeCount: current.nudgeCount + 1,
-        lastReviewNudge: marker,
-      }));
-      bb.log.warn(`${threadId} ended a turn with ${unreviewed.length} unjudged worker(s)`);
+      bb.log.warn(`${threadId} ended a turn with ${count} unjudged worker(s)`);
     } catch (cause) {
       bb.log.warn(`review nudge failed for ${threadId}: ${String(cause)}`);
+      // Give the reminder back: the marker would otherwise mute the gate for this set.
+      await mutateState(threadId, (current) =>
+        current.lastReviewNudge === marker
+          ? { ...current, nudgeCount: Math.max(0, current.nudgeCount - 1), lastReviewNudge: null }
+          : current,
+      ).catch(() => undefined);
     }
   }
 
@@ -2187,10 +2368,12 @@ export default async function plugin(bb: BbPluginApi) {
               !clearing &&
               !clearFallback &&
               !hasFallbackPatch &&
-              presetName === undefined &&
               clearPreset === undefined &&
               Object.keys(chosen).length === 0
             ) {
+              // Nothing named a value to write, so this is a read: `--preset
+              // build` on its own asks for a preset with no contents, and
+              // storing `{}` would leave a no-op preset a delegation could name.
               return render(
                 input.options.json,
                 live.worker,
@@ -2207,7 +2390,7 @@ export default async function plugin(bb: BbPluginApi) {
                 // untouched.
                 next = { ...live.worker };
                 const presets = { ...(next.presets ?? {}) };
-                if (presetName !== undefined) {
+                if (presetName !== undefined && Object.keys(chosen).length > 0) {
                   presets[presetName] = { ...presets[presetName], ...chosen };
                 } else if (clearPreset !== undefined) {
                   delete presets[clearPreset];

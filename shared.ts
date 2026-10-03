@@ -44,11 +44,13 @@ export const ENFORCEMENT_DESCRIPTIONS: Record<EnforcementLevel, string> = {
     "Block writes the rules too and stops the turn as soon as the orchestrator does work itself, though a fast write can still land first.",
 };
 
+/** One runtime check for every `as const` union this module declares. */
+export function isOneOf<T extends string>(values: readonly T[], value: unknown): value is T {
+  return typeof value === "string" && (values as readonly string[]).includes(value);
+}
+
 export function isEnforcementLevel(value: unknown): value is EnforcementLevel {
-  return (
-    typeof value === "string" &&
-    (ENFORCEMENT_LEVELS as readonly string[]).includes(value)
-  );
+  return isOneOf(ENFORCEMENT_LEVELS, value);
 }
 
 // ---------------------------------------------------------------------------
@@ -80,24 +82,15 @@ export const SERVICE_TIERS = ["default", "fast"] as const;
 export type ServiceTier = (typeof SERVICE_TIERS)[number];
 
 export function isReasoningLevel(value: unknown): value is ReasoningLevel {
-  return (
-    typeof value === "string" &&
-    (REASONING_LEVELS as readonly string[]).includes(value)
-  );
+  return isOneOf(REASONING_LEVELS, value);
 }
 
 export function isPermissionMode(value: unknown): value is PermissionMode {
-  return (
-    typeof value === "string" &&
-    (PERMISSION_MODES as readonly string[]).includes(value)
-  );
+  return isOneOf(PERMISSION_MODES, value);
 }
 
 export function isServiceTier(value: unknown): value is ServiceTier {
-  return (
-    typeof value === "string" &&
-    (SERVICE_TIERS as readonly string[]).includes(value)
-  );
+  return isOneOf(SERVICE_TIERS, value);
 }
 
 /**
@@ -126,10 +119,7 @@ export const WORKER_PRESETS = ["build", "review", "research"] as const;
 export type WorkerPresetName = (typeof WORKER_PRESETS)[number];
 
 export function isWorkerPreset(value: unknown): value is WorkerPresetName {
-  return (
-    typeof value === "string" &&
-    (WORKER_PRESETS as readonly string[]).includes(value)
-  );
+  return isOneOf(WORKER_PRESETS, value);
 }
 
 /**
@@ -296,8 +286,58 @@ const ALWAYS_ALLOWED: ReadonlySet<string> = new Set([
   "image-view",
 ]);
 
-/** Shell metacharacters that split one command line into separate commands. */
-const COMMAND_SEPARATORS = /(?:&&|\|\||[;|\n\r])/;
+/**
+ * Whether the character at `index` ends one shell command and starts the next.
+ * `;`, `|` and the line breaks always do; `&` is the awkward one, because it
+ * also forms the redirect and fd-duplication operators. A `&` that belongs to
+ * `>&`, `&>` or `2>&1` is part of a redirect rather than a separator, and so is
+ * a leading `&` (as in `&> file`). `&&` still separates, both ampersands of it.
+ * Nothing here is quote-aware: the scanner only asks about characters outside
+ * quotes.
+ */
+function isCommandSeparator(text: string, index: number): boolean {
+  const char = text[index]!;
+  if (char === ";" || char === "|" || char === "\n" || char === "\r") return true;
+  if (char !== "&") return false;
+  if (text[index - 1] === "&" || text[index + 1] === "&") return true;
+  if (text[index - 1] === ">" || text[index + 1] === ">") return false;
+  return index !== 0;
+}
+
+/**
+ * Walk a shell line once. `unquoted` is the text outside quotes, for the
+ * metacharacter tests, and `segments` are the pieces between unquoted
+ * separators, so `rg "a|b"` stays one command, a quoted `>` is not a redirect,
+ * and the `&` in `ls 2>&1` does not cut the line in two.
+ */
+function scanCommandLine(text: string): { unquoted: string; segments: string[] } {
+  const segments: string[] = [];
+  let current = "";
+  let unquoted = "";
+  let quote = "";
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]!;
+    if (quote !== "") {
+      current += char;
+      if (char === quote) quote = "";
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      current += char;
+      continue;
+    }
+    unquoted += char;
+    if (isCommandSeparator(text, index)) {
+      segments.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  segments.push(current);
+  return { unquoted, segments };
+}
 
 /** Leading `FOO=bar` environment assignments before the actual program. */
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
@@ -360,10 +400,11 @@ const READ_ONLY_PROGRAMS: ReadonlySet<string> = new Set([
 
 /**
  * Programs that plausibly appear as the first word of a real command. Not a
- * safety list: a command outside it is still work if it carries the shape of a
- * command, see {@link looksLikeShellCommand}. Its job is to tell a command from
- * the *title* some providers give a plugin tool call, which arrives as a
- * `command` row whose text is a sentence like "Recording verdict for X".
+ * safety list: an unknown program is still work, because a command's first
+ * token is not an English sentence — see {@link looksLikeShellCommand}. Its job
+ * is to tell a command from the *title* some providers give a plugin tool call,
+ * which arrives as a `command` row whose text is a sentence like "Recording
+ * verdict for X".
  */
 const PLAUSIBLE_PROGRAMS: ReadonlySet<string> = new Set([
   ...READ_ONLY_PROGRAMS,
@@ -462,19 +503,55 @@ const PLAUSIBLE_PROGRAMS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Flags that turn an otherwise read-only program into a writer or a runner, so
+ * `find . -delete`, `fd -x rm`, `rg --pre <cmd>` and `yq -i` are not read as
+ * searches. Only programs on the read-only list can appear here.
+ */
+const MUTATING_PROGRAM_FLAGS: Record<string, RegExp> = {
+  find: /^-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/,
+  fd: /^(?:-x|--exec|-X|--exec-batch)$/,
+  rg: /^--pre$/,
+  yq: /^(?:-i|--inplace|--in-place)$/,
+  date: /^(?:-s|--set)/,
+  // `hostname` prints on its own and sets the name when it is given one.
+  hostname: /^[^-]/,
+};
+
+/** A later token that reads as a lowercase English word rather than a shout. */
+const SENTENCE_WORD = /^[a-z][a-z'-]*$/;
+
+/**
  * Whether a `command` row's text is shaped like something that was actually
  * run, rather than the sentence a provider used as a tool call's title.
  *
- * A known program is enough. Anything else has to carry shell evidence (a
- * path, a flag, a redirect, a pipe, an assignment), because no real invocation
- * of an unknown program looks like prose.
+ * One rule separates the two, and it is the first token. A program is named the
+ * way the binary or file is: lowercase (`gradlew build`), a path
+ * (`./deploy.sh`), or an env assignment (`FOO=bar make`). A provider title
+ * instead begins with a capitalised English word and reads on as a sentence
+ * (`Recording verdict for src/app.ts`, `Running the build (2 files)`), so a
+ * capitalised first token plus one later lowercase word means a title. A known
+ * program settles it either way; otherwise a lone capitalised token — a
+ * capitalised program with no lowercase word after it — reads as a program.
+ *
+ * The known residual: a detached capitalised program followed by a lowercase
+ * argument (`Gradlew build`, `Just test`) is read as a title and missed,
+ * because nothing outside the program list distinguishes it from prose. The
+ * lowercase form (`gradlew build`) and the path form (`./Gradlew build`) are
+ * both caught.
  */
 export function looksLikeShellCommand(command: string): boolean {
   const text = command.trim();
   if (text === "") return false;
-  const first = text.split(/\s+/)[0] ?? "";
+  const tokens = text.split(/\s+/);
+  const first = tokens[0] ?? "";
   if (PLAUSIBLE_PROGRAMS.has(first)) return true;
-  return /[|&;<>()$`\\{}*?[\]]|\s-{1,2}\w|\/|\.\w|=\S/.test(text);
+  // A capitalised program name is still a program.
+  if (!/^[A-Z]/.test(first) || PLAUSIBLE_PROGRAMS.has(first.toLowerCase())) return true;
+  // `FOO=bar` is an assignment, not a sentence.
+  if (ENV_ASSIGNMENT.test(first)) return true;
+  // A sentence needs a lowercase word after its first token; without one the
+  // text is a bare capitalised token, which reads as a program, not prose.
+  return !tokens.slice(1).some((token) => SENTENCE_WORD.test(token));
 }
 
 const READ_ONLY_GIT_SUBCOMMANDS: ReadonlySet<string> = new Set([
@@ -502,10 +579,50 @@ const GIT_BRANCH_LIST_OPTIONS: ReadonlySet<string> = new Set([
 ]);
 const GIT_TAG_LIST_OPTIONS: ReadonlySet<string> = new Set(["--list", "-l", "-n"]);
 
+/** `git config` actions that write, whichever read form the same call asks for. */
+const GIT_CONFIG_WRITERS: Record<string, true> = {
+  "--add": true,
+  "--unset": true,
+  "--unset-all": true,
+  "--replace-all": true,
+  "--rename-section": true,
+  "--remove-section": true,
+  "--set": true,
+  "--edit": true,
+  "-e": true,
+};
+
+/** Git global options that take a separate value, so the token after them is not the subcommand. */
+const GIT_GLOBAL_VALUE_FLAGS: Record<string, true> = {
+  "-C": true,
+  "-c": true,
+  "--git-dir": true,
+  "--work-tree": true,
+  "--namespace": true,
+  "--exec-path": true,
+  "--config-env": true,
+};
+
+/** The subcommand after any leading global options: `git -C repo status` reads `status`, not `-C`. */
+function gitSubcommandAndArgs(rest: readonly string[]): { subcommand: string | undefined; args: string[] } {
+  let index = 0;
+  while (index < rest.length) {
+    const token = rest[index]!;
+    if (GIT_GLOBAL_VALUE_FLAGS[token] === true) { index += 2; continue; }
+    if (token.startsWith("-")) { index += 1; continue; }
+    break;
+  }
+  return { subcommand: rest[index], args: rest.slice(index + 1) };
+}
+
 /** Mixed Git subcommands need an explicit query form, not just a known name. */
 function isReadOnlyGitSegment(rest: readonly string[]): boolean {
-  const [subcommand, ...args] = rest;
+  const { subcommand, args } = gitSubcommandAndArgs(rest);
   if (subcommand === undefined) return true;
+  // A diff-family `--output=<file>`/`--output <file>` writes a file, whatever
+  // the subcommand reads. Only those two forms: `--output-indicator-*` is a
+  // read-only display flag that shares the prefix.
+  if (args.some((arg) => arg === "--output" || arg.startsWith("--output="))) return false;
   if (subcommand === "branch" || subcommand === "tag") {
     const isBranch = subcommand === "branch";
     const listing = args.includes("--list") || (!isBranch && args.includes("-l"));
@@ -525,7 +642,11 @@ function isReadOnlyGitSegment(rest: readonly string[]): boolean {
     return args.length === 0 || args[0] === "show" || args[0] === "list" || args[0] === "exists";
   }
   if (subcommand === "config") {
-    return args.some((arg) => arg === "--get" || arg === "--list" || arg === "-l");
+    // A read form only reads when the same call carries no writing action.
+    return (
+      args.some((arg) => arg === "--get" || arg === "--list" || arg === "-l") &&
+      !args.some((arg) => GIT_CONFIG_WRITERS[arg] === true)
+    );
   }
   return READ_ONLY_GIT_SUBCOMMANDS.has(subcommand);
 }
@@ -576,13 +697,13 @@ const HELP_OR_VERSION = /(?:^|\s)(?:--help|-h|--version)(?:\s|=|$)/;
 export function isReadOnlyCommand(command: string): boolean {
   const trimmed = command.trim();
   if (trimmed === "") return true;
-  // A redirect writes, whatever the program is.
-  if (/(^|[^>])>(?!&)/.test(trimmed) || />>/.test(trimmed)) return false;
-  if (/\btee\b/.test(trimmed)) return false;
-  // Command substitution can hide anything.
-  if (/\$\(|`/.test(trimmed)) return false;
+  const { unquoted, segments } = scanCommandLine(trimmed);
+  // A redirect writes, whatever the program is. Only unquoted text counts: `echo 'a > b'` writes nothing.
+  if (/(^|[^>])>(?!&)/.test(unquoted) || />>/.test(unquoted)) return false;
+  if (/\btee\b/.test(unquoted)) return false;
+  // Command and process substitution can hide a whole command in a read-only one.
+  if (/\$\(|`|[<(]\(/.test(unquoted)) return false;
 
-  const segments = trimmed.split(COMMAND_SEPARATORS);
   return segments.every((segment) => isReadOnlySegment(segment.trim()));
 }
 
@@ -596,9 +717,29 @@ function isReadOnlySegment(segment: string): boolean {
   const program = tokens[index];
   if (program === undefined) return true;
   const name = program.replace(/^.*\//, "");
-  if (name === "git") return isReadOnlyGitSegment(tokens.slice(index + 1));
-  if (name === "bb") return isReadOnlyBbSegment(tokens.slice(index + 1));
-  return READ_ONLY_PROGRAMS.has(name);
+  const args = tokens.slice(index + 1);
+  if (name === "git") return isReadOnlyGitSegment(args);
+  if (name === "bb") return isReadOnlyBbSegment(args);
+  if (name === "env") return isReadOnlyEnvSegment(args);
+  if (!READ_ONLY_PROGRAMS.has(name)) return false;
+  const mutating = MUTATING_PROGRAM_FLAGS[name];
+  return mutating === undefined || !args.some((arg) => mutating.test(arg));
+}
+
+/**
+ * `env` only reads when it is not running a program: `env`, `env FOO=1` and `env -i` report, `env rm -rf x` does not.
+ * `-u`/`--unset` and `-S`/`--split-string` take a separate value, so the token after them is not the program.
+ */
+function isReadOnlyEnvSegment(rest: readonly string[]): boolean {
+  let index = 0;
+  while (index < rest.length) {
+    const token = rest[index]!;
+    if (token === "-u" || token === "--unset" || token === "-S" || token === "--split-string") { index += 2; continue; }
+    if (token.startsWith("-") || ENV_ASSIGNMENT.test(token)) { index += 1; continue; }
+    break;
+  }
+  const program = rest[index];
+  return program === undefined || isReadOnlySegment(rest.slice(index).join(" "));
 }
 
 function isReadOnlyBbSegment(rest: readonly string[]): boolean {
@@ -646,7 +787,8 @@ export function classifyRow(
   }
 
   if (workKind === "command") {
-    const command = (row.command ?? "").trim();
+    // A malformed row must not throw out of the scan loop: a non-string command reads as no command at all.
+    const command = typeof row.command === "string" ? row.command.trim() : "";
     if (allowReadCommands && command !== "" && isReadOnlyCommand(command)) {
       return null;
     }
@@ -693,10 +835,7 @@ export const CONTRACT_PRESETS = [
 export type ContractPresetId = (typeof CONTRACT_PRESETS)[number];
 
 export function isContractPreset(value: unknown): value is ContractPresetId {
-  return (
-    typeof value === "string" &&
-    (CONTRACT_PRESETS as readonly string[]).includes(value)
-  );
+  return isOneOf(CONTRACT_PRESETS, value);
 }
 
 /**
@@ -708,6 +847,12 @@ export function isContractPreset(value: unknown): value is ContractPresetId {
  * honest when the contract grows.
  */
 export const EXTRA_INSTRUCTION_LIMIT = 370;
+
+/** `bb.agents.configure` truncates the dynamic instructions at this many characters. */
+export const INSTRUCTION_LIMIT = 4096;
+
+/** One reminder line, so a long file path cannot crowd out the contract it corrects. */
+const REMINDER_LINE_LIMIT = 120;
 
 export interface InstructionInput {
   enforcement: EnforcementLevel;
@@ -791,15 +936,15 @@ export function buildInstructions(input: InstructionInput): string {
     ? "Read-only shell commands (`ls`, `cat`, `rg`, `git status`, `git diff`, `git log`, `find`, `wc`) are allowed so you can orient yourself. Anything that writes, builds, installs, commits or otherwise changes state is not."
     : "Do not run shell commands at all. Reading files and searching is enough to orient yourself.";
 
-  const reminders =
-    input.reminders === undefined || input.reminders.length === 0
+  const reminderLines = (input.reminders ?? [])
+    .slice(-5)
+    .map((line) => (line.length > REMINDER_LINE_LIMIT ? `${line.slice(0, REMINDER_LINE_LIMIT - 3)}...` : line));
+  const reminderBlock = (lines: readonly string[]): string =>
+    lines.length === 0
       ? ""
-      : `\n\nYou have already broken this contract in this thread:\n${input.reminders
-          .slice(-5)
-          .map((line) => `- ${line}`)
-          .join("\n")}`;
+      : `\n\nYou have already broken this contract in this thread:\n${lines.map((line) => `- ${line}`).join("\n")}`;
 
-  return `# ORCHESTRATOR MODE IS ON FOR THIS THREAD
+  const render = (lines: readonly string[]): string => `# ORCHESTRATOR MODE IS ON FOR THIS THREAD
 
 You are an orchestrator. You do not do the work. Every unit of actual work is
 handed to a worker thread, and your own output is the plan, the delegation, and
@@ -855,7 +1000,17 @@ ${extraBudget(input.extra)}## If you cannot delegate
 
 Say so plainly and stop. "I cannot do this without doing the work myself" is a
 correct answer; doing the work yourself is not. Do not disable or argue with
-this mode. Ask the user to turn it off in the composer if it is wrong.${reminders}`;
+this mode. Ask the user to turn it off in the composer if it is wrong.${reminderBlock(lines)}`;
+
+  const whole = render(reminderLines);
+  if (whole.length <= INSTRUCTION_LIMIT) return whole;
+  // BB cuts the dynamic block at the ceiling and the tail is what disappears, so the reminders are trimmed here
+  // instead: the contract has to arrive whole, and the newest reminders are the ones worth keeping.
+  for (let keep = reminderLines.length - 1; keep >= 0; keep -= 1) {
+    const candidate = render(reminderLines.slice(reminderLines.length - keep));
+    if (candidate.length <= INSTRUCTION_LIMIT) return candidate;
+  }
+  return render([]);
 }
 
 /**
@@ -953,10 +1108,7 @@ export function buildNudge(violations: readonly Violation[], enforcement: Enforc
     enforcement === "block"
       ? " The turn was stopped, so any change you made mid-flight may be incomplete."
       : "";
-  const missingTool =
-    "\n\nIf `" +
-    DELEGATE_TOOL +
-    "` is not among your tools, this session predates the mode and cannot gain tools mid-flight. Do not improvise another delegation mechanism and do not retry the work: say plainly that the tool arrives with the next session, and stop.";
+  const missingTool = `\n\nIf \`${DELEGATE_TOOL}\` is not among your tools, this session predates the mode and cannot gain tools mid-flight. Do not improvise another delegation mechanism and do not retry the work: say plainly that the tool arrives with the next session, and stop.`;
   return `Orchestrator mode caught you doing the work yourself:${stopped}
 
 ${acts}

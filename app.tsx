@@ -30,83 +30,23 @@ import {
   type PluginComposerScope,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
-import type { rpcContract } from "./server";
-import { ENFORCEMENT_DESCRIPTIONS, type EnforcementLevel } from "./shared";
+import type { ContractDto, OrchestratorStateDto, rpcContract } from "./server";
+import {
+  ENFORCEMENT_DESCRIPTIONS,
+  type EnforcementLevel,
+  type PermissionMode,
+  type ReasoningLevel,
+  type ServiceTier,
+  type WorkerConfig,
+  type WorkerExecution,
+  type WorkerPresetName,
+} from "./shared";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import "./app.css";
 
-interface ViolationDto {
-  id: string;
-  turnId: string | null;
-  workKind: string;
-  detail: string;
-  detectedAt: number;
-}
-
-interface DelegationDto {
-  threadId: string;
-  title: string;
-  task: string;
-  createdAt: number;
-  status: string | null;
-}
-
-interface OrchestratorState {
-  enabled: boolean;
-  enforcement: EnforcementLevel | null;
-  effectiveEnforcement: EnforcementLevel;
-  enabledAt: string | null;
-  violations: ViolationDto[];
-  delegations: DelegationDto[];
-  nudgeCount: number;
-  defaultForNewThreads: boolean;
-  allowReadCommands: boolean;
-  maxNudges: number;
-}
-
-/** Mirrors the SDK's own unions; the pickers take the SDK's types, not these. */
-type ReasoningLevelDto =
-  | "none"
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh"
-  | "max"
-  | "ultra"
-  | "ultracode";
-type ServiceTierDto = "default" | "fast";
-type PermissionModeDto = "auto" | "accept-edits" | "full";
-
-/**
- * What every delegation will ask for. An absent field is inherited from the
- * project, not "unset": `{}` means workers follow the project's own execution.
- */
-interface WorkerExecutionDto {
-  providerId?: string;
-  model?: string;
-  reasoningLevel?: ReasoningLevelDto;
-  serviceTier?: ServiceTierDto;
-  permissionMode?: PermissionModeDto;
-}
-
-type WorkerPresetNameDto = "build" | "review" | "research";
-
-interface WorkerConfigDto extends WorkerExecutionDto {
-  fallback?: WorkerExecutionDto;
-  /** Per-unit-class overrides, applied under a delegation's own arguments. */
-  presets?: Partial<Record<WorkerPresetNameDto, WorkerExecutionDto>>;
-}
-
-/** The contract the plugin injects, and how much room is left for rules. */
-interface ContractDto {
-  text: string;
-  extra: string;
-  limit: number;
-}
-
 /** The presets the settings section edits, in the order it shows them. */
-const PRESET_ROWS: { name: WorkerPresetNameDto; label: string; hint: string }[] = [
+const PRESET_ROWS: { name: WorkerPresetName; label: string; hint: string }[] = [
   { name: "build", label: "Build", hint: "for units that change files" },
   { name: "review", label: "Review", hint: "for units that only inspect work" },
   { name: "research", label: "Research", hint: "for units that answer a question" },
@@ -116,15 +56,15 @@ const PRESET_ROWS: { name: WorkerPresetNameDto; label: string; hint: string }[] 
 interface ExecutionSelection {
   providerId: string;
   model: string;
-  reasoningLevel: ReasoningLevelDto;
-  serviceTier?: ServiceTierDto;
-  permissionMode?: PermissionModeDto;
+  reasoningLevel: ReasoningLevel;
+  serviceTier?: ServiceTier;
+  permissionMode?: PermissionMode;
 }
 
 /** The mutable handle every surface in one composer shares. */
 interface Controller {
   enabled: boolean;
-  state: OrchestratorState | null;
+  state: OrchestratorStateDto | null;
   busy: boolean;
   toggle(): Promise<void>;
   turnOff(): Promise<void>;
@@ -186,7 +126,7 @@ function OrchestratorHost() {
   const key = scopeKey(view.scope);
   const threadId = view.scope.kind === "thread" ? view.scope.threadId : null;
 
-  const [state, setState] = useState<OrchestratorState | null>(null);
+  const [state, setState] = useState<OrchestratorStateDto | null>(null);
   const [defaultEnabled, setDefaultEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -386,7 +326,7 @@ function OrchestratorToggle() {
 function WorkerExecutionSettings() {
   const rpc = useRpc<typeof rpcContract>();
   const sdk = useSdk();
-  const [stored, setStored] = useState<WorkerConfigDto | null>(null);
+  const [stored, setStored] = useState<WorkerConfig | null>(null);
   const [contract, setContract] = useState<ContractDto | null>(null);
   const [draft, setDraft] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -413,7 +353,7 @@ function WorkerExecutionSettings() {
   /** Write the configuration. A promise is awaited first, so a caller that has
    * to read the catalog before it knows the value passes one. */
   const save = useCallback(
-    async (next: WorkerConfigDto | null | Promise<WorkerConfigDto>) => {
+    async (next: WorkerConfig | null | Promise<WorkerConfig>) => {
       setBusy(true);
       try {
         setStored(await rpc.call("set_worker_execution", await next));
@@ -430,7 +370,7 @@ function WorkerExecutionSettings() {
    * This machine's catalog default, so every field the picker shows is one the
    * provider it names can actually serve.
    */
-  const seed = useCallback(async (): Promise<WorkerExecutionDto> => {
+  const seed = useCallback(async (): Promise<WorkerExecution> => {
     const system = await sdk.providers.models();
     const provider = system.providers.find((entry) => entry.available);
     if (provider === undefined) throw new Error("No provider is available on this machine.");
@@ -713,7 +653,7 @@ function WorkerExecutionSettings() {
 }
 
 /** The picker's own value shape, filled from what is stored. */
-function selectionOf(stored: WorkerExecutionDto): ExecutionSelection {
+function selectionOf(stored: WorkerExecution): ExecutionSelection {
   return {
     providerId: stored.providerId!,
     model: stored.model!,
@@ -723,12 +663,12 @@ function selectionOf(stored: WorkerExecutionDto): ExecutionSelection {
 }
 
 /** The config without its worker execution, keeping any fallback. */
-function dropPrimary(config: WorkerConfigDto | null): WorkerConfigDto {
+function dropPrimary(config: WorkerConfig | null): WorkerConfig {
   return config?.fallback === undefined ? {} : { fallback: config.fallback };
 }
 
 /** The config without a retry target, keeping the worker execution. */
-function dropFallback(config: WorkerConfigDto | null): WorkerConfigDto {
+function dropFallback(config: WorkerConfig | null): WorkerConfig {
   const { fallback: _fallback, ...execution } = config ?? {};
   return execution;
 }
