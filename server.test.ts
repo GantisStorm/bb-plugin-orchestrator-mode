@@ -8,7 +8,7 @@ import {
 } from "@get-bb/plugin-sdk/testing";
 import type { BbPluginApi, PluginSettingValue } from "@get-bb/plugin-sdk";
 import { REVIEW_TOOL } from "./shared";
-import plugin, { DELEGATE_TOOL, type OrchestratorStateDto } from "./server";
+import plugin, { DELEGATE_TOOL, MAX_STATE_BYTES, type OrchestratorStateDto } from "./server";
 import { writeMirror } from "./shared";
 
 const THREAD = "th_orchestrator";
@@ -1925,6 +1925,42 @@ describe("rpc", () => {
     // The unreadable timestamp falls back to 0, so that row is the oldest.
     expect(raw.th_bad).toBeUndefined();
     expect(raw.th_2).toBeDefined();
+  });
+
+  it("keeps the persisted map under the byte budget without losing the newest thread", async () => {
+    const detail = "x".repeat(100);
+    const seed: Record<string, unknown> = {};
+    for (let index = 1; index <= 20; index += 1) {
+      seed[`th_${index}`] = {
+        enabled: false,
+        touchedAt: index,
+        violations: Array.from({ length: 60 }, (_, at) => ({
+          id: `v_${index}_${at}`,
+          turnId: "turn_1",
+          workKind: "command",
+          detail,
+          detectedAt: index,
+        })),
+      };
+    }
+    // ~220 KB of rows: seedable (under the store's 256 KB limit) but well past
+    // the plugin's 192 KB budget, so the next write has to prune before it can
+    // succeed.
+    const { bb, harness } = await load({}, seed);
+    await enable(harness);
+
+    const raw = (await bb.storage.kv.get("state")) as Record<string, unknown>;
+    // (a) the persisted map fits the budget the store enforces.
+    expect(Buffer.byteLength(JSON.stringify(raw), "utf8")).toBeLessThanOrEqual(MAX_STATE_BYTES);
+    // (b) the newest thread and the newest seeded row survived the trim.
+    expect(raw[THREAD]).toMatchObject({ enabled: true });
+    expect(raw.th_20).toBeDefined();
+    expect(Object.keys(raw).length).toBeLessThan(20);
+    // (c) the write succeeded and a surviving row still reads back whole.
+    const kept = (await harness.behavior.callRpc("get_state", {
+      threadId: "th_20",
+    })) as OrchestratorStateDto;
+    expect(kept.violations).toHaveLength(60);
   });
 });
 

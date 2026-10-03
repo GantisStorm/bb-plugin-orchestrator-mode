@@ -78,9 +78,22 @@ const WORKER_KEY = "worker";
 const CONTRACT_KEY = "contract";
 /** Threads kept in the KV map before the least recently touched is dropped. */
 const MAX_THREADS = 300;
+/**
+ * The KV map's byte ceiling, under BB's 262,144-byte value limit. A write past
+ * that limit fails with an opaque store error and the toggle silently stays
+ * off, so the map is trimmed to fit here and leave 64 KiB of headroom — several
+ * rows at the measured ~15 KB each — for the row the write is adding.
+ */
+export const MAX_STATE_BYTES = 196_608;
 const MAX_VIOLATIONS = 100;
 const MAX_SEEN_ROWS = 500;
 const MAX_DELEGATIONS = 50;
+
+/** UTF-8 bytes of a JSON value, the unit the store's size budget is measured in. */
+const utf8Encoder = new TextEncoder();
+function byteLength(value: unknown): number {
+  return utf8Encoder.encode(JSON.stringify(value) ?? "null").length;
+}
 
 export interface Delegation {
   threadId: string;
@@ -935,12 +948,12 @@ export default async function plugin(bb: BbPluginApi) {
       if (next === null) {
         if (all[threadId] === undefined) return undefined;
         delete all[threadId];
-        await persist(prune(all));
+        await persist(prune(all, inFlightThreads(threadId)));
         return undefined;
       }
       next.touchedAt = Date.now();
       all[threadId] = next;
-      await persist(prune(all));
+      await persist(prune(all, inFlightThreads(threadId)));
       return next;
     });
   }
@@ -959,13 +972,55 @@ export default async function plugin(bb: BbPluginApi) {
     }));
   }
 
-  /** Drop the least recently touched threads once the map outgrows its cap. */
-  function prune(all: Record<string, ThreadState>): Record<string, ThreadState> {
+  /**
+   * The threads a prune must not evict: the one this write is about, and any
+   * thread whose scan is queued or running. Dropping a scanning thread would
+   * lose its cursor and re-report work the next scan already classified.
+   */
+  function inFlightThreads(threadId: string): string[] {
+    return [threadId, ...scanning, ...scanTimers.keys()];
+  }
+
+  /**
+   * Drop the least recently touched threads until the map is inside both its
+   * count cap and the store's byte budget. The newest thread and every thread in
+   * flight always survive, whatever the budget says. Each eviction is logged, so
+   * a drop is never silent.
+   */
+  function prune(
+    all: Record<string, ThreadState>,
+    protectedIds: readonly string[],
+  ): Record<string, ThreadState> {
     const ids = Object.keys(all);
-    if (ids.length <= MAX_THREADS) return all;
-    const ordered = ids.sort((a, b) => (all[a]!.touchedAt ?? 0) - (all[b]!.touchedAt ?? 0));
+    if (ids.length <= MAX_THREADS && byteLength(all) <= MAX_STATE_BYTES) return all;
+
+    // Oldest first: walking this order backwards is the eviction order.
+    const ranked = ids.sort((a, b) => (all[a]!.touchedAt ?? 0) - (all[b]!.touchedAt ?? 0));
+    const keep = new Set(protectedIds);
+    const newest = ranked[ranked.length - 1];
+    if (newest !== undefined) keep.add(newest);
     const out: Record<string, ThreadState> = {};
-    for (const id of ordered.slice(ordered.length - MAX_THREADS)) out[id] = all[id]!;
+    let bytes = 2; // "{}"
+    let count = 0;
+    const dropped: string[] = [];
+    for (let index = ranked.length - 1; index >= 0; index -= 1) {
+      const id = ranked[index]!;
+      // The exact JSON the store will write for this entry: quoted key, colon,
+      // value. Summed with the braces and commas this equals stringified size.
+      const grown = bytes + (count === 0 ? 0 : 1) + byteLength(id) + 1 + byteLength(all[id]);
+      if (keep.has(id) || (count < MAX_THREADS && grown <= MAX_STATE_BYTES)) {
+        out[id] = all[id]!;
+        bytes = grown;
+        count += 1;
+      } else {
+        dropped.push(id);
+      }
+    }
+    if (dropped.length > 0) {
+      bb.log.warn(
+        `state map over budget: dropped ${dropped.length} least recently touched thread(s) (${dropped.slice(0, 5).join(", ")}${dropped.length > 5 ? ", …" : ""})`,
+      );
+    }
     return out;
   }
 
