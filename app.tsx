@@ -107,9 +107,9 @@ interface ContractDto {
 
 /** The presets the settings section edits, in the order it shows them. */
 const PRESET_ROWS: { name: WorkerPresetNameDto; label: string; hint: string }[] = [
-  { name: "build", label: "Build", hint: "Units that change the repository." },
-  { name: "review", label: "Review", hint: "Units that only inspect work." },
-  { name: "research", label: "Research", hint: "Units that answer a question." },
+  { name: "build", label: "Build", hint: "for units that change files" },
+  { name: "review", label: "Review", hint: "for units that only inspect work" },
+  { name: "research", label: "Research", hint: "for units that answer a question" },
 ];
 
 /** The SDK's value shape for the provider/model picker. */
@@ -469,11 +469,11 @@ function WorkerExecutionSettings() {
     <div className="rounded-md border border-border bg-surface-recessed/70 p-3">
       <div className="flex items-start justify-between gap-6">
         <div className="min-w-0">
-          <div className="text-sm font-medium">Workers run on</div>
+          <div className="text-sm font-medium">Which provider and model workers use</div>
           <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
             {execution === null
-              ? "Inherit this project's remembered provider and model."
-              : "Use the provider and model below. A single delegation can still override them."}
+              ? "Inherit — workers use this project's remembered provider and model."
+              : "Custom — every worker starts on the provider and model below."}
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-1" role="group" aria-label="Worker provider and model">
@@ -524,11 +524,11 @@ function WorkerExecutionSettings() {
 
       <div className="mt-3 flex items-start justify-between gap-6 border-t border-border/60 pt-3">
         <div className="min-w-0">
-          <div className="text-sm font-medium">Retry a failed worker</div>
+          <div className="text-sm font-medium">If a worker fails</div>
           <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
             {fallback === null
-              ? "A failed worker is reported back to the orchestrator."
-              : "The same brief is re-delegated on this provider, model and access."}
+              ? "Report — the failure comes back to the orchestrator to re-delegate."
+              : "Retry — the same brief runs once more on the provider, model and access below."}
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-1" role="group" aria-label="Worker fallback">
@@ -589,8 +589,9 @@ function WorkerExecutionSettings() {
       <div className="mt-3 border-t border-border/60 pt-3">
         <div className="text-sm font-medium">Presets</div>
         <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
-          A preset is one word a delegation can name, applied under its own arguments. An
-          unset preset changes nothing.
+          Save a model and an access level for each kind of work. When the orchestrator hands
+          a unit to a worker it can name the kind, and that unit runs on what you saved here
+          instead of the default above. A kind left off uses the default.
         </p>
         <div className="mt-2 flex flex-col gap-2">
           {PRESET_ROWS.map(({ name, label, hint }) => {
@@ -611,7 +612,7 @@ function WorkerExecutionSettings() {
                     void save({ ...stored, presets });
                   }}
                 >
-                  Off
+                  Default
                 </Button>
                 <Button
                   variant={preset === null ? "ghost" : "secondary"}
@@ -631,7 +632,9 @@ function WorkerExecutionSettings() {
                   Set
                 </Button>
                 {preset === null ? (
-                  <span className="text-xs text-subtle-foreground/75">{hint}</span>
+                  <span className="text-xs text-subtle-foreground/75">
+                    uses the default above · {hint}
+                  </span>
                 ) : (
                   <>
                     <ProviderModelPicker
@@ -663,10 +666,10 @@ function WorkerExecutionSettings() {
       </div>
 
       <div className="mt-3 border-t border-border/60 pt-3">
-        <div className="text-sm font-medium">Project rules</div>
+        <div className="text-sm font-medium">Extra rules for this project</div>
         <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
-          Appended to the contract as its own section, so a rule adds to the contract rather
-          than replacing what the watchdog enforces.
+          Added to the contract as its own section, so a rule adds to what the orchestrator is
+          told instead of replacing the rules the watchdog enforces.
         </p>
         <textarea
           value={draft ?? contract?.extra ?? ""}
@@ -680,7 +683,7 @@ function WorkerExecutionSettings() {
         />
         <div className="mt-1 flex items-center justify-between gap-3">
           <span className="text-xs text-subtle-foreground/75">
-            {(draft ?? contract?.extra ?? "").length} / {contract?.limit ?? 370} characters
+            {(draft ?? contract?.extra ?? "").length} of {contract?.limit ?? 370} characters used
           </span>
           <Button
             variant="outline"
@@ -696,7 +699,7 @@ function WorkerExecutionSettings() {
 
       <details className="mt-3 border-t border-border/60 pt-3">
         <summary className="cursor-pointer text-sm font-medium">
-          What the orchestrator is told
+          The contract: the exact instructions this plugin adds
           <span className="ml-2 font-normal text-subtle-foreground/75">
             {contract === null ? "" : `${contract.text.length} of 4096 characters`}
           </span>
@@ -734,8 +737,9 @@ function dropFallback(config: WorkerConfigDto | null): WorkerConfigDto {
 export default definePluginApp((app) => {
   app.slots.settingsSection({
     id: "worker-execution",
-    title: "Worker execution",
-    description: "What every delegated worker thread runs on.",
+    title: "Workers",
+    description:
+      "What delegated workers run on, how a failure is retried, and one-word presets a delegation can name. Enforcement, the contract and the limits are in the plugin settings above.",
     component: WorkerExecutionSettings,
   });
 
