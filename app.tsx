@@ -27,16 +27,13 @@ import {
   useRpc,
   useSdk,
   type ComposerView,
+  type ExperimentalProviderModelPickerValue,
   type PluginComposerScope,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { ContractDto, OrchestratorStateDto, rpcContract } from "./server";
 import {
   ENFORCEMENT_DESCRIPTIONS,
-  type EnforcementLevel,
-  type PermissionMode,
-  type ReasoningLevel,
-  type ServiceTier,
   type WorkerConfig,
   type WorkerExecution,
   type WorkerPresetName,
@@ -52,22 +49,11 @@ const PRESET_ROWS: { name: WorkerPresetName; label: string; hint: string }[] = [
   { name: "research", label: "Research", hint: "for units that answer a question" },
 ];
 
-/** The SDK's value shape for the provider/model picker. */
-interface ExecutionSelection {
-  providerId: string;
-  model: string;
-  reasoningLevel: ReasoningLevel;
-  serviceTier?: ServiceTier;
-  permissionMode?: PermissionMode;
-}
-
 /** The mutable handle every surface in one composer shares. */
 interface Controller {
   enabled: boolean;
-  state: OrchestratorStateDto | null;
   busy: boolean;
   toggle(): Promise<void>;
-  turnOff(): Promise<void>;
 }
 
 const registry = new Map<string, Controller>();
@@ -190,10 +176,8 @@ function OrchestratorHost() {
     if (key === null) return;
     const controller: Controller = {
       enabled,
-      state,
       busy,
       toggle: () => applyEnabled(!enabled),
-      turnOff: () => applyEnabled(false),
     };
     registry.set(key, controller);
     bump();
@@ -425,7 +409,9 @@ function WorkerExecutionSettings() {
             disabled={loading || busy}
             className="h-7 px-2 text-xs"
             onClick={() => {
-              if (execution !== null) void save(dropPrimary(execution));
+              if (execution !== null) {
+                void save(execution.fallback === undefined ? {} : { fallback: execution.fallback });
+              }
             }}
           >
             Inherit
@@ -653,18 +639,13 @@ function WorkerExecutionSettings() {
 }
 
 /** The picker's own value shape, filled from what is stored. */
-function selectionOf(stored: WorkerExecution): ExecutionSelection {
+function selectionOf(stored: WorkerExecution): ExperimentalProviderModelPickerValue {
   return {
     providerId: stored.providerId!,
     model: stored.model!,
     reasoningLevel: stored.reasoningLevel ?? "medium",
     ...(stored.serviceTier === undefined ? {} : { serviceTier: stored.serviceTier }),
   };
-}
-
-/** The config without its worker execution, keeping any fallback. */
-function dropPrimary(config: WorkerConfig | null): WorkerConfig {
-  return config?.fallback === undefined ? {} : { fallback: config.fallback };
 }
 
 /** The config without a retry target, keeping the worker execution. */
