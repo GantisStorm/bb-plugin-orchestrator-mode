@@ -406,26 +406,22 @@ function WorkerExecutionSettings() {
 
   /**
    * This machine's catalog default, so every field the picker shows is one the
-   * provider it names can actually serve. Only the worker execution carries a
-   * permission mode; a fallback inherits the one its workers already use.
+   * provider it names can actually serve.
    */
-  const seed = useCallback(
-    async (withPermission: boolean): Promise<WorkerExecutionDto> => {
-      const system = await sdk.providers.models();
-      const provider = system.providers.find((entry) => entry.available);
-      if (provider === undefined) throw new Error("No provider is available on this machine.");
-      const listed = await sdk.providers.models({ providerId: provider.id });
-      const model = listed.models.find((entry) => entry.isDefault) ?? listed.models[0];
-      if (model === undefined) throw new Error(`${provider.id} offers no models.`);
-      return {
-        providerId: provider.id,
-        model: model.id,
-        reasoningLevel: model.defaultReasoningEffort,
-        ...(withPermission ? { permissionMode: system.permissionCeiling } : {}),
-      };
-    },
-    [sdk],
-  );
+  const seed = useCallback(async (): Promise<WorkerExecutionDto> => {
+    const system = await sdk.providers.models();
+    const provider = system.providers.find((entry) => entry.available);
+    if (provider === undefined) throw new Error("No provider is available on this machine.");
+    const listed = await sdk.providers.models({ providerId: provider.id });
+    const model = listed.models.find((entry) => entry.isDefault) ?? listed.models[0];
+    if (model === undefined) throw new Error(`${provider.id} offers no models.`);
+    return {
+      providerId: provider.id,
+      model: model.id,
+      reasoningLevel: model.defaultReasoningEffort,
+      permissionMode: system.permissionCeiling,
+    };
+  }, [sdk]);
 
   /** The stored execution, only when it names the provider and model the
    * pickers need; null while the workers inherit the project's own. */
@@ -466,7 +462,7 @@ function WorkerExecutionSettings() {
             disabled={loading || busy}
             className="h-7 px-2 text-xs"
             onClick={() =>
-              void save(seed(true).then((chosen) => ({ ...stored, ...chosen })))
+              void save(seed().then((chosen) => ({ ...stored, ...chosen })))
             }
           >
             Custom
@@ -498,7 +494,7 @@ function WorkerExecutionSettings() {
           <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
             {fallback === null
               ? "A failed worker is reported back to the orchestrator."
-              : "The same brief is re-delegated on this provider and model."}
+              : "The same brief is re-delegated on this provider, model and access."}
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-1" role="group" aria-label="Worker fallback">
@@ -521,7 +517,7 @@ function WorkerExecutionSettings() {
             disabled={loading || busy}
             className="h-7 px-2 text-xs"
             onClick={() =>
-              void save(seed(false).then((chosen) => ({ ...stored, fallback: chosen })))
+              void save(seed().then((chosen) => ({ ...stored, fallback: chosen })))
             }
           >
             Retry
@@ -535,7 +531,24 @@ function WorkerExecutionSettings() {
             value={selectionOf(fallback)}
             disabled={busy}
             className="h-8 max-w-full"
-            onChange={(next) => void save({ ...stored, fallback: next })}
+            onChange={(next) =>
+              void save({
+                ...stored,
+                fallback: {
+                  ...next,
+                  ...(fallback.permissionMode === undefined
+                    ? {}
+                    : { permissionMode: fallback.permissionMode }),
+                },
+              })
+            }
+          />
+          <PermissionModePicker
+            providerId={fallback.providerId!}
+            value={fallback.permissionMode ?? execution?.permissionMode ?? "full"}
+            disabled={busy}
+            className="h-8 shrink-0"
+            onChange={(permissionMode) => void save({ ...stored, fallback: { ...fallback, permissionMode } })}
           />
         </div>
       )}

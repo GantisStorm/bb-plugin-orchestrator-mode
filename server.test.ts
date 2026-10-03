@@ -7,7 +7,7 @@ import {
   type FakePluginHarness,
 } from "@get-bb/plugin-sdk/testing";
 import type { BbPluginApi, PluginSettingValue } from "@get-bb/plugin-sdk";
-import plugin, { DELEGATE_TOOL } from "./server";
+import plugin, { DELEGATE_TOOL, type OrchestratorStateDto } from "./server";
 import { writeMirror } from "./shared";
 
 const THREAD = "th_orchestrator";
@@ -30,6 +30,9 @@ interface ProviderCatalogFixture {
   providers?: { id: string; available: boolean }[];
   models?: Record<string, { id: string }[]>;
 }
+
+/** The retry target the delegation-failure tests store. */
+const RETRY_TARGET = { providerId: "claude-code", model: "claude-opus-5-5" };
 
 /** The catalog the delegation tests resolve worker ids against. */
 const CATALOG: ProviderCatalogFixture = {
@@ -793,10 +796,7 @@ describe("the delegation tool", () => {
   /** Enable a thread whose workers run on a stored execution and retry target.
    * Pass `null` for a thread with no retry target. */
   async function armFallback(
-    fallback: { providerId: string; model: string } | null = {
-      providerId: "claude-code",
-      model: "claude-opus-5-5",
-    },
+    fallback: OrchestratorStateDto["workerExecution"] | null = RETRY_TARGET,
   ): Promise<FakePluginHarness> {
     const { harness } = await load({}, undefined, CATALOG);
     await harness.behavior.callRpc("set_worker_execution", {
@@ -821,7 +821,7 @@ describe("the delegation tool", () => {
   }
 
   it("retries a failed worker on the configured fallback", async () => {
-    const harness = await armFallback();
+    const harness = await armFallback({ ...RETRY_TARGET, permissionMode: "auto" });
     twoWorkers(harness);
     harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
       makeThreadResponse({ id: threadId, status: threadId === "th_first" ? "error" : "idle" }),
@@ -838,12 +838,18 @@ describe("the delegation tool", () => {
       model: "command-code/deepseek/deepseek-v4.1-flash-fast",
       providerId: "acp-omp",
     });
-    // The fallback replaces the model and keeps the rest of the execution.
+    // The fallback replaces the model and its access, and keeps the rest of
+    // the execution.
     expect(spawned[1]).toMatchObject({
       providerId: "claude-code",
       model: "claude-opus-5-5",
+      permissionMode: "auto",
       prompt: "Rebuild the index",
-      executionInputSources: { providerId: "explicit", model: "explicit" },
+      executionInputSources: {
+        providerId: "explicit",
+        model: "explicit",
+        permissionMode: "explicit",
+      },
     });
     expect(String(result)).toContain("th_first failed");
     expect(String(result)).toContain("th_second");
@@ -874,6 +880,33 @@ describe("the delegation tool", () => {
     expect(spawned).toHaveLength(2);
     expect(spawned[1]).toMatchObject({ providerId: "claude-code", model: "claude-opus-5-5" });
     expect(String(result)).toContain("th_first failed");
+  });
+
+  it("lets a fallback without its own access inherit the worker's", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      permissionMode: "accept-edits",
+      fallback: RETRY_TARGET,
+    });
+    await enable(harness);
+    twoWorkers(harness);
+    harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
+      makeThreadResponse({ id: threadId, status: threadId === "th_first" ? "error" : "idle" }),
+    );
+
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Rebuild the index" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    expect(spawned[1]).toMatchObject({
+      providerId: "claude-code",
+      model: "claude-opus-5-5",
+      permissionMode: "accept-edits",
+    });
   });
 
   it("retries on the fallback when the worker cannot start at all", async () => {
