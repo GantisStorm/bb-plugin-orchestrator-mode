@@ -265,7 +265,7 @@ records so the refusal can name what it hit:
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `maxParallelWorkers` | `6` | Refuses a delegation while this many workers are still running. Every worker counts, including check units and fallbacks. |
-| `maxDelegationsPerTurn` | `20` | Refuses a delegation once one turn has delegated this many. |
+| `maxDelegationsPerTurn` | `20` | Refuses a delegation once one turn has delegated this many. Check units and fallback retries do not count against it. |
 
 `0` removes either cap. A refusal is returned to the orchestrator as a readable
 error, and it is never retried on the fallback: a cap is the plugin's own
@@ -315,7 +315,9 @@ can produce with an append at the cap and asserts it fits.
   flag, a pipe, a redirect, an assignment). A provider that renders a plugin tool
   call as a command row carries the call's title there instead, and a title is
   not a command. The cost is that a bare unknown program name with no arguments
-  reads as a title; a write it performs still shows up as a file change.
+  reads as a title, and that piping a read-only command into a script counts as
+  work, since a script can do anything. A write either one performs still shows
+  up as a file change.
 - **Detection follows the action.** BB exposes no pre-tool-call veto. `block`
   stops a turn after detection, so a fast write can complete before the stop.
 - **Grace turns are intentional.** Enabling an idle thread skips its next turn
