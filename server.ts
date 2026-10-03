@@ -412,7 +412,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "number",
       label: "Most workers per turn",
       description:
-        "A delegation is refused once one turn has delegated this many, so a runaway fan-out stops instead of filling the sidebar. 0 for no limit.",
+        "A delegation is refused once one turn has delegated this many, so a runaway fan-out stops instead of filling the sidebar. Check units and fallback retries are the plugin's own doing and do not count. 0 for no limit.",
       default: 20,
     },
     workerRetention: {
@@ -607,6 +607,17 @@ export default async function plugin(bb: BbPluginApi) {
    * not make delegation impossible.
    */
   function assertInCatalog(exec: WorkerExecution): void {
+    // The provider first: it is the outer choice, and naming a model that exists
+    // under a provider that does not is a confusing way to report a typo.
+    if (
+      exec.providerId !== undefined &&
+      catalog.providers.length > 0 &&
+      !catalog.providers.includes(exec.providerId)
+    ) {
+      throw new Error(
+        `Unknown worker provider "${exec.providerId}". Providers this machine offers: ${catalog.providers.join(", ")}. Omit provider to inherit the project default.`,
+      );
+    }
     if (
       exec.model !== undefined &&
       catalog.models.length > 0 &&
@@ -618,15 +629,6 @@ export default async function plugin(bb: BbPluginApi) {
         .join(", ");
       throw new Error(
         `Unknown worker model "${exec.model}". Models this machine offers include: ${sample}. Run \`bb provider models <provider>\` for the full list, or omit model to inherit the project default.`,
-      );
-    }
-    if (
-      exec.providerId !== undefined &&
-      catalog.providers.length > 0 &&
-      !catalog.providers.includes(exec.providerId)
-    ) {
-      throw new Error(
-        `Unknown worker provider "${exec.providerId}". Providers this machine offers: ${catalog.providers.join(", ")}. Omit provider to inherit the project default.`,
       );
     }
   }
@@ -778,6 +780,11 @@ export default async function plugin(bb: BbPluginApi) {
       void persistDefaultEnabledAt();
     }
     bb.log.info(`enforcement=${live.enforcement} default=${live.defaultForNewThreads}`);
+    // Several settings change text the composer strip and the settings section
+    // render (the contract shape and the enforcement description above all), so
+    // a settings write has to wake them. Their own writes publish too; this
+    // covers a change made in BB's settings UI, which the plugin never sees.
+    bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
   });
 
   // --- state store ---------------------------------------------------------
@@ -1113,6 +1120,13 @@ export default async function plugin(bb: BbPluginApi) {
       if (threadId === undefined || projectId === undefined) {
         throw new Error("orchestrator_delegate needs a thread context.");
       }
+      // A check unit inspects finished work, so it can only start once the
+      // worker has settled. Refusing beats spawning a worker nobody checks.
+      if (verify === true && waitForResult === false) {
+        throw new Error(
+          "verify: true needs waitForResult: true, because a check unit has to inspect finished work. Wait for this worker, or record a verdict yourself and delegate the check as its own unit.",
+        );
+      }
       const parent = await bb.sdk.threads.get({ threadId });
       const environment =
         parent.environmentId === null
@@ -1153,9 +1167,9 @@ export default async function plugin(bb: BbPluginApi) {
       async function spawnWorker(
         exec: WorkerExecution,
         workerLabel: string,
-        options: { brief?: string; verifierFor?: string } = {},
+        options: { brief?: string; verifierFor?: string; pluginInitiated?: boolean } = {},
       ): Promise<string> {
-        await assertWithinBudget(orchestratorId);
+        await assertWithinBudget(orchestratorId, options.pluginInitiated !== true);
         const spawned = await bb.sdk.threads.spawn({
           projectId: targetProjectId,
           environment,
@@ -1233,29 +1247,8 @@ export default async function plugin(bb: BbPluginApi) {
         } catch (cause) {
           bb.log.warn(`worker output read failed for ${workerId}: ${String(cause)}`);
         }
-        await maybeArchive(workerId);
+        await maybeArchive(orchestratorId, workerId);
         return { status, output, running: false };
-      }
-
-      /**
-       * Archive a settled worker when the retention policy says so. Its result
-       * has just been read into the orchestrator's context, so hiding it from
-       * the sidebar loses nothing that has not already been handed over.
-       */
-      async function maybeArchive(workerId: string): Promise<void> {
-        if (live.workerRetention === "keep") return;
-        const state = await getState(orchestratorId);
-        const delegation = state?.delegations.find((entry) => entry.threadId === workerId);
-        if (delegation === undefined) return;
-        if (live.workerRetention === "archive-checks" && delegation.verifierFor === undefined) {
-          return;
-        }
-        try {
-          await bb.sdk.threads.archive({ threadId: workerId });
-          bb.log.info(`archived worker ${workerId} (retention: ${live.workerRetention})`);
-        } catch (cause) {
-          bb.log.warn(`could not archive worker ${workerId}: ${String(cause)}`);
-        }
       }
 
       /** The text the orchestrator gets back about one finished worker. */
@@ -1281,7 +1274,9 @@ export default async function plugin(bb: BbPluginApi) {
         const retryExec = reconcile({ ...workerExec, ...fallback });
         const target = retryExec.model ?? "the project default";
         bb.log.warn(`${reason} Retrying on ${target}.`);
-        const retryId = await spawnWorker(retryExec, `${workerTitle} (fallback)`);
+        const retryId = await spawnWorker(retryExec, `${workerTitle} (fallback)`, {
+          pluginInitiated: true,
+        });
         const settled = await settle(retryId, timeoutMs);
         return `${reason} Re-delegated the same brief on \`${target}\` as worker ${retryId}.\n\n${await finish(retryId, `${workerTitle} (fallback)`, settled)}`;
       }
@@ -1304,6 +1299,7 @@ export default async function plugin(bb: BbPluginApi) {
           verifierId = await spawnWorker(verifierExec, `${workerLabel} (check)`, {
             brief,
             verifierFor: workerId,
+            pluginInitiated: true,
           });
         } catch (cause) {
           bb.log.warn(`check unit for ${workerId} could not start: ${String(cause)}`);
@@ -1429,6 +1425,15 @@ export default async function plugin(bb: BbPluginApi) {
             : delegation,
         ),
       }));
+      // Recording a verdict is the moment the orchestrator demonstrably read the
+      // result, which is what retention waits for.
+      await maybeArchive(threadId, workerThreadId);
+      const reviewed = updated?.delegations.find(
+        (delegation) => delegation.threadId === workerThreadId,
+      );
+      if (reviewed?.verifiedBy != null) {
+        await maybeArchive(threadId, reviewed.verifiedBy);
+      }
       const remaining = unreviewedOf(updated?.delegations ?? []).length;
       const tail =
         remaining === 0
@@ -1734,11 +1739,37 @@ export default async function plugin(bb: BbPluginApi) {
    * `guard` here. That limit is documented rather than papered over.
    */
   /**
+   * Archive a worker the retention policy covers. Called where the plugin learns
+   * the orchestrator has read a result: when it settles a worker it was waiting
+   * on, and when a verdict is recorded. The second place matters because a
+   * delegation made with `waitForResult: false` is never settled here, and
+   * retention that only worked for waited delegations would be a trap.
+   */
+  async function maybeArchive(ownerThreadId: string, workerId: string): Promise<void> {
+    if (live.workerRetention === "keep") return;
+    const state = await getState(ownerThreadId);
+    const delegation = state?.delegations.find((entry) => entry.threadId === workerId);
+    if (delegation === undefined) return;
+    if (live.workerRetention === "archive-checks" && delegation.verifierFor === undefined) {
+      return;
+    }
+    try {
+      await bb.sdk.threads.archive({ threadId: workerId });
+      bb.log.info(`archived worker ${workerId} (retention: ${live.workerRetention})`);
+    } catch (cause) {
+      bb.log.warn(`could not archive worker ${workerId}: ${String(cause)}`);
+    }
+  }
+
+  /**
    * Refuse a delegation that would exceed either fan-out cap. Both counts come
    * from this plugin's own records, so the orchestrator is told which cap it hit
    * and what to do about it.
    */
-  async function assertWithinBudget(threadId: string): Promise<void> {
+  async function assertWithinBudget(
+    threadId: string,
+    countPerTurn: boolean,
+  ): Promise<void> {
     const state = await getState(threadId);
     if (state === undefined) return;
     if (live.maxParallelWorkers > 0) {
@@ -1749,7 +1780,10 @@ export default async function plugin(bb: BbPluginApi) {
         );
       }
     }
-    if (live.maxDelegationsPerTurn > 0 && state.turnStartedAt > 0) {
+    // The per-turn cap governs what the orchestrator chose to fan out. A check
+    // unit or a fallback retry is this plugin's own decision, and counting it
+    // would let a tight cap silently defeat `verify: true`.
+    if (countPerTurn && live.maxDelegationsPerTurn > 0 && state.turnStartedAt > 0) {
       const thisTurn = state.delegations.filter(
         (delegation) => delegation.createdAt >= state.turnStartedAt,
       ).length;

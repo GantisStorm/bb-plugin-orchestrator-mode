@@ -1179,6 +1179,32 @@ describe("the delegation tool", () => {
     expect(spawned).toHaveLength(2);
   });
 
+  it("does not count a check unit against the per-turn cap", async () => {
+    const { harness } = await load({ maxDelegationsPerTurn: 1, maxParallelWorkers: 0 });
+    await enable(harness);
+    const handler = harness.inspection.registrations.hooks["message.dispatch"];
+    await handler!(
+      makeMessageDispatchHookContext({ thread: makeThreadResponse({ id: THREAD }) }),
+    );
+    let started = 0;
+    harness.inspection.sdk.stub("threads.spawn", async (args) => {
+      spawned.push(args as unknown as Record<string, unknown>);
+      return makeThreadResponse({
+        id: started++ === 0 ? "th_unit" : "th_check",
+        parentThreadId: THREAD,
+      });
+    });
+
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it", verify: true },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    // One delegation the orchestrator chose, plus the check unit it did not.
+    expect(spawned).toHaveLength(2);
+  });
+
   it("does not send a fan-out refusal to the fallback", async () => {
     const { harness } = await load({ maxParallelWorkers: 1, maxDelegationsPerTurn: 0 }, undefined, CATALOG);
     await harness.behavior.callRpc("set_worker_execution", {
@@ -1404,6 +1430,49 @@ describe("the delegation tool", () => {
     );
 
     expect(archivedThreads).toEqual([WORKER]);
+  });
+
+  it("archives a worker a verdict was recorded for, even without waiting", async () => {
+    const { harness } = await load({ workerRetention: "archive-all" });
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it", waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    // Nobody waited on it, so nothing has been read yet.
+    expect(archivedThreads).toEqual([]);
+
+    await harness.behavior.callAgentTool(
+      REVIEW_TOOL,
+      { workerThreadId: WORKER, verdict: "accepted" },
+      { threadId: THREAD },
+    );
+    expect(archivedThreads).toEqual([WORKER]);
+  });
+
+  it("refuses to verify a worker nobody waits for", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    await expect(
+      harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task: "Do it", waitForResult: false, verify: true },
+        { threadId: THREAD, projectId: "proj_1" },
+      ),
+    ).rejects.toThrow(/verify: true needs waitForResult: true/);
+    // Nothing was spawned, so no worker is left unchecked.
+    expect(spawned).toHaveLength(0);
+  });
+
+  it("names the provider, not the model, when the provider is the typo", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await expect(
+      harness.behavior.callRpc("set_worker_execution", {
+        providerId: "nope",
+        model: "claude-opus-5-5",
+      }),
+    ).rejects.toThrow(/Unknown worker provider "nope"/);
   });
 
   it("keeps every worker by default", async () => {
