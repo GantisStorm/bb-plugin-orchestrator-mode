@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_ENFORCEMENT,
+  CONTRACT_PRESETS,
+  EXTRA_INSTRUCTION_LIMIT,
   buildInstructions,
   buildNudge,
   classifyRow,
@@ -243,12 +245,40 @@ describe("direct-work classification", () => {
   });
 });
 
+describe("telling a command from a tool call's title", () => {
+  it("does not read a provider's tool title as a command", () => {
+    // The shape that produced a false "did the work itself" nudge: the review
+    // tool call rendered as a command row whose text is its title.
+    expect(classifyRow(row({ id: `probe_1`, workKind: "command", command: "Recording verdict for PONG worker" }))).toBeNull();
+    expect(classifyRow(row({ id: `probe_2`, workKind: "command", command: "Delegating PONG worker" }))).toBeNull();
+  });
+
+  it("still reads every realistic command as work", () => {
+    for (const command of [
+      "npm install",
+      "bb thread spawn --project proj_1",
+      "./deploy.sh --force",
+      "rm -rf build",
+      "git push origin main",
+      "make release",
+    ]) {
+      expect(classifyRow(row({ id: `probe_3`, workKind: "command", command }))).not.toBeNull();
+    }
+  });
+
+  it("keeps allowing read-only commands", () => {
+    expect(classifyRow(row({ id: `probe_4`, workKind: "command", command: "ls -la" }))).toBeNull();
+    expect(classifyRow(row({ id: `probe_5`, workKind: "command", command: "git status" }))).toBeNull();
+  });
+});
+
 describe("the contract", () => {
   const levels: EnforcementLevel[] = ["instruct", "guard", "block"];
 
   it("fits the 4096-character configure() budget in every mode", () => {
     for (const enforcement of levels) {
       for (const allowReadCommands of [true, false]) {
+       for (const preset of CONTRACT_PRESETS) {
         const text = buildInstructions({
           enforcement,
           allowReadCommands,
@@ -261,8 +291,11 @@ describe("the contract", () => {
             permissionMode: "accept-edits",
             fallback: { providerId: "claude-code", model: "claude-opus-5-5" },
           },
+          extra: "x".repeat(EXTRA_INSTRUCTION_LIMIT),
+          preset,
         });
         expect(text.length).toBeLessThanOrEqual(4096);
+       }
       }
     }
   });

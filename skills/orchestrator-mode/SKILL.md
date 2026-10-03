@@ -62,11 +62,24 @@ Use the `orchestrator_delegate` tool, which the mode selects for the thread.
 Give it a complete, self-contained brief: the worker cannot see this
 conversation. Fan out independent units; sequence only real dependencies.
 
+## Recording a verdict
+
+Every worker whose result you used needs a verdict before you finish the turn:
+call `orchestrator_review` with the worker's thread id, `accepted` or
+`rejected`, and a line of notes. A turn that ends with unjudged workers gets
+one reminder. A rejected result is re-delegated, never patched by you.
+
+`verify: true` on a delegation spawns an independent check unit that inspects
+the repository and reports `VERDICT: pass` or `VERDICT: fail`; its report comes
+back with the worker's, and its thread is recorded as that delegation's
+evidence. Use it when you cannot judge a unit from its report alone.
+
 Arguments are `task` (required, at most 20,000 characters), `title` (optional,
 at most 200), `waitForResult` (default `true`), `timeoutSeconds` (default `900`,
 integer range 10–3,600) and `hidden` (default `false`). A timeout or
-`waitForResult: false` leaves the worker running; inspect that worker later
-and review its result.
+`preset` (optional) names a stored execution preset. `verify` (default `false`)
+adds the check unit described above. `waitForResult: false` leaves the worker
+running; inspect that worker later and review its result.
 
 ## Choosing the worker's execution
 

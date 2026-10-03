@@ -29,28 +29,40 @@ import { z } from "zod";
 import {
   DEFAULT_ENFORCEMENT,
   DELEGATE_TOOL,
+  CONTRACT_PRESETS,
   ENFORCEMENT_DESCRIPTIONS,
   ENFORCEMENT_LEVELS,
   PERMISSION_MODES,
   REASONING_LEVELS,
+  REVIEW_TOOL,
+  REVIEW_VERDICTS,
+  WORKER_PRESETS,
   SERVICE_TIERS,
+  EXTRA_INSTRUCTION_LIMIT,
   buildInstructions,
   buildNudge,
+  buildReviewNudge,
+  buildVerifierBrief,
   classifyRow,
   defaultAppliesTo,
+  isContractPreset,
   isEnforcementLevel,
   isPermissionMode,
   isReasoningLevel,
+  isWorkerPreset,
   isServiceTier,
   readMirror,
   writeMirror,
   type EnforcementLevel,
   type PermissionMode,
   type ReasoningLevel,
+  type ReviewVerdict,
   type ServiceTier,
   type Violation,
   type WorkerCatalog,
   type WorkerConfig,
+  type WorkerPresetName,
+  type ContractPresetId,
   type WorkerExecution,
   type WorkerModelOption,
 } from "./shared";
@@ -66,6 +78,8 @@ const STATE_KEY = "state";
 const DEFAULT_KEY = "default";
 /** The stored worker execution every delegation defaults to. */
 const WORKER_KEY = "worker";
+/** The stored project rules appended to the contract. */
+const CONTRACT_KEY = "contract";
 /** Threads kept in the KV map before the least recently touched is dropped. */
 const MAX_THREADS = 300;
 const MAX_VIOLATIONS = 100;
@@ -78,6 +92,19 @@ export interface Delegation {
   task: string;
   createdAt: number;
   status: string | null;
+  /** Set when the delegation asked for an independent check unit. */
+  verifiedBy?: string | null;
+  /**
+   * The delegation this worker is the check unit for. A check unit is evidence,
+   * not a unit of work: the orchestrator judges the unit, not its checker.
+   */
+  verifierFor?: string;
+  /** The orchestrator's verdict, absent until `orchestrator_review` records one. */
+  verdict?: ReviewVerdict | null;
+  notes?: string | null;
+  reviewedAt?: number | null;
+  /** The error text when this worker failed, so the orchestrator sees why. */
+  failure?: string | null;
 }
 
 export interface ThreadState {
@@ -103,6 +130,16 @@ export interface ThreadState {
   lastNudgeTurnId: string | null;
   lastStopTurnId: string | null;
   delegations: Delegation[];
+  /**
+   * When the orchestrator's current turn started, as the dispatch hook saw it.
+   * The per-turn fan-out cap counts delegations created since this moment.
+   */
+  turnStartedAt: number;
+  /**
+   * The set of workers the review gate last reminded about, so a turn that ends
+   * with the same unjudged workers is not nagged twice.
+   */
+  lastReviewNudge: string | null;
 }
 
 const delegationSchema = z.object({
@@ -111,6 +148,12 @@ const delegationSchema = z.object({
   task: z.string(),
   createdAt: z.number(),
   status: z.string().nullable(),
+  verifiedBy: z.string().nullable().optional(),
+  verifierFor: z.string().optional(),
+  verdict: z.enum(REVIEW_VERDICTS).nullable().optional(),
+  notes: z.string().nullable().optional(),
+  reviewedAt: z.number().nullable().optional(),
+  failure: z.string().nullable().optional(),
 });
 
 const violationSchema = z.object({
@@ -130,9 +173,12 @@ const workerExecutionSchema = z.object({
   permissionMode: z.enum(PERMISSION_MODES).optional(),
 });
 
-/** The stored configuration: the execution, plus what to retry a failure on. */
+/** The stored configuration: the execution, the retry target, the presets. */
 const workerConfigSchema = workerExecutionSchema.extend({
   fallback: workerExecutionSchema.optional(),
+  presets: z
+    .partialRecord(z.enum(WORKER_PRESETS), workerExecutionSchema)
+    .optional(),
 });
 
 const stateSchema = z.object({
@@ -149,6 +195,13 @@ const stateSchema = z.object({
   maxNudges: z.number(),
   /** The execution every delegation defaults to; absent fields inherit. */
   workerExecution: workerExecutionSchema,
+  /** The fan-out caps in force, so a report can name them. */
+  maxParallelWorkers: z.number(),
+  maxDelegationsPerTurn: z.number(),
+  /** Settled workers whose result nobody has judged yet. */
+  unreviewed: z.number(),
+  /** Delegations whose result the orchestrator accepted, as a ratio's numerator. */
+  reviewed: z.number(),
 });
 
 /** The shape every RPC call returns; the schema above owns it. */
@@ -174,6 +227,20 @@ export const rpcContract = defineRpcContract({
     input: z.object({ enabled: z.boolean() }).strict(),
     output: z.object({ enabled: z.boolean() }),
   },
+  get_contract: {
+    input: z.object({ threadId: z.string().min(1).max(120).nullable() }).strict(),
+    output: z.object({
+      text: z.string(),
+      extra: z.string(),
+      limit: z.number(),
+    }),
+  },
+  set_contract: {
+    input: z
+      .object({ extra: z.string().max(EXTRA_INSTRUCTION_LIMIT) })
+      .strict(),
+    output: z.object({ text: z.string(), extra: z.string(), limit: z.number() }),
+  },
   get_worker_execution: { input: z.null(), output: workerConfigSchema },
   set_worker_execution: {
     input: workerConfigSchema.nullable(),
@@ -184,6 +251,30 @@ export const rpcContract = defineRpcContract({
     output: stateSchema,
   },
 });
+
+/**
+ * What to do with a worker whose result the orchestrator has read. Archiving is
+ * recoverable and only ever hides a worker from the sidebar, so it stays opt-in:
+ * a default that tidied the sidebar would also hide the evidence.
+ */
+const WORKER_RETENTION = ["keep", "archive-checks", "archive-all"] as const;
+type WorkerRetention = (typeof WORKER_RETENTION)[number];
+
+function isWorkerRetention(value: unknown): value is WorkerRetention {
+  return (
+    typeof value === "string" &&
+    (WORKER_RETENTION as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * Thrown when a delegation would exceed a fan-out cap. A distinct type because
+ * the delegation tool retries a *provider* failure on the fallback, and a cap
+ * is not a provider failure: retrying it would fail twice for no reason.
+ */
+class WorkerBudgetError extends Error {
+  override readonly name = "WorkerBudgetError";
+}
 
 /** A timeline row, narrowed to the fields the classifier reads. */
 interface ScanRow {
@@ -293,6 +384,22 @@ export default async function plugin(bb: BbPluginApi) {
       options: [...ENFORCEMENT_LEVELS],
       default: DEFAULT_ENFORCEMENT,
     },
+    contractPreset: {
+      type: "select",
+      label: "Contract shape",
+      description:
+        "Which instructions an orchestrating session receives. `standard` covers delegation and review; `delegate-only` also delegates research; `research-first` asks for reading before a brief; `review-heavy` requires a check unit per delegation.",
+      options: [...CONTRACT_PRESETS],
+      default: "standard",
+    },
+    workerRetention: {
+      type: "select",
+      label: "Clean up settled workers",
+      description:
+        "`keep` leaves every worker in the sidebar. `archive-checks` archives check units once their verdict has been read. `archive-all` archives every worker whose result the orchestrator has read, which hides them from the sidebar but keeps them recoverable.",
+      options: [...WORKER_RETENTION],
+      default: "keep",
+    },
     allowReadCommands: {
       type: "boolean",
       label: "Read-only shell commands are not work",
@@ -305,6 +412,20 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Maximum corrective nudges per thread",
       description: "Violations keep being recorded after the cap is reached.",
       default: 3,
+    },
+    maxParallelWorkers: {
+      type: "number",
+      label: "Workers in flight at once",
+      description:
+        "A delegation is refused with a readable error once this many workers are still running. 0 removes the cap. Every worker counts, including check units and fallbacks.",
+      default: 6,
+    },
+    maxDelegationsPerTurn: {
+      type: "number",
+      label: "Workers delegated per turn",
+      description:
+        "A delegation is refused once the orchestrator has delegated this many in one turn. 0 removes the cap.",
+      default: 20,
     },
   } satisfies Record<string, PluginSettingDescriptor>;
 
@@ -328,6 +449,11 @@ export default async function plugin(bb: BbPluginApi) {
     enforcement: DEFAULT_ENFORCEMENT as EnforcementLevel,
     allowReadCommands: true,
     maxNudges: 3,
+    contractPreset: "standard" as ContractPresetId,
+    workerRetention: "keep" as WorkerRetention,
+    /** Fan-out guardrails; 0 means no cap. */
+    maxParallelWorkers: 6,
+    maxDelegationsPerTurn: 20,
     /** Worker execution defaults; an absent field means "inherit". */
     worker: {} as WorkerConfig,
   };
@@ -348,7 +474,7 @@ export default async function plugin(bb: BbPluginApi) {
    * bookkeeping, not a spawn field.
    */
   function executionOf(config: WorkerConfig): WorkerExecution {
-    const { fallback: _fallback, ...execution } = config;
+    const { fallback: _fallback, presets: _presets, ...execution } = config;
     return execution;
   }
 
@@ -397,6 +523,20 @@ export default async function plugin(bb: BbPluginApi) {
     live.allowReadCommands = values.allowReadCommands !== false;
     const nudges = Number(values.maxNudges);
     live.maxNudges = Number.isFinite(nudges) && nudges >= 0 ? Math.floor(nudges) : 3;
+    live.maxParallelWorkers = capOf(values.maxParallelWorkers, 6);
+    live.maxDelegationsPerTurn = capOf(values.maxDelegationsPerTurn, 20);
+    live.contractPreset = isContractPreset(values.contractPreset)
+      ? values.contractPreset
+      : "standard";
+    live.workerRetention = isWorkerRetention(values.workerRetention)
+      ? values.workerRetention
+      : "keep";
+  }
+
+  /** A fan-out cap: a non-negative whole number, or the fallback when unusable. */
+  function capOf(value: unknown, fallback: number): number {
+    const cap = Number(value);
+    return Number.isFinite(cap) && cap >= 0 ? Math.floor(cap) : fallback;
   }
 
   /**
@@ -412,6 +552,16 @@ export default async function plugin(bb: BbPluginApi) {
       record.fallback === undefined || record.fallback === null
         ? undefined
         : sanitizeExecution(record.fallback as Record<string, unknown>);
+    const presets: Partial<Record<WorkerPresetName, WorkerExecution>> = {};
+    if (record.presets !== null && typeof record.presets === "object") {
+      for (const [name, value] of Object.entries(record.presets as Record<string, unknown>)) {
+        // A preset is a partial override, so it only loses the ids the catalog
+        // no longer lists, and is dropped when nothing usable is left.
+        if (!isWorkerPreset(name) || value === null || typeof value !== "object") continue;
+        const sanitized = sanitizeExecution(value as Record<string, unknown>);
+        if (Object.keys(sanitized).length > 0) presets[name] = sanitized;
+      }
+    }
     return {
       ...execution,
       // A fallback that lost its provider or model to the catalog is no retry
@@ -419,6 +569,7 @@ export default async function plugin(bb: BbPluginApi) {
       ...(fallback?.providerId === undefined || fallback.model === undefined
         ? {}
         : { fallback }),
+      ...(Object.keys(presets).length === 0 ? {} : { presets }),
     };
   }
 
@@ -505,12 +656,22 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function setWorkerConfig(next: WorkerConfig | null): Promise<WorkerConfig> {
     if (next !== null) {
-      for (const level of [next, next.fallback]) {
-        if (level === undefined) continue;
-        if (level.providerId === undefined || level.model === undefined) {
+      const execution = executionOf(next);
+      if (Object.keys(execution).length > 0) {
+        if (execution.providerId === undefined || execution.model === undefined) {
           throw new Error("A worker execution needs both a provider and a model.");
         }
-        assertInCatalog(level);
+        assertInCatalog(execution);
+      }
+      if (next.fallback !== undefined) {
+        if (next.fallback.providerId === undefined || next.fallback.model === undefined) {
+          throw new Error("A worker execution needs both a provider and a model.");
+        }
+        assertInCatalog(next.fallback);
+      }
+      // A preset is partial by design, so only the ids it does name must exist.
+      for (const preset of Object.values(next.presets ?? {})) {
+        assertInCatalog(preset);
       }
     }
     const stored: WorkerConfig =
@@ -519,11 +680,70 @@ export default async function plugin(bb: BbPluginApi) {
         : {
             ...reconcile(executionOf(next)),
             ...(next.fallback === undefined ? {} : { fallback: reconcile(next.fallback) }),
+            ...(next.presets === undefined
+              ? {}
+              : {
+                  presets: Object.fromEntries(
+                    Object.entries(next.presets).map(([name, preset]) => [
+                      name,
+                      reconcile(preset),
+                    ]),
+                  ),
+                }),
           };
     await bb.storage.kv.set(WORKER_KEY, stored);
     live.worker = stored;
     bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
     return stored;
+  }
+
+  /**
+   * The project rules the user appended. Held in memory as well as storage
+   * because `bb.agents.configure` is synchronous and cannot await a read.
+   */
+  let extraInstructions = readExtra(await bb.storage.kv.get<unknown>(CONTRACT_KEY));
+
+  /** The appended rules out of a stored record, or "" when there are none. */
+  function readExtra(stored: unknown): string {
+    if (stored === null || typeof stored !== "object") return "";
+    const value = (stored as Record<string, unknown>).extra;
+    return typeof value === "string" ? value : "";
+  }
+
+  /** Replace the appended rules. An empty string clears them. */
+  async function setExtraInstructions(next: string): Promise<string> {
+    const text = next.trim();
+    if (text.length > EXTRA_INSTRUCTION_LIMIT) {
+      throw new Error(
+        `Project rules are capped at ${EXTRA_INSTRUCTION_LIMIT} characters so the contract stays inside the 4096-character limit; that text is ${text.length}.`,
+      );
+    }
+    await bb.storage.kv.set(CONTRACT_KEY, { extra: text });
+    extraInstructions = text;
+    bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
+    return text;
+  }
+
+  /**
+   * The exact text `bb.agents.configure` injects, for one thread or — with a
+   * null thread — for a thread that has not run yet. Exposed so the contract
+   * can be read instead of guessed at.
+   */
+  async function contractText(threadId: string | null): Promise<string> {
+    const state = threadId === null ? undefined : await getState(threadId);
+    const enforcement = effectiveEnforcement(state);
+    const reminders =
+      state === undefined || state.violations.length === 0
+        ? undefined
+        : state.violations.slice(-5).map((violation) => violation.detail);
+    return buildInstructions({
+      enforcement,
+      allowReadCommands: live.allowReadCommands,
+      reminders,
+      workerConfig: live.worker,
+      extra: extraInstructions,
+      preset: live.contractPreset,
+    });
   }
 
   applySettings(await settings.get());
@@ -585,6 +805,8 @@ export default async function plugin(bb: BbPluginApi) {
       seenRowIds: Array.isArray(state.seenRowIds) ? state.seenRowIds : [],
       delegations: Array.isArray(state.delegations) ? state.delegations : [],
       graceTurnIds: Array.isArray(state.graceTurnIds) ? state.graceTurnIds : [],
+      lastReviewNudge: typeof state.lastReviewNudge === "string" ? state.lastReviewNudge : null,
+      turnStartedAt: typeof state.turnStartedAt === "number" ? state.turnStartedAt : 0,
       graceSlots: typeof state.graceSlots === "number" ? state.graceSlots : 1,
       lastSeq: typeof state.lastSeq === "number" ? state.lastSeq : 0,
       nudgeCount: typeof state.nudgeCount === "number" ? state.nudgeCount : 0,
@@ -612,6 +834,8 @@ export default async function plugin(bb: BbPluginApi) {
       lastNudgeTurnId: null,
       lastStopTurnId: null,
       delegations: [],
+      turnStartedAt: 0,
+      lastReviewNudge: null,
     };
   }
 
@@ -685,7 +909,26 @@ export default async function plugin(bb: BbPluginApi) {
       allowReadCommands: live.allowReadCommands,
       maxNudges: live.maxNudges,
       workerExecution: workerDefaults(),
+      maxParallelWorkers: live.maxParallelWorkers,
+      maxDelegationsPerTurn: live.maxDelegationsPerTurn,
+      unreviewed: unreviewedOf(base.delegations).length,
+      reviewed: base.delegations.filter((delegation) => delegation.verdict != null).length,
     };
+  }
+
+  /**
+   * Settled workers whose result nobody has judged. A worker still running has
+   * nothing to review yet, so it is not counted.
+   */
+  function unreviewedOf(delegations: readonly Delegation[]): Delegation[] {
+    return delegations.filter(
+      (delegation) =>
+        delegation.status !== null &&
+        delegation.verdict == null &&
+        // A check unit is evidence for the unit it checks: judging the checker
+        // as well would double the ceremony without adding a decision.
+        delegation.verifierFor === undefined,
+    );
   }
 
   /** Read the thread's current timeline head so a scan starts after it. */
@@ -806,6 +1049,18 @@ export default async function plugin(bb: BbPluginApi) {
         .boolean()
         .optional()
         .describe("Keep the worker out of the sidebar. Default false."),
+      preset: z
+        .enum(WORKER_PRESETS)
+        .optional()
+        .describe(
+          "A named execution preset stored in the plugin settings, applied under this call's own arguments. Ask for one that is stored; the error names the ones that are.",
+        ),
+      verify: z
+        .boolean()
+        .optional()
+        .describe(
+          "Also spawn an independent check unit on the same brief, told to inspect the work and report pass or fail. Use it for a unit whose result you cannot judge from its report alone. Default false.",
+        ),
       model: z
         .string()
         .min(1)
@@ -842,6 +1097,8 @@ export default async function plugin(bb: BbPluginApi) {
         waitForResult,
         timeoutSeconds,
         hidden,
+        preset,
+        verify,
         model,
         provider,
         reasoning,
@@ -861,10 +1118,26 @@ export default async function plugin(bb: BbPluginApi) {
       const orchestratorId = threadId;
       const targetProjectId = projectId;
 
-      // Per-delegation arguments win over the plugin's worker settings; a field
-      // neither names is left out so the worker resolves the project default.
+      // A named preset must be stored: silently ignoring one would leave the
+      // orchestrator believing it had asked for a different model.
+      let presetExec: WorkerExecution = {};
+      if (preset !== undefined) {
+        const stored = live.worker.presets?.[preset];
+        if (stored === undefined) {
+          const available = Object.keys(live.worker.presets ?? {});
+          throw new Error(
+            `No \`${preset}\` worker preset is stored.${available.length === 0 ? " This plugin has no presets configured." : ` Stored presets: ${available.join(", ")}.`}`,
+          );
+        }
+        presetExec = stored;
+      }
+
+      // Per-delegation arguments win over a preset, which wins over the worker
+      // settings; a field none of them names is left out so the worker resolves
+      // the project default.
       const workerExec = reconcile({
         ...workerDefaults(),
+        ...presetExec,
         ...(provider === undefined ? {} : { providerId: provider }),
         ...(model === undefined ? {} : { model }),
         ...(reasoning === undefined ? {} : { reasoningLevel: reasoning }),
@@ -873,11 +1146,16 @@ export default async function plugin(bb: BbPluginApi) {
       assertInCatalog(workerExec);
 
       /** Spawn one worker on `exec` and record it against this orchestrator. */
-      async function spawnWorker(exec: WorkerExecution, workerLabel: string): Promise<string> {
+      async function spawnWorker(
+        exec: WorkerExecution,
+        workerLabel: string,
+        options: { brief?: string; verifierFor?: string } = {},
+      ): Promise<string> {
+        await assertWithinBudget(orchestratorId);
         const spawned = await bb.sdk.threads.spawn({
           projectId: targetProjectId,
           environment,
-          prompt: task,
+          prompt: options.brief ?? task,
           title: workerLabel,
           parentThreadId: orchestratorId,
           ...(hidden === true ? { visibility: "hidden" as const } : {}),
@@ -897,9 +1175,12 @@ export default async function plugin(bb: BbPluginApi) {
             {
               threadId: spawned.id,
               title: workerLabel,
-              task: task.slice(0, 400),
+              task: (options.brief ?? task).slice(0, 400),
               createdAt: Date.now(),
               status: null,
+              ...(options.verifierFor === undefined
+                ? {}
+                : { verifierFor: options.verifierFor, verifiedBy: null, verdict: null }),
             },
           ].slice(-MAX_DELEGATIONS),
         }));
@@ -948,7 +1229,29 @@ export default async function plugin(bb: BbPluginApi) {
         } catch (cause) {
           bb.log.warn(`worker output read failed for ${workerId}: ${String(cause)}`);
         }
+        await maybeArchive(workerId);
         return { status, output, running: false };
+      }
+
+      /**
+       * Archive a settled worker when the retention policy says so. Its result
+       * has just been read into the orchestrator's context, so hiding it from
+       * the sidebar loses nothing that has not already been handed over.
+       */
+      async function maybeArchive(workerId: string): Promise<void> {
+        if (live.workerRetention === "keep") return;
+        const state = await getState(orchestratorId);
+        const delegation = state?.delegations.find((entry) => entry.threadId === workerId);
+        if (delegation === undefined) return;
+        if (live.workerRetention === "archive-checks" && delegation.verifierFor === undefined) {
+          return;
+        }
+        try {
+          await bb.sdk.threads.archive({ threadId: workerId });
+          bb.log.info(`archived worker ${workerId} (retention: ${live.workerRetention})`);
+        } catch (cause) {
+          bb.log.warn(`could not archive worker ${workerId}: ${String(cause)}`);
+        }
       }
 
       /** The text the orchestrator gets back about one finished worker. */
@@ -976,7 +1279,60 @@ export default async function plugin(bb: BbPluginApi) {
         bb.log.warn(`${reason} Retrying on ${target}.`);
         const retryId = await spawnWorker(retryExec, `${workerTitle} (fallback)`);
         const settled = await settle(retryId, timeoutMs);
-        return `${reason} Re-delegated the same brief on \`${target}\` as worker ${retryId}.\n\n${report(retryId, settled)}`;
+        return `${reason} Re-delegated the same brief on \`${target}\` as worker ${retryId}.\n\n${await finish(retryId, `${workerTitle} (fallback)`, settled)}`;
+      }
+
+      /**
+       * Spawn a second worker to check the first one's work, on the same
+       * execution, and hand its report back with the worker's. The check unit
+       * is recorded as evidence for `workerId` and is not itself a unit the
+       * orchestrator has to judge.
+       */
+      async function runVerifier(
+        workerId: string,
+        workerLabel: string,
+        workerOutput: string | null,
+      ): Promise<string> {
+        const brief = buildVerifierBrief({ task, workerTitle: workerLabel, workerOutput });
+        const verifierExec = reconcile({ ...workerExec });
+        let verifierId: string;
+        try {
+          verifierId = await spawnWorker(verifierExec, `${workerLabel} (check)`, {
+            brief,
+            verifierFor: workerId,
+          });
+        } catch (cause) {
+          bb.log.warn(`check unit for ${workerId} could not start: ${String(cause)}`);
+          return `\n\nNo check unit ran: ${String(cause)}`;
+        }
+        await mutateState(orchestratorId, (current) => ({
+          ...current,
+          delegations: current.delegations.map((delegation) =>
+            delegation.threadId === workerId ? { ...delegation, verifiedBy: verifierId } : delegation,
+          ),
+        }));
+        const checked = await settle(verifierId, timeoutMs);
+        const verdict = (checked.output ?? "").trim();
+        return `\n\nCheck unit ${verifierId} ran the same brief.${
+          checked.running
+            ? " It is still running — check it before you accept the work."
+            : verdict === ""
+              ? " It produced no final text — open it before you accept the work."
+              : `\n\n${verdict.length > 8_000 ? `${verdict.slice(0, 8_000)}\n\n[truncated]` : verdict}`
+        }`;
+      }
+
+      /** The worker's report, plus an independent check when one was asked for. */
+      async function finish(
+        workerId: string,
+        workerLabel: string,
+        settled: Settled,
+      ): Promise<string> {
+        const reported = report(workerId, settled);
+        // Checking a worker that never ran is pointless: there is nothing to
+        // inspect, and the orchestrator has to re-delegate that unit anyway.
+        if (verify !== true || settled.running || settled.status === "error") return reported;
+        return `${reported}${await runVerifier(workerId, workerLabel, settled.output)}`;
       }
 
       const timeoutMs = Math.min(Math.max(timeoutSeconds ?? 900, 10), 3600) * 1000;
@@ -985,6 +1341,9 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         workerId = await spawnWorker(workerExec, workerTitle);
       } catch (cause) {
+        // A cap is our own refusal, not a provider that could not start: send
+        // it straight back so the orchestrator changes what it is doing.
+        if (cause instanceof WorkerBudgetError) throw cause;
         // A spawn that never started a worker is the clearest case for the
         // fallback: the provider could not serve the requested execution at all.
         if (fallback === undefined) throw cause;
@@ -1001,9 +1360,79 @@ export default async function plugin(bb: BbPluginApi) {
 
       const first = await settle(workerId, timeoutMs);
       if (first.running || first.status !== "error" || fallback === undefined) {
-        return report(workerId, first);
+        return await finish(workerId, workerTitle, first);
       }
       return await retryOnFallback(fallback, `Worker ${workerId} failed.`);
+    },
+  });
+
+  bb.agents.registerTool({
+    name: REVIEW_TOOL,
+    description:
+      "Record your verdict on one worker's output. Call it once per worker whose result you used, before you report — the watchdog checks for it. `rejected` means the unit is re-delegated to a worker, never patched by you.",
+    instructions:
+      "Judge every worker whose result you used and record the verdict with orchestrator_review before you finish the turn.",
+    presentation: {
+      label: {
+        pending: "Recording a worker review",
+        completed: "Recorded a worker review",
+      },
+    },
+    parameters: z.object({
+      workerThreadId: z
+        .string()
+        .min(1)
+        .max(120)
+        .describe("The worker thread whose output you judged."),
+      verdict: z
+        .enum(REVIEW_VERDICTS)
+        .describe("accepted, or rejected when the result is wrong or incomplete."),
+      notes: z
+        .string()
+        .max(2_000)
+        .optional()
+        .describe("What you checked and what you concluded."),
+      verifiedBy: z
+        .string()
+        .min(1)
+        .max(120)
+        .optional()
+        .describe("The check unit's thread id, when one ran."),
+    }),
+    async execute({ workerThreadId, verdict, notes, verifiedBy }, { threadId }) {
+      if (threadId === undefined) {
+        throw new Error(`${REVIEW_TOOL} needs a thread context.`);
+      }
+      const state = await getState(threadId);
+      const known = state?.delegations ?? [];
+      if (!known.some((delegation) => delegation.threadId === workerThreadId)) {
+        const ids = known.map((delegation) => delegation.threadId).join(", ");
+        throw new Error(
+          `This thread has no worker ${workerThreadId}.${ids === "" ? " It has delegated nothing yet." : ` Workers it delegated: ${ids}.`}`,
+        );
+      }
+      const updated = await mutateState(threadId, (current) => ({
+        ...current,
+        delegations: current.delegations.map((delegation) =>
+          delegation.threadId === workerThreadId
+            ? {
+                ...delegation,
+                verdict,
+                notes: notes ?? delegation.notes ?? null,
+                reviewedAt: Date.now(),
+                ...(verifiedBy === undefined ? {} : { verifiedBy }),
+              }
+            : delegation,
+        ),
+      }));
+      const remaining = unreviewedOf(updated?.delegations ?? []).length;
+      const tail =
+        remaining === 0
+          ? " Every worker has a verdict."
+          : ` ${remaining} worker${remaining === 1 ? "" : "s"} still unjudged.`;
+      return verdict === "rejected"
+        ? `Recorded rejected for ${workerThreadId}. Re-delegate that unit to a worker — do not fix it yourself.${tail}`
+        : `Recorded accepted for ${workerThreadId}.${tail}`;
     },
   });
 
@@ -1023,13 +1452,15 @@ export default async function plugin(bb: BbPluginApi) {
         ? undefined
         : state.violations.slice(-5).map((violation) => violation.detail);
     return {
-      tools: [DELEGATE_TOOL],
+      tools: [DELEGATE_TOOL, REVIEW_TOOL],
       skills: [],
       instructions: buildInstructions({
         enforcement,
         allowReadCommands: live.allowReadCommands,
         reminders,
         workerConfig: live.worker,
+        extra: extraInstructions,
+        preset: live.contractPreset,
       }),
     };
   });
@@ -1076,7 +1507,12 @@ export default async function plugin(bb: BbPluginApi) {
         return { action: "proceed" as const };
       }
       await syncMirror(threadId, state.enabled, state.enforcement);
-      if (state.enabled) scheduleScan(threadId, 0);
+      if (state.enabled) {
+        // A dispatch is where a new turn begins, so this is where the per-turn
+        // delegation budget starts counting.
+        await mutateState(threadId, (current) => ({ ...current, turnStartedAt: Date.now() }));
+        scheduleScan(threadId, 0);
+      }
     } catch (cause) {
       // Never block a dispatch because the mirror could not be refreshed; the
       // next turn tries again and the watchdog still reads authoritative state.
@@ -1224,14 +1660,147 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.events.on("thread.idle", ({ thread }) => {
     void (async () => {
+      await syncDelegationFor(thread.id, thread.status);
       const state = await getState(thread.id);
-      if (state?.enabled === true) scheduleScan(thread.id, 250);
+      if (state?.enabled === true) {
+        scheduleScan(thread.id, 250);
+        await checkReviews(thread.id);
+      }
+    })();
+  });
+
+  bb.events.on("thread.failed", ({ thread, error }) => {
+    void (async () => {
+      await syncDelegationFor(thread.id, thread.status, error);
     })();
   });
 
   bb.events.on("thread.deleted", ({ thread }) => {
     void mutateState(thread.id, () => null);
   });
+
+  /**
+   * The orchestrator whose delegation this worker is, if any. A worker that
+   * settles while its orchestrator is not watching it — a delegation made with
+   * `waitForResult: false` — is only visible through this lookup.
+   */
+  function ownerOf(workerThreadId: string): string | undefined {
+    for (const [threadId, state] of Object.entries(cache ?? {})) {
+      if (state.delegations.some((delegation) => delegation.threadId === workerThreadId)) {
+        return threadId;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Keep a delegation's record in step when its worker settles on its own, and
+   * carry the failure text across so the orchestrator is told why, not just
+   * that it errored.
+   */
+  async function syncDelegationFor(
+    workerThreadId: string,
+    status: string,
+    failure?: string | null,
+  ): Promise<void> {
+    await readAll();
+    const owner = ownerOf(workerThreadId);
+    if (owner === undefined) return;
+    await mutateState(owner, (current) => ({
+      ...current,
+      delegations: current.delegations.map((delegation) =>
+        delegation.threadId === workerThreadId
+          ? {
+              ...delegation,
+              status,
+              ...(failure === undefined || failure === null ? {} : { failure }),
+            }
+          : delegation,
+      ),
+    }));
+    await checkReviews(owner);
+  }
+
+  /**
+   * The review gate: a turn that ended with workers nobody judged gets one
+   * reminder, and only while its orchestrator is idle — a nudge sent mid-turn
+   * would queue behind the very work it is asking about.
+   *
+   * A finished turn cannot be stopped after the fact, so `block` behaves as
+   * `guard` here. That limit is documented rather than papered over.
+   */
+  /**
+   * Refuse a delegation that would exceed either fan-out cap. Both counts come
+   * from this plugin's own records, so the orchestrator is told which cap it hit
+   * and what to do about it.
+   */
+  async function assertWithinBudget(threadId: string): Promise<void> {
+    const state = await getState(threadId);
+    if (state === undefined) return;
+    if (live.maxParallelWorkers > 0) {
+      const inFlight = state.delegations.filter((delegation) => delegation.status === null).length;
+      if (inFlight >= live.maxParallelWorkers) {
+        throw new WorkerBudgetError(
+          `${inFlight} workers are still running and this plugin caps parallel workers at ${live.maxParallelWorkers}. Wait for one to finish, or raise maxParallelWorkers (0 removes the cap).`,
+        );
+      }
+    }
+    if (live.maxDelegationsPerTurn > 0 && state.turnStartedAt > 0) {
+      const thisTurn = state.delegations.filter(
+        (delegation) => delegation.createdAt >= state.turnStartedAt,
+      ).length;
+      if (thisTurn >= live.maxDelegationsPerTurn) {
+        throw new WorkerBudgetError(
+          `This turn has delegated ${thisTurn} workers and this plugin caps a turn at ${live.maxDelegationsPerTurn}. Fold what came back into a report, or raise maxDelegationsPerTurn (0 removes the cap).`,
+        );
+      }
+    }
+  }
+
+  async function checkReviews(threadId: string): Promise<void> {
+    const state = await getState(threadId);
+    if (state === undefined || !state.enabled) return;
+    if (effectiveEnforcement(state) === "instruct") return;
+    const unreviewed = unreviewedOf(state.delegations);
+    if (unreviewed.length === 0) return;
+    const marker = unreviewed
+      .map((delegation) => delegation.threadId)
+      .sort()
+      .join(",");
+    if (state.lastReviewNudge === marker) return;
+    if (state.nudgeCount >= live.maxNudges) return;
+    try {
+      const thread = await bb.sdk.threads.get({ threadId });
+      if (thread.status !== "idle" && thread.status !== "error") return;
+    } catch (cause) {
+      bb.log.warn(`review gate could not read ${threadId}: ${String(cause)}`);
+      return;
+    }
+    try {
+      await bb.sdk.threads.send({
+        threadId,
+        mode: "auto",
+        input: [
+          {
+            type: "text",
+            text: buildReviewNudge(
+              unreviewed.map((delegation) => delegation.title),
+              effectiveEnforcement(state),
+            ),
+            mentions: [],
+          },
+        ],
+      });
+      await mutateState(threadId, (current) => ({
+        ...current,
+        nudgeCount: current.nudgeCount + 1,
+        lastReviewNudge: marker,
+      }));
+      bb.log.warn(`${threadId} ended a turn with ${unreviewed.length} unjudged worker(s)`);
+    } catch (cause) {
+      bb.log.warn(`review nudge failed for ${threadId}: ${String(cause)}`);
+    }
+  }
 
   // --- RPC -----------------------------------------------------------------
 
@@ -1243,6 +1812,17 @@ export default async function plugin(bb: BbPluginApi) {
     },
     get_default: async () => ({ enabled: live.defaultForNewThreads }),
     set_default: async ({ enabled }) => ({ enabled: await setDefault(enabled) }),
+    get_contract: async ({ threadId }) => ({
+      text: await contractText(threadId),
+      extra: extraInstructions,
+      limit: EXTRA_INSTRUCTION_LIMIT,
+    }),
+    set_contract: async ({ extra }) => {
+      // Store first: the returned text has to be the text this write produced,
+      // not the one it replaced.
+      const stored = await setExtraInstructions(extra);
+      return { text: await contractText(null), extra: stored, limit: EXTRA_INSTRUCTION_LIMIT };
+    },
     get_worker_execution: async () => live.worker,
     set_worker_execution: async (next) => setWorkerConfig(next),
     clear_violations: async ({ threadId }) => {
@@ -1282,6 +1862,16 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** One line naming what a delegation's worker will run on. */
+  /** The stored presets, one line each. */
+  function describePresets(presets: WorkerConfig["presets"]): string {
+    const entries = Object.entries(presets ?? {});
+    return entries.length === 0
+      ? ""
+      : entries
+          .map(([name, execution]) => `\n  preset ${name}: ${describeWorkerExecution(execution)}`)
+          .join("");
+  }
+
   /** The retry target, named after the execution it belongs to. */
   function describeFallback(fallback: WorkerConfig["fallback"]): string {
     return fallback === undefined
@@ -1311,6 +1901,10 @@ export default async function plugin(bb: BbPluginApi) {
       `  nudges sent:       ${state.nudgeCount} of ${state.maxNudges}`,
       `  delegations:       ${state.delegations.length}`,
       `  workers run as:    ${describeWorkerExecution(state.workerExecution)}`,
+      `  reviews:           ${state.reviewed} judged, ${state.unreviewed} waiting`,
+      `  fan-out cap:       ${
+        state.maxParallelWorkers === 0 ? "none" : `${state.maxParallelWorkers} in flight`
+      }, ${state.maxDelegationsPerTurn === 0 ? "none" : `${state.maxDelegationsPerTurn} per turn`}`,
     ];
     if (state.violations.length > 0) {
       lines.push("  recent direct work:");
@@ -1372,6 +1966,46 @@ export default async function plugin(bb: BbPluginApi) {
             const state = await setEnabled(threadId, false, null);
             const dto = toDto(threadId, state);
             return render(input.options.json, dto, `Orchestrator mode off for ${threadId}.`);
+          },
+        }),
+        contract: cliCommand({
+          summary: "Print the exact instructions this plugin injects into a thread",
+          options: {
+            thread: {
+              type: "string",
+              description: "Thread id. Defaults to this thread, or to a new one when absent.",
+              aliases: ["t"],
+            },
+            rules: {
+              type: "string",
+              description: "Replace the project rules appended to the contract",
+            },
+            "clear-rules": {
+              type: "boolean",
+              description: "Remove the project rules",
+            },
+            json: { type: "boolean", description: "Emit machine-readable JSON" },
+          },
+          async run(input, ctx) {
+            const threadId = input.options.thread?.trim() || ctx.threadId || null;
+            if (input.options["clear-rules"] === true) {
+              await setExtraInstructions("");
+            } else if (input.options.rules !== undefined) {
+              await setExtraInstructions(input.options.rules);
+            }
+            const text = await contractText(threadId);
+            return render(
+              input.options.json,
+              {
+                threadId,
+                chars: text.length,
+                ceiling: 4096,
+                extra: extraInstructions,
+                extraLimit: EXTRA_INSTRUCTION_LIMIT,
+                text,
+              },
+              text,
+            );
           },
         }),
         violations: cliCommand({
@@ -1461,6 +2095,17 @@ export default async function plugin(bb: BbPluginApi) {
               type: "boolean",
               description: "Stop retrying failed workers",
             },
+            preset: {
+              type: "enum",
+              values: [...WORKER_PRESETS],
+              description:
+                "Write these execution flags to a named preset instead of to the worker execution",
+            },
+            "clear-preset": {
+              type: "enum",
+              values: [...WORKER_PRESETS],
+              description: "Delete a named preset",
+            },
             json: { type: "boolean", description: "Emit machine-readable JSON" },
           },
           async run(input) {
@@ -1493,11 +2138,20 @@ export default async function plugin(bb: BbPluginApi) {
             const hasFallbackPatch = Object.keys(fallbackPatch).length > 0;
             const clearing = input.options.clear === true;
             const clearFallback = input.options["clear-fallback"] === true;
-            if (!clearing && !clearFallback && Object.keys(chosen).length === 0 && !hasFallbackPatch) {
+            const presetName = input.options.preset;
+            const clearPreset = input.options["clear-preset"];
+            if (
+              !clearing &&
+              !clearFallback &&
+              !hasFallbackPatch &&
+              presetName === undefined &&
+              clearPreset === undefined &&
+              Object.keys(chosen).length === 0
+            ) {
               return render(
                 input.options.json,
                 live.worker,
-                `Workers run as: ${describeWorkerExecution(workerDefaults())}${describeFallback(live.worker.fallback)}`,
+                `Workers run as: ${describeWorkerExecution(workerDefaults())}${describeFallback(live.worker.fallback)}${describePresets(live.worker.presets)}`,
               );
             }
             // Each flag changes one thing and leaves the rest of the stored
@@ -1505,11 +2159,24 @@ export default async function plugin(bb: BbPluginApi) {
             // choice does not drop its provider and model.
             let next: WorkerConfig | null = null;
             if (!clearing) {
-              next = { ...workerDefaults(), ...chosen };
-              if (!clearFallback) {
-                const target = { ...live.worker.fallback, ...fallbackPatch };
-                if (target.providerId !== undefined || target.model !== undefined) {
-                  next.fallback = target;
+              if (presetName !== undefined || clearPreset !== undefined) {
+                // A preset edit leaves the worker execution and the retry target
+                // untouched.
+                next = { ...live.worker };
+                const presets = { ...(next.presets ?? {}) };
+                if (presetName !== undefined) {
+                  presets[presetName] = { ...presets[presetName], ...chosen };
+                } else if (clearPreset !== undefined) {
+                  delete presets[clearPreset];
+                }
+                next.presets = Object.keys(presets).length === 0 ? undefined : presets;
+              } else {
+                next = { ...workerDefaults(), ...chosen };
+                if (!clearFallback) {
+                  const target = { ...live.worker.fallback, ...fallbackPatch };
+                  if (target.providerId !== undefined || target.model !== undefined) {
+                    next.fallback = target;
+                  }
                 }
               }
             }
@@ -1517,7 +2184,7 @@ export default async function plugin(bb: BbPluginApi) {
             return render(
               input.options.json,
               stored,
-              `Workers run as: ${describeWorkerExecution(stored)}${describeFallback(stored.fallback)}`,
+              `Workers run as: ${describeWorkerExecution(stored)}${describeFallback(stored.fallback)}${describePresets(stored.presets)}`,
             );
           },
         }),

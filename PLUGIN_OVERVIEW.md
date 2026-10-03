@@ -34,6 +34,11 @@ delegation can override the result in the tool call. The same section can name a
 provider and model to retry a failed worker on, once. An id the catalog does not
 offer is refused with the alternatives named.
 
+Every delegation is also meant to end in a verdict: the orchestrator records one
+per worker with `orchestrator_review`, and a turn that ends with unjudged
+workers gets one reminder. `verify: true` adds an independent check unit that
+inspects the work and reports pass or fail instead of repairing it.
+
 - **instruct:** contract only.
 - **guard** (default): watch the timeline, record direct work and send
   corrective messages up to the configured cap.
@@ -59,10 +64,12 @@ your environment and use ordinary provider resources.
 ## CLI and settings
 
 `bb orchestrator-mode` provides `status`, `on`, `off`, `violations` (including
-`--clear`), `default` and `worker`. Thread commands accept `--thread`; every
-command supports `--json`. Settings control the new-thread default, enforcement,
-read-only command handling and the corrective-message cap; the worker execution
-is stored by the plugin and edited in Settings or with `bb orchestrator-mode
-worker`.
+`--clear`), `default`, `worker` and `contract`. Thread commands accept
+`--thread`; every command supports `--json`. Settings control the new-thread
+default, enforcement, read-only command handling, the corrective-message cap,
+the contract shape, worker retention and the two fan-out caps. The worker
+execution and its presets are stored by the plugin and edited in Settings or
+with `bb orchestrator-mode worker`; `contract` prints the exact instructions a
+thread receives.
 
 Requires bb 0.44+ and Plugin SDK 0.5.29+. Licensed under MIT.
