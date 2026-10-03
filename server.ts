@@ -1039,10 +1039,16 @@ export default async function plugin(bb: BbPluginApi) {
     return delegations.filter(needsVerdict);
   }
 
-  /** One row's dedupe key: a later turn may reuse a row id, so the sequence disambiguates it. */
+  /**
+   * One row's dedupe key. A later turn may reuse a row id, and a row id may
+   * itself contain `:`, so neither the bare id nor `id:seq` is unique per
+   * `(id, seq)`: `id:"a:1"` at seq 0 would collide with `id:"a"` at seq 1 and
+   * hide the later row. The id's length in front makes the key unambiguous
+   * whatever characters the id holds.
+   */
   function seenKey(row: ScanRow): string {
     const seq = typeof row.sourceSeqEnd === "number" ? row.sourceSeqEnd : 0;
-    return seq === 0 ? row.id : `${row.id}:${seq}`;
+    return `${row.id.length}:${row.id}:${seq}`;
   }
 
   /** Read the thread's current timeline head so a scan starts after it. */
