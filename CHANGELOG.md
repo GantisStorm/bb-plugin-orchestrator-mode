@@ -14,7 +14,7 @@ All notable changes to Orchestrator Mode are documented here. The format follows
   `orchestrator_delegate`, so a worker thread can run on a chosen model and
   permission mode instead of inheriting the project default. Picking a provider
   scopes the model list to that provider, and one pick resolves provider, model,
-  reasoning level and service tier as a single value — the same value
+  reasoning level and service tier as a single value, the same value
   `threads.spawn` takes, which is why the choice is stored by the plugin rather
   than as a settings `select` whose options cannot depend on another. Every
   requested field is stamped in `threads.spawn`'s `executionInputSources`,
@@ -79,7 +79,7 @@ All notable changes to Orchestrator Mode are documented here. The format follows
   as the orchestrator running a shell command. Those rows carry a call's title
   ("Recording accepted verdict"), not a command line, and flagging them told the
   orchestrator off for using the tools this plugin gives it. A command row now
-  has to look like an invocation — a known program, or shell evidence such as a
+  has to look like an invocation, so a known program or shell evidence such as a
   path, a flag, a pipe or an assignment.
 
 - Read incremental timeline patches and nested work in completed turns so the

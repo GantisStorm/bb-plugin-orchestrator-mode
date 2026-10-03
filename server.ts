@@ -1,4 +1,4 @@
-// bb-plugin-orchestrator-mode — backend.
+// Backend for the orchestrator-mode plugin.
 //
 // One per-thread switch, three enforcement layers:
 //
@@ -11,7 +11,7 @@
 //      what layer 1 can read synchronously; the KV store is what the agent
 //      cannot forge.
 //   3. A watchdog reads the timeline of orchestrator threads, classifies each
-//      new work row, and — in `guard`/`block` — records violations, stops the
+//      new work row; in `guard`/`block` it records violations, stops the
 //      turn and sends a corrective nudge.
 //
 // BB gives plugins no pre-tool-call veto, so layer 3 is detect-and-intervene
@@ -308,7 +308,7 @@ function asScanRows(rows: unknown): ScanRow[] {
 
 /**
  * Every model the SDK's own picker would offer, with the provider that serves
- * it. Read from `bb.sdk.providers.models()` — the same source the new-thread
+ * it. Read from `bb.sdk.providers.models()`, the same source the new-thread
  * composer's provider and model pickers use, so a worker runs on something the
  * user can actually select there.
  *
@@ -374,7 +374,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "boolean",
       label: "Start new threads as orchestrators",
       description:
-        "Threads you start from the composer begin in orchestrator mode. Threads already open, child workers and side chats are not affected. You can still turn the mode on or off for one thread in the composer.",
+        "Threads you start from the composer begin in orchestrator mode. Threads already open, child workers and side chats are not affected, and you can still switch one thread on or off whenever you like.",
       default: false,
     },
     enforcement: {
@@ -383,9 +383,7 @@ export default async function plugin(bb: BbPluginApi) {
       // One line per option, which BB's settings UI collapses into a paragraph
       // and `bb plugin config` prints as written. A settings description is a
       // single string, so a real list is not available here.
-      description: ENFORCEMENT_LEVELS.map(
-        (level) => `${level} — ${ENFORCEMENT_DESCRIPTIONS[level]}`,
-      ).join("\n"),
+      description: ENFORCEMENT_LEVELS.map((level) => ENFORCEMENT_DESCRIPTIONS[level]).join(" "),
       options: [...ENFORCEMENT_LEVELS],
       default: DEFAULT_ENFORCEMENT,
     },
@@ -393,21 +391,21 @@ export default async function plugin(bb: BbPluginApi) {
       type: "boolean",
       label: "Let the orchestrator read with shell commands",
       description:
-        "On: ls, cat, rg, git status, git diff and similar are treated as looking around, not as doing work. Off: any command counts as doing the work itself.",
+        "While this is on, ls, cat, rg, git status, git diff and similar count as looking around rather than doing work. Turn it off and every command counts as doing the work itself.",
       default: true,
     },
     maxNudges: {
       type: "number",
       label: "Reminders per thread",
       description:
-        "How many times this plugin may prod one thread — once for doing work itself, once for leaving a worker unjudged. Violations keep being recorded after the cap; only the reminders stop. 0 turns reminders off.",
+        "How many times this plugin may prod one thread, once for doing work itself and once for leaving a worker unjudged. Violations keep being recorded after the cap; only the reminders stop. 0 turns reminders off.",
       default: 3,
     },
     maxParallelWorkers: {
       type: "number",
       label: "Most workers running at once",
       description:
-        "A delegation is refused, with the reason, while this many workers are still running. Check units and fallbacks count too. 0 for no limit.",
+        "Once this many workers are running, further delegations are refused and told why. Check units and fallbacks count too. 0 for no limit.",
       default: 6,
     },
     maxDelegationsPerTurn: {
@@ -421,7 +419,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "select",
       label: "What happens to workers afterwards",
       description:
-        "keep — every worker stays in the sidebar.\narchive-checks — check units are archived once their verdict has been read.\narchive-all — every worker is archived once the orchestrator has read its result.\nArchiving only hides a thread from the sidebar; it stays recoverable.",
+        "keep leaves every worker in the sidebar. archive-checks archives check units once their verdict has been read. archive-all archives every worker once the orchestrator has read its result. Archiving hides a thread from the sidebar, but it stays recoverable.",
       options: [...WORKER_RETENTION],
       default: "keep",
     },
@@ -429,7 +427,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "select",
       label: "What the orchestrator is told",
       description:
-        "standard — delegate the work and review it.\ndelegate-only — also hand over research, so it may not run commands at all.\nresearch-first — read enough to write a brief that stands alone.\nreview-heavy — every unit gets an independent check unit before it is accepted.\nThe exact text: bb orchestrator-mode contract.",
+        "standard delegates the work and reviews it. delegate-only also hands over research, so it may not run commands at all. research-first asks for enough reading to write a brief that stands alone. review-heavy gives every unit an independent check unit before it is accepted. Read the exact text with bb orchestrator-mode contract.",
       options: [...CONTRACT_PRESETS],
       default: "standard",
     },
@@ -605,7 +603,7 @@ export default async function plugin(bb: BbPluginApi) {
   /**
    * Refuse a worker the provider catalog cannot serve, naming the alternatives
    * so the agent can correct itself instead of handing back a broken worker.
-   * Nothing is asserted while the catalog is empty — an unreadable catalog must
+   * Nothing is asserted while the catalog is empty, because an unreadable catalog must
    * not make delegation impossible.
    */
   function assertInCatalog(exec: WorkerExecution): void {
@@ -656,7 +654,7 @@ export default async function plugin(bb: BbPluginApi) {
   /**
    * Replace the stored worker configuration. `null` clears it, leaving every
    * delegation on the project's remembered defaults. Each level must name both
-   * a provider and a model — the settings section renders them with BB's
+   * a provider and a model, since the settings section renders them with BB's
    * picker, which resolves the pair against the live catalog, and every id it
    * cannot serve is refused here rather than spawned.
    */
@@ -731,9 +729,9 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
-   * The exact text `bb.agents.configure` injects, for one thread or — with a
-   * null thread — for a thread that has not run yet. Exposed so the contract
-   * can be read instead of guessed at.
+   * The exact text `bb.agents.configure` injects for one thread. Pass a null
+   * thread for the text a thread that has not run yet would receive. Exposed so
+   * the contract can be read instead of guessed at.
    */
   async function contractText(threadId: string | null): Promise<string> {
     const state = threadId === null ? undefined : await getState(threadId);
@@ -1209,7 +1207,7 @@ export default async function plugin(bb: BbPluginApi) {
           // `wait` matches one status and polls, so an errored thread never
           // reaches `idle`: the server rejects the wait immediately with
           // "will not reach idle by waiting alone" rather than holding until the
-          // timeout. That rejection is what notices a failure promptly — the
+          // timeout. That rejection is what notices a failure promptly, and the
           // status read below then decides whether to retry. A timeout lands
           // here too, which is why the status is read either way.
         }
@@ -1263,16 +1261,16 @@ export default async function plugin(bb: BbPluginApi) {
       /** The text the orchestrator gets back about one finished worker. */
       function report(workerId: string, settled: Settled): string {
         if (settled.running) {
-          return `Worker ${workerId} is still running after ${Math.round(timeoutMs / 1000)}s (status: ${settled.status ?? "unknown"}). Delegate the next unit, or wait and check it again — do not start doing its work yourself.`;
+          return `Worker ${workerId} is still running after ${Math.round(timeoutMs / 1000)}s (status: ${settled.status ?? "unknown"}). Delegate the next unit, or wait and check it again. Do not start doing its work yourself.`;
         }
         const trimmed = (settled.output ?? "").trim();
         const body =
           trimmed === ""
-            ? "(the worker produced no final text — open the thread to see what it did)"
+            ? "(the worker produced no final text. Open the thread to see what it did.)"
             : trimmed.length > 12_000
               ? `${trimmed.slice(0, 12_000)}\n\n[truncated]`
               : trimmed;
-        return `Worker ${workerId} finished with status "${settled.status ?? "unknown"}".\n\n${body}\n\nReview it. If it is wrong or incomplete, send a follow-up to a worker — do not fix it yourself.`;
+        return `Worker ${workerId} finished with status "${settled.status ?? "unknown"}".\n\n${body}\n\nReview it. If it is wrong or incomplete, send a follow-up to a worker. Do not fix it yourself.`;
       }
 
       /**
@@ -1321,9 +1319,9 @@ export default async function plugin(bb: BbPluginApi) {
         const verdict = (checked.output ?? "").trim();
         return `\n\nCheck unit ${verifierId} ran the same brief.${
           checked.running
-            ? " It is still running — check it before you accept the work."
+            ? " It is still running, so check it before you accept the work."
             : verdict === ""
-              ? " It produced no final text — open it before you accept the work."
+              ? " It produced no final text, so open it before you accept the work."
               : `\n\n${verdict.length > 8_000 ? `${verdict.slice(0, 8_000)}\n\n[truncated]` : verdict}`
         }`;
       }
@@ -1361,7 +1359,7 @@ export default async function plugin(bb: BbPluginApi) {
 
       if (waitForResult === false) {
         const retry = fallback === undefined ? "" : " If it fails, re-delegate it on the configured fallback.";
-        return `Delegated without waiting.\nWorker thread: ${workerId} — "${workerTitle}"\nCheck on it later and fold its result into your report.${retry}`;
+        return `Delegated without waiting.\nWorker thread ${workerId}, titled "${workerTitle}"\nCheck on it later and fold its result into your report.${retry}`;
       }
 
       const first = await settle(workerId, timeoutMs);
@@ -1375,7 +1373,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: REVIEW_TOOL,
     description:
-      "Record your verdict on one worker's output. Call it once per worker whose result you used, before you report — the watchdog checks for it. `rejected` means the unit is re-delegated to a worker, never patched by you.",
+      "Record your verdict on one worker's output. Call it once per worker whose result you used, before you report, because the watchdog checks for it. `rejected` means the unit is re-delegated to a worker, never patched by you.",
     instructions:
       "Judge every worker whose result you used and record the verdict with orchestrator_review before you finish the turn.",
     presentation: {
@@ -1437,7 +1435,7 @@ export default async function plugin(bb: BbPluginApi) {
           ? " Every worker has a verdict."
           : ` ${remaining} worker${remaining === 1 ? "" : "s"} still unjudged.`;
       return verdict === "rejected"
-        ? `Recorded rejected for ${workerThreadId}. Re-delegate that unit to a worker — do not fix it yourself.${tail}`
+        ? `Recorded rejected for ${workerThreadId}. Re-delegate that unit to a worker. Do not fix it yourself.${tail}`
         : `Recorded accepted for ${workerThreadId}.${tail}`;
     },
   });
@@ -1445,7 +1443,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.configure((context) => {
     // The mirror is the only source of truth here. `configure` is synchronous
     // and receives no createdAt, so it cannot tell a thread created under the
-    // new-thread default from one that merely predates it — guessing here is
+    // new-thread default from one that merely predates it, and guessing here is
     // what once governed every mirror-less thread in the app. The dispatch
     // hook, which does have createdAt, is the single place the default lands.
     const mirror = readMirror(context.pluginMetadata as Record<string, unknown>);
@@ -1593,7 +1591,7 @@ export default async function plugin(bb: BbPluginApi) {
         graceTurnIds.push(turnId);
       }
       // Turns that ran before the session could gain the contract are never
-      // judged — only recorded.
+      // judged, only recorded.
       if (turnId !== null && graceTurnIds.includes(turnId)) continue;
       const violation = classifyRow(row, { allowReadCommands: live.allowReadCommands });
       if (violation !== null) fresh.push(violation);
@@ -1687,8 +1685,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   /**
    * The orchestrator whose delegation this worker is, if any. A worker that
-   * settles while its orchestrator is not watching it — a delegation made with
-   * `waitForResult: false` — is only visible through this lookup.
+   * settles while its orchestrator is not watching it is only visible through
+   * this lookup. A delegation made with `waitForResult: false` settles that way.
    */
   function ownerOf(workerThreadId: string): string | undefined {
     for (const [threadId, state] of Object.entries(cache ?? {})) {
@@ -1729,7 +1727,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   /**
    * The review gate: a turn that ended with workers nobody judged gets one
-   * reminder, and only while its orchestrator is idle — a nudge sent mid-turn
+   * reminder, and only while its orchestrator is idle, since a nudge sent mid-turn
    * would queue behind the very work it is asking about.
    *
    * A finished turn cannot be stopped after the fact, so `block` behaves as
@@ -1960,7 +1958,7 @@ export default async function plugin(bb: BbPluginApi) {
               input.options.json,
               dto,
               `Orchestrator mode ON for ${threadId} (${dto.effectiveEnforcement}).\n` +
-                "Applies when the provider session is next constructed — a live session keeps the instructions it started with.",
+                "Applies when the provider session is next constructed. A live session keeps the instructions it started with.",
             );
           },
         }),

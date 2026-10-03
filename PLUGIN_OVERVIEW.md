@@ -39,10 +39,10 @@ per worker with `orchestrator_review`, and a turn that ends with unjudged
 workers gets one reminder. `verify: true` adds an independent check unit that
 inspects the work and reports pass or fail instead of repairing it.
 
-- **instruct:** contract only.
-- **guard** (default): watch the timeline, record direct work and send
-  corrective messages up to the configured cap.
-- **block:** also stop the offending turn after detection.
+`instruct` writes the rules and checks nothing. `guard` (the default) also
+watches the timeline, records direct work and sends corrective messages up to
+the configured cap. `block` also stops the offending turn once direct work is
+detected.
 
 Direct image generation counts as work and must be delegated. Recognised
 read-only shell commands are allowed by default. You can treat all
