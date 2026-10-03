@@ -889,6 +889,10 @@ export default async function plugin(bb: BbPluginApi) {
       nudgeCount: 0,
       lastNudgeTurnId: null,
       lastStopTurnId: null,
+      // The review reminder is a correction counter too. Leaving its marker here
+      // would mute the gate for the same workers while the cap said there were
+      // reminders left to spend.
+      lastReviewNudge: null,
     }));
   }
 
@@ -995,6 +999,7 @@ export default async function plugin(bb: BbPluginApi) {
       nudgeCount: enabled ? current.nudgeCount : 0,
       lastNudgeTurnId: enabled ? current.lastNudgeTurnId : null,
       lastStopTurnId: enabled ? current.lastStopTurnId : null,
+      lastReviewNudge: enabled ? current.lastReviewNudge : null,
     }));
     await syncMirror(threadId, state?.enabled ?? false, state?.enforcement ?? null);
     return state ?? emptyState(Date.now());

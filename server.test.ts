@@ -1075,6 +1075,49 @@ describe("the delegation tool", () => {
     expect(reviews()).toHaveLength(1);
   });
 
+  it("reminds again after the counters are cleared", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    const reminders = () => sentTexts.filter((text) => /review is missing/i.test(text));
+
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(reminders()).toHaveLength(1);
+
+    await harness.behavior.callRpc("clear_violations", { threadId: THREAD });
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    // Clearing resets the counters, so the gate speaks again instead of staying
+    // muted for the same unjudged worker.
+    expect(reminders()).toHaveLength(2);
+  });
+
+  it("reminds again after the thread is turned off and on", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    const reminders = () => sentTexts.filter((text) => /review is missing/i.test(text));
+
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(reminders()).toHaveLength(1);
+
+    await harness.behavior.callRpc("set_enabled", { threadId: THREAD, enabled: false });
+    await enable(harness);
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(reminders()).toHaveLength(2);
+  });
+
   it("leaves the review gate silent at the instruct level", async () => {
     const { harness } = await load({ enforcement: "instruct" });
     await enable(harness);
