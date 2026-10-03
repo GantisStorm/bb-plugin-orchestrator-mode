@@ -109,9 +109,9 @@ about, so an ignored reminder is not repeated for the same set. A finished turn
 cannot be stopped, so `block` behaves as `guard` here; the nudge text says so
 rather than implying a stop that did not happen.
 
-A worker that settles while nothing is waiting on it — a delegation made with
-`waitForResult: false` — is found by looking its thread id up in every stored
-orchestrator's delegations. That lookup also carries the failure text from
+A worker that settles while nothing is waiting on it is found by looking its
+thread id up in every stored orchestrator's delegations. A delegation made with
+`waitForResult: false` settles that way. That lookup also carries the failure text from
 `thread.failed` onto the record, so the orchestrator is told why a worker failed
 and not only that it did.
 

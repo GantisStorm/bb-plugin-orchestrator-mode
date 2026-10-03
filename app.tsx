@@ -1,4 +1,4 @@
-// bb-plugin-orchestrator-mode — frontend.
+// Frontend for the orchestrator-mode plugin.
 //
 // One composer customization with three surfaces over one shared controller:
 //
@@ -170,7 +170,7 @@ function message(cause: unknown): string {
 /**
  * The glyph every surface draws. The artwork itself is declared once, in the
  * manifest under `bb.branding.experimental_icons`, and BB serves it hashed and
- * tinted — so there is exactly one drawing of it to keep in step.
+ * tinted, so there is exactly one drawing of it to keep in step.
  */
 const ICON_NAME = "orchestrator-mode/hub";
 
@@ -224,7 +224,7 @@ function OrchestratorHost() {
           setState(updated);
           toast.success(
             next
-              ? `Orchestrator mode on — ${updated.effectiveEnforcement}`
+              ? `Orchestrator mode on (${updated.effectiveEnforcement})`
               : "Orchestrator mode off",
           );
         } else {
@@ -377,8 +377,9 @@ function OrchestratorToggle() {
  * Worker execution is not a plugin setting: the model list has to follow the
  * chosen provider, and a `select` cannot depend on another `select`. BB's own
  * provider/model picker resolves provider, model, reasoning level and service
- * tier against the live catalog as one coherent value — the same value
- * `threads.spawn` takes — so the choice is stored through this plugin's RPC and
+ * tier against the live catalog as one coherent value, the same value
+ * `threads.spawn` takes. That is why the choice is stored through this plugin's
+ * RPC and
  * rendered with that picker. Each choice is a pressed pair, so `Inherit` is a
  * visible option rather than only the absence of one.
  */
@@ -472,8 +473,8 @@ function WorkerExecutionSettings() {
           <div className="text-sm font-medium">Which provider and model workers use</div>
           <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
             {execution === null
-              ? "Inherit — workers use this project's remembered provider and model."
-              : "Custom — every worker starts on the provider and model below."}
+              ? "Workers use this project's remembered provider and model."
+              : "Every worker starts on the provider and model below."}
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-1" role="group" aria-label="Worker provider and model">
@@ -527,8 +528,8 @@ function WorkerExecutionSettings() {
           <div className="text-sm font-medium">If a worker fails</div>
           <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
             {fallback === null
-              ? "Report — the failure comes back to the orchestrator to re-delegate."
-              : "Retry — the same brief runs once more on the provider, model and access below."}
+              ? "A failure comes back to the orchestrator to re-delegate."
+              : "The same brief runs once more on the provider, model and access below."}
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-1" role="group" aria-label="Worker fallback">
@@ -632,9 +633,7 @@ function WorkerExecutionSettings() {
                   Set
                 </Button>
                 {preset === null ? (
-                  <span className="text-xs text-subtle-foreground/75">
-                    uses the default above · {hint}
-                  </span>
+                  <span className="text-xs text-subtle-foreground/75">{hint}</span>
                 ) : (
                   <>
                     <ProviderModelPicker

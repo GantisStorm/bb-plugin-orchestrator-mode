@@ -176,12 +176,12 @@ Workers run on the project's remembered provider and model unless you give them
 their own. **Settings → Installed plugins → Orchestrator Mode → Worker
 execution** has two choices, each a visible pair rather than a switch:
 
-- **Workers run on** — `Inherit` keeps the project's remembered provider and
-  model; `Custom` starts them on the provider, model, reasoning level and
-  service tier you pick with BB's own picker.
-- **Retry a failed worker** — `Report` hands a failure back to the orchestrator;
-  `Retry` re-delegates the same brief on a second provider, model and access
-  you pick, each with its own picker.
+- **Workers run on** `Inherit` (the project's remembered provider and model) or
+  `Custom` (the provider, model, reasoning level and service tier you pick with
+  BB's own picker).
+- **Retry a failed worker** `Report` (hand the failure back to the orchestrator)
+  or `Retry` (re-delegate the same brief on a second provider, model and access
+  you pick, each with its own picker).
 
 The retry runs once, and it covers both ways a worker fails: a spawn the
 provider refuses outright, and a worker thread that lands in `error`. The
@@ -194,7 +194,7 @@ when a fallback is configured.
 
 The picker is BB's, not a copy: choosing a provider shows that provider's
 models, and one pick resolves provider, model, reasoning level and service tier
-as a single coherent value — the same value `threads.spawn` takes. That is why
+as a single coherent value, the same value `threads.spawn` takes. That is why
 this is not a plugin setting: a settings `select` cannot make its options depend
 on another `select`, so a flat model list would offer models for providers you
 did not choose.
@@ -228,18 +228,18 @@ the retry target's own provider and model. Setting a worker execution or a
 fallback needs both a provider and a model, because those two are what the
 pickers describe.
 
-**Provider support:** changing a worker's model needs the target provider to
-switch models at session start. `codex` and `claude-code` do. The `acp-omp`
-provider answers an ACP `session/set_model` call with *Unknown ACP ext method*,
-so asking for any model other than the one it already runs fails that worker's
-start — leave workers on the project default when delegating to `acp-omp`.
+Changing a worker's model needs the target provider to switch models at session
+start. `codex` and `claude-code` do. The `acp-omp` provider answers an ACP
+`session/set_model` call with *Unknown ACP ext method*, so asking for any model
+other than the one it already runs fails that worker's start. Leave workers on
+the project default when delegating to `acp-omp`.
 
 ## Reviewing worker output
 
 Every delegation is meant to end in a verdict, and the plugin checks for one.
-The orchestrator records it with the `orchestrator_review` tool — one call per
-worker whose result it used, with `accepted` or `rejected` and a line of notes —
-and the watchdog notices when a turn ends without one:
+The orchestrator records it with the `orchestrator_review` tool, one call per
+worker whose result it used, with `accepted` or `rejected` and a line of notes.
+The watchdog notices when a turn ends without one:
 
 - The composer strip and `bb orchestrator-mode status` show how many workers are
   judged and how many are waiting.
@@ -251,8 +251,8 @@ and the watchdog notices when a turn ends without one:
 
 `orchestrator_delegate` takes `verify: true`, which spawns an **independent
 check unit** on the same brief: a second worker told to inspect the repository
-and report `VERDICT: pass` or `VERDICT: fail`, and told not to modify anything —
-a checker that repairs the work destroys the evidence it was asked for. Its
+and report `VERDICT: pass` or `VERDICT: fail`, and told not to modify anything.
+A checker that repairs the work destroys the evidence it was asked for. Its
 thread is recorded as that delegation's evidence and its report comes back with
 the worker's. A check unit is not itself a unit to judge, so it does not add a
 second verdict to record.
@@ -280,8 +280,8 @@ is already in the orchestrator's hands.
 ## The contract
 
 The instructions a session receives are inspectable and extensible, but not
-rewritable — the contract states exactly which acts the watchdog flags, so a
-free-form replacement could desync the two and make the watchdog wrong.
+rewritable, because the contract states exactly which acts the watchdog flags.
+A free-form replacement could desync the two and make the watchdog wrong.
 
 ```sh
 bb orchestrator-mode contract                              # the text this thread receives
@@ -311,8 +311,8 @@ can produce with an append at the cap and asserts it fits.
 ## Enforcement limits
 
 - **A command has to look like one.** A `command` row counts as work when it
-  names a program an agent plausibly runs, or carries shell evidence — a path, a
-  flag, a pipe, a redirect, an assignment. A provider that renders a plugin tool
+  names a program an agent plausibly runs, or carries shell evidence (a path, a
+  flag, a pipe, a redirect, an assignment). A provider that renders a plugin tool
   call as a command row carries the call's title there instead, and a title is
   not a command. The cost is that a bare unknown program name with no arguments
   reads as a title; a write it performs still shows up as a file change.
@@ -354,10 +354,12 @@ ordinary terminal, provide a thread ID for thread commands.
 
 </details>
 
-**Agent tools:**
-`orchestrator_delegate({ task, title?, waitForResult?, timeoutSeconds?, hidden?, preset?, verify?, provider?, model?, reasoning?, permissionMode? })`,
-and `orchestrator_review({ workerThreadId, verdict, notes?, verifiedBy? })`, which
-the watchdog expects once per worker whose result was used.
+Two tools. `orchestrator_delegate({ task, title?, waitForResult?,
+timeoutSeconds?, hidden?, preset?, verify?, provider?, model?, reasoning?,
+permissionMode? })` hands one unit to a worker, and
+`orchestrator_review({ workerThreadId, verdict, notes?, verifiedBy? })` records
+your verdict on the result. The watchdog expects one verdict per worker whose
+result was used.
 The brief is required and limited to 20,000 characters; the title is limited to
 200. Waiting defaults to `true`, with a 900-second timeout (range 10–3,600).
 `hidden` defaults to `false`. A timeout returns the worker's status and leaves it

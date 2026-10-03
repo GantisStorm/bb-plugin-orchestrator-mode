@@ -1,4 +1,4 @@
-// bb-plugin-orchestrator-mode — policy shared by the backend and the frontend.
+// Shared policy for the orchestrator-mode backend and the frontend.
 //
 // Everything here is pure: no SDK imports, no I/O. `server.ts` uses it to build
 // the instruction block and to classify timeline rows, `app.tsx` uses it to
@@ -37,11 +37,11 @@ export const DEFAULT_ENFORCEMENT: EnforcementLevel = "guard";
 
 /** One-line description of each level, for the composer, CLI and settings UI. */
 export const ENFORCEMENT_DESCRIPTIONS: Record<EnforcementLevel, string> = {
-  instruct: "writes the rules into every turn and checks nothing.",
+  instruct: "Instruct writes the rules into every turn and checks nothing.",
   guard:
-    "writes the rules, and warns the orchestrator when it does work itself or leaves a worker unjudged.",
+    "Guard writes the rules and warns the orchestrator when it does work itself or leaves a worker unjudged.",
   block:
-    "the same, and stops the turn as soon as it does work itself — a fast write can still land first.",
+    "Block writes the rules too and stops the turn as soon as the orchestrator does work itself, though a fast write can still land first.",
 };
 
 export function isEnforcementLevel(value: unknown): value is EnforcementLevel {
@@ -361,7 +361,7 @@ const READ_ONLY_PROGRAMS: ReadonlySet<string> = new Set([
 /**
  * Programs that plausibly appear as the first word of a real command. Not a
  * safety list: a command outside it is still work if it carries the shape of a
- * command — see {@link looksLikeShellCommand}. Its job is to tell a command from
+ * command, see {@link looksLikeShellCommand}. Its job is to tell a command from
  * the *title* some providers give a plugin tool call, which arrives as a
  * `command` row whose text is a sentence like "Recording verdict for X".
  */
@@ -465,8 +465,8 @@ const PLAUSIBLE_PROGRAMS: ReadonlySet<string> = new Set([
  * Whether a `command` row's text is shaped like something that was actually
  * run, rather than the sentence a provider used as a tool call's title.
  *
- * A known program is enough. Anything else has to carry shell evidence — a
- * path, a flag, a redirect, a pipe, an assignment — because no real invocation
+ * A known program is enough. Anything else has to carry shell evidence (a
+ * path, a flag, a redirect, a pipe, an assignment), because no real invocation
  * of an unknown program looks like prose.
  */
 export function looksLikeShellCommand(command: string): boolean {
@@ -653,7 +653,7 @@ export function classifyRow(
     // Some providers render a plugin tool call as a command row whose text is
     // the call's title. That is not the orchestrator running anything, and
     // flagging it tells the orchestrator off for using the tools this plugin
-    // gave it — the fastest way for a watchdog to lose its authority.
+    // gave it, which is the fastest way for a watchdog to lose its authority.
     if (command !== "" && !looksLikeShellCommand(command)) {
       return null;
     }
@@ -779,13 +779,13 @@ export function buildInstructions(input: InstructionInput): string {
     preset === "review-heavy"
       ? `4. Every unit gets checked before you trust it: delegate it with \`verify: true\` so an
    independent worker inspects the result, then record a verdict for that unit
-   with the \`${REVIEW_TOOL}\` tool. If the check fails, re-delegate the unit — never
+   with the \`${REVIEW_TOOL}\` tool. If the check fails, re-delegate the unit. Never
    patch it yourself.`
       : `4. Review what comes back, and record a verdict for every worker with the
    \`${REVIEW_TOOL}\` tool. Pass \`verify: true\` when you delegate a unit whose
    result you cannot judge from its report alone: that adds an independent
    check unit. If a result is wrong or incomplete, send a follow-up to a
-   worker — never patch it yourself.`;
+   worker. Never patch it yourself.`;
 
   const commands = readCommands
     ? "Read-only shell commands (`ls`, `cat`, `rg`, `git status`, `git diff`, `git log`, `find`, `wc`) are allowed so you can orient yourself. Anything that writes, builds, installs, commits or otherwise changes state is not."
@@ -807,7 +807,7 @@ the synthesis of what came back.
 
 ${watching}
 
-## Forbidden — doing the work yourself
+## Do not do the work yourself
 
 - Editing, creating, overwriting, moving or deleting any file.
 - Generating images instead of delegating their creation.
@@ -819,7 +819,7 @@ ${watching}
 
 ${commands}
 
-## Required — how you work instead
+## How you work instead
 
 1. Understand the request. Read and search freely; ask the user when the goal
    is ambiguous.${research}
@@ -846,7 +846,7 @@ something, stop and delegate it instead.
 
 ${workerBudget(input.workerConfig)} Override it per delegation with the
 \`model\`, \`provider\`, \`reasoning\` and \`permissionMode\` arguments of
-\`${DELEGATE_TOOL}\` — give a hard unit a stronger model and a mechanical one a
+\`${DELEGATE_TOOL}\`. Give a hard unit a stronger model and a mechanical one a
 cheaper one. Valid ids come from the catalog: \`bb provider list\` names the
 providers, \`bb provider models <provider>\` lists their models. Both are
 read-only.
@@ -855,7 +855,7 @@ ${extraBudget(input.extra)}## If you cannot delegate
 
 Say so plainly and stop. "I cannot do this without doing the work myself" is a
 correct answer; doing the work yourself is not. Do not disable or argue with
-this mode — ask the user to turn it off in the composer if it is wrong.${reminders}`;
+this mode. Ask the user to turn it off in the composer if it is wrong.${reminders}`;
 }
 
 /**
@@ -889,9 +889,9 @@ ${claimed}
 
 ## What to do
 
-Verify the work against the brief by inspecting the repository itself — the
-files it claims to have touched, whether they exist, and whether they do what
-the brief asked. Do not trust the report alone, and do not fix anything: an
+Verify the work against the brief by inspecting the repository itself. Look at
+the files it claims to have touched, whether they exist, and whether they do
+what the brief asked. Do not trust the report alone, and do not fix anything: an
 unverified claim and a missing change are both findings.
 
 Report, in this order:
@@ -938,8 +938,8 @@ export function buildReviewNudge(
 ${acts}
 
 You finished the turn without recording a verdict for these workers. Call
-\`${REVIEW_TOOL}\` once per worker — \`accepted\` or \`rejected\` with a line of
-notes — then fold the verdicts into your report. A rejected result is
+\`${REVIEW_TOOL}\` once per worker, with \`accepted\` or \`rejected\` and a line of
+notes, then fold the verdicts into your report. A rejected result is
 re-delegated to a worker, never fixed by you.`;
 }
 
