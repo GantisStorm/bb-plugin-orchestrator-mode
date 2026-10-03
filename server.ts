@@ -1452,6 +1452,11 @@ export default async function plugin(bb: BbPluginApi) {
               type: "string",
               description: "Model to retry a failed worker on; needs --fallback-provider",
             },
+            "fallback-permission": {
+              type: "enum",
+              values: [...PERMISSION_MODES],
+              description: "Permission mode for a retried worker",
+            },
             "clear-fallback": {
               type: "boolean",
               description: "Stop retrying failed workers",
@@ -1474,13 +1479,21 @@ export default async function plugin(bb: BbPluginApi) {
             };
             const fallbackProvider = input.options["fallback-provider"];
             const fallbackModel = input.options["fallback-model"];
-            const fallback =
-              fallbackProvider === undefined && fallbackModel === undefined
-                ? undefined
-                : { providerId: fallbackProvider ?? "", model: fallbackModel ?? "" };
+            const fallbackPermission = input.options["fallback-permission"];
+            // A patch, not a replacement: each flag below is merged over the
+            // stored fallback, so `--fallback-permission` alone keeps its
+            // provider and model.
+            const fallbackPatch: WorkerExecution = {
+              ...(fallbackProvider === undefined ? {} : { providerId: fallbackProvider }),
+              ...(fallbackModel === undefined ? {} : { model: fallbackModel }),
+              ...(fallbackPermission === undefined
+                ? {}
+                : { permissionMode: fallbackPermission as PermissionMode }),
+            };
+            const hasFallbackPatch = Object.keys(fallbackPatch).length > 0;
             const clearing = input.options.clear === true;
             const clearFallback = input.options["clear-fallback"] === true;
-            if (!clearing && !clearFallback && Object.keys(chosen).length === 0 && fallback === undefined) {
+            if (!clearing && !clearFallback && Object.keys(chosen).length === 0 && !hasFallbackPatch) {
               return render(
                 input.options.json,
                 live.worker,
@@ -1494,8 +1507,10 @@ export default async function plugin(bb: BbPluginApi) {
             if (!clearing) {
               next = { ...workerDefaults(), ...chosen };
               if (!clearFallback) {
-                const target = fallback ?? live.worker.fallback;
-                if (target !== undefined) next.fallback = { ...live.worker.fallback, ...target };
+                const target = { ...live.worker.fallback, ...fallbackPatch };
+                if (target.providerId !== undefined || target.model !== undefined) {
+                  next.fallback = target;
+                }
               }
             }
             const stored = await setWorkerConfig(next);
