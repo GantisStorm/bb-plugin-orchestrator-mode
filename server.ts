@@ -372,60 +372,66 @@ export default async function plugin(bb: BbPluginApi) {
   const SETTING_DESCRIPTORS = {
     defaultForNewThreads: {
       type: "boolean",
-      label: "New threads start in orchestrator mode",
+      label: "Start new threads as orchestrators",
       description:
-        "Applies the default to root threads created while it is on. Existing threads are left alone.",
+        "Threads you start from the composer begin in orchestrator mode. Threads already open, child workers and side chats are not affected. You can still turn the mode on or off for one thread in the composer.",
       default: false,
     },
     enforcement: {
       type: "select",
-      label: "Enforcement",
-      description: ENFORCEMENT_DESCRIPTIONS.guard,
+      label: "How far the watchdog goes",
+      // One line per option, which BB's settings UI collapses into a paragraph
+      // and `bb plugin config` prints as written. A settings description is a
+      // single string, so a real list is not available here.
+      description: ENFORCEMENT_LEVELS.map(
+        (level) => `${level} — ${ENFORCEMENT_DESCRIPTIONS[level]}`,
+      ).join("\n"),
       options: [...ENFORCEMENT_LEVELS],
       default: DEFAULT_ENFORCEMENT,
     },
-    contractPreset: {
-      type: "select",
-      label: "Contract shape",
-      description:
-        "Which instructions an orchestrating session receives. `standard` covers delegation and review; `delegate-only` also delegates research; `research-first` asks for reading before a brief; `review-heavy` requires a check unit per delegation.",
-      options: [...CONTRACT_PRESETS],
-      default: "standard",
-    },
-    workerRetention: {
-      type: "select",
-      label: "Clean up settled workers",
-      description:
-        "`keep` leaves every worker in the sidebar. `archive-checks` archives check units once their verdict has been read. `archive-all` archives every worker whose result the orchestrator has read, which hides them from the sidebar but keeps them recoverable.",
-      options: [...WORKER_RETENTION],
-      default: "keep",
-    },
     allowReadCommands: {
       type: "boolean",
-      label: "Read-only shell commands are not work",
+      label: "Let the orchestrator read with shell commands",
       description:
-        "Lets an orchestrator run ls/cat/rg/git status/git diff to orient itself. Turning this off treats every command as doing the work.",
+        "On: ls, cat, rg, git status, git diff and similar are treated as looking around, not as doing work. Off: any command counts as doing the work itself.",
       default: true,
     },
     maxNudges: {
       type: "number",
-      label: "Maximum corrective nudges per thread",
-      description: "Violations keep being recorded after the cap is reached.",
+      label: "Reminders per thread",
+      description:
+        "How many times this plugin may prod one thread — once for doing work itself, once for leaving a worker unjudged. Violations keep being recorded after the cap; only the reminders stop. 0 turns reminders off.",
       default: 3,
     },
     maxParallelWorkers: {
       type: "number",
-      label: "Workers in flight at once",
+      label: "Most workers running at once",
       description:
-        "A delegation is refused with a readable error once this many workers are still running. 0 removes the cap. Every worker counts, including check units and fallbacks.",
+        "A delegation is refused, with the reason, while this many workers are still running. Check units and fallbacks count too. 0 for no limit.",
       default: 6,
     },
     maxDelegationsPerTurn: {
       type: "number",
-      label: "Workers delegated per turn",
+      label: "Most workers per turn",
       description:
-        "A delegation is refused once the orchestrator has delegated this many in one turn. 0 removes the cap.",
+        "A delegation is refused once one turn has delegated this many, so a runaway fan-out stops instead of filling the sidebar. 0 for no limit.",
       default: 20,
+    },
+    workerRetention: {
+      type: "select",
+      label: "What happens to workers afterwards",
+      description:
+        "keep — every worker stays in the sidebar.\narchive-checks — check units are archived once their verdict has been read.\narchive-all — every worker is archived once the orchestrator has read its result.\nArchiving only hides a thread from the sidebar; it stays recoverable.",
+      options: [...WORKER_RETENTION],
+      default: "keep",
+    },
+    contractPreset: {
+      type: "select",
+      label: "What the orchestrator is told",
+      description:
+        "standard — delegate the work and review it.\ndelegate-only — also hand over research, so it may not run commands at all.\nresearch-first — read enough to write a brief that stands alone.\nreview-heavy — every unit gets an independent check unit before it is accepted.\nThe exact text: bb orchestrator-mode contract.",
+      options: [...CONTRACT_PRESETS],
+      default: "standard",
     },
   } satisfies Record<string, PluginSettingDescriptor>;
 

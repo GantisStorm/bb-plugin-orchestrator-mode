@@ -37,11 +37,11 @@ export const DEFAULT_ENFORCEMENT: EnforcementLevel = "guard";
 
 /** One-line description of each level, for the composer, CLI and settings UI. */
 export const ENFORCEMENT_DESCRIPTIONS: Record<EnforcementLevel, string> = {
-  instruct: "Contract only: inject the orchestrator rules into every turn.",
+  instruct: "writes the rules into every turn and checks nothing.",
   guard:
-    "Contract + watchdog: detect direct work, record it and correct the agent.",
+    "writes the rules, and warns the orchestrator when it does work itself or leaves a worker unjudged.",
   block:
-    "Contract + watchdog + stop: halt the turn the moment it does direct work.",
+    "the same, and stops the turn as soon as it does work itself — a fast write can still land first.",
 };
 
 export function isEnforcementLevel(value: unknown): value is EnforcementLevel {
