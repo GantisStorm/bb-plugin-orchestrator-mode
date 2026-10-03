@@ -2129,6 +2129,54 @@ describe("sweep regressions", () => {
     });
   });
 
+  it("does not let a colon-bearing row id hide a later, different row", async () => {
+    // lastSeq starts at 0 so both deliveries are above the cursor, and the rows
+    // carry no turnId so neither spends a grace slot.
+    const { harness } = await load({ enforcement: "guard" }, {
+      [THREAD]: {
+        enabled: true,
+        enforcement: "guard",
+        enabledAt: new Date(Date.now() - 60_000).toISOString(),
+        touchedAt: Date.now(),
+        violations: [],
+        seenRowIds: [],
+        lastSeq: 0,
+        graceTurnIds: [],
+        graceSlots: 1,
+        nudgeCount: 0,
+        lastNudgeTurnId: null,
+        lastStopTurnId: null,
+        delegations: [],
+        turnStartedAt: 0,
+        lastReviewNudge: null,
+      },
+    });
+    // A seq-0 delivery whose id already contains the old `id:seq` separator.
+    timelineRows = [
+      workRow({ id: "a:1", workKind: "file-change", turnId: undefined, sourceSeqStart: 0, sourceSeqEnd: 0, change: { path: "src/first.ts" } }),
+    ];
+    timelineMaxSeq = 0;
+    await idle(harness);
+    await vi.waitFor(async () => {
+      const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as { violations: { detail: string }[] };
+      expect(state.violations.map((violation) => violation.detail)).toEqual(["changed src/first.ts itself"]);
+    });
+    // `{id:"a", sourceSeqEnd:1}` is a different row, not a redelivery of `a:1`.
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: "a", workKind: "file-change", turnId: undefined, sourceSeqStart: 1, sourceSeqEnd: 1, change: { path: "src/second.ts" } }),
+    ];
+    timelineMaxSeq = 1;
+    await idle(harness);
+    await vi.waitFor(async () => {
+      const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as { violations: { detail: string }[] };
+      expect(state.violations.map((violation) => violation.detail)).toEqual([
+        "changed src/first.ts itself",
+        "changed src/second.ts itself",
+      ]);
+    });
+  });
+
   it("keeps workers that are still owed a verdict when the record is trimmed", async () => {
     const { harness } = await load({ enforcement: "instruct", maxParallelWorkers: 0, maxDelegationsPerTurn: 0 });
     await enable(harness, THREAD, "instruct");

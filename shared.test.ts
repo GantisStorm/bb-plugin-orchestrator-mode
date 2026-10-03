@@ -154,6 +154,18 @@ describe("read-only command detection", () => {
     "hostname",
     "hostname -s",
     "git config --get user.email",
+    // The whole `--get*` query family reads, not only `--get`.
+    "git config --get-all user.name",
+    "git config --get-regexp ^user",
+    "git config --get-color color.diff auto",
+    "git config --get-colorbool color.diff",
+    "git config --get-urlmatch user.name https://example.com",
+    // A heredoc body is data, not commands: the body's lines must not read as
+    // unknown programs, and the `<<` must not read as a writing redirect.
+    "cat <<EOF\nbody\nEOF",
+    "cat <<'EOF'\nbody\nEOF",
+    "cat <<-EOF\n\tbody\n\tEOF",
+    'echo "a << b"',
   ];
   for (const command of readOnly) {
     it(`allows \`${command}\``, () => {
@@ -222,6 +234,20 @@ describe("read-only command detection", () => {
     // Process substitution hides a command inside a read-only one.
     "diff <(rm -rf build) file.txt",
     "cat <(sh -c 'rm -rf build')",
+    // The `=<value>` spelling of a mutating flag is the same act as the
+    // detached spelling, not a read.
+    "rg --pre=cat pattern src",
+    "fd --exec=rm",
+    "fd -X=rm",
+    "fd --exec-batch=rm",
+    "yq --inplace=.a=1 file.yaml",
+    "date --set=2020-01-01",
+    // A heredoc does not launder the rest of the line, the program it feeds, or
+    // a write alongside it. An unterminated heredoc stays a refusal.
+    "cat <<EOF; rm x\nbody\nEOF",
+    "cat <<EOF > out.txt\nbody\nEOF",
+    "bash <<EOF\nrm -rf build\nEOF",
+    "cat <<EOF\nbody",
   ];
   for (const command of mutating) {
     it(`refuses \`${command}\``, () => {

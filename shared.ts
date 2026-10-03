@@ -506,13 +506,18 @@ const PLAUSIBLE_PROGRAMS: ReadonlySet<string> = new Set([
  * Flags that turn an otherwise read-only program into a writer or a runner, so
  * `find . -delete`, `fd -x rm`, `rg --pre <cmd>` and `yq -i` are not read as
  * searches. Only programs on the read-only list can appear here.
+ *
+ * Each pattern accepts the bare flag and its `=<value>` spelling, because
+ * `rg --pre=cat`, `fd --exec=rm` and `fd -X=rm` are the same request as their
+ * space-separated forms. `(?:=|$)` does both: the explicit `=`, or the end of
+ * the token that a detached value leaves behind.
  */
 const MUTATING_PROGRAM_FLAGS: Record<string, RegExp> = {
-  find: /^-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/,
-  fd: /^(?:-x|--exec|-X|--exec-batch)$/,
-  rg: /^--pre$/,
-  yq: /^(?:-i|--inplace|--in-place)$/,
-  date: /^(?:-s|--set)/,
+  find: /^-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)(?:=|$)/,
+  fd: /^(?:-x|--exec|-X|--exec-batch)(?:=|$)/,
+  rg: /^--pre(?:=|$)/,
+  yq: /^(?:-i|--inplace|--in-place)(?:=|$)/,
+  date: /^(?:-s|--set)(?:=|$)/,
   // `hostname` prints on its own and sets the name when it is given one.
   hostname: /^[^-]/,
 };
@@ -643,10 +648,13 @@ function isReadOnlyGitSegment(rest: readonly string[]): boolean {
   }
   if (subcommand === "config") {
     // A read form only reads when the same call carries no writing action.
-    return (
-      args.some((arg) => arg === "--get" || arg === "--list" || arg === "-l") &&
-      !args.some((arg) => GIT_CONFIG_WRITERS[arg] === true)
+    // The whole `--get*` query family reads: `--get-all`, `--get-regexp`,
+    // `--get-color`, `--get-colorbool` and `--get-urlmatch` are the same
+    // explicit query as `--get`, and none of them writes.
+    const reads = args.some(
+      (arg) => arg === "--get" || arg.startsWith("--get-") || arg === "--list" || arg === "-l",
     );
+    return reads && !args.some((arg) => GIT_CONFIG_WRITERS[arg] === true);
   }
   return READ_ONLY_GIT_SUBCOMMANDS.has(subcommand);
 }
@@ -690,6 +698,114 @@ const MUTATING_SKILL_VERBS: ReadonlySet<string> = new Set(["update", "remove", "
 /** Asking for help or a version never changes anything. */
 const HELP_OR_VERSION = /(?:^|\s)(?:--help|-h|--version)(?:\s|=|$)/;
 
+/** Characters that end an unquoted shell word, so a heredoc delimiter stops there. */
+const SHELL_WORD_BREAK = /[\s;&|()<>]/;
+
+/**
+ * Read the heredoc delimiter word at `start`, skipping the whitespace between
+ * `<<` and the word. Quotes are removed from the result, because the shell
+ * compares the terminator against the unquoted text: `<<'EOF'` ends at `EOF`.
+ * Returns null when there is no word to read, which is not a heredoc we can
+ * bound.
+ */
+function readHeredocDelimiter(text: string, start: number): { delimiter: string; end: number } | null {
+  let index = start;
+  while (index < text.length && (text[index] === " " || text[index] === "\t")) index += 1;
+  if (index >= text.length) return null;
+  const first = text[index]!;
+  if (first === "'" || first === '"') {
+    index += 1;
+    let delimiter = "";
+    while (index < text.length && text[index] !== first) {
+      delimiter += text[index];
+      index += 1;
+    }
+    if (index >= text.length) return null; // Unterminated quote: not a bounded word.
+    return delimiter === "" ? null : { delimiter, end: index + 1 };
+  }
+  let delimiter = "";
+  if (first === "\\") {
+    // `<\word>` quotes a single character.
+    index += 1;
+    if (index >= text.length) return null;
+    delimiter = text[index]!;
+    index += 1;
+  } else {
+    while (index < text.length && !SHELL_WORD_BREAK.test(text[index]!)) {
+      delimiter += text[index];
+      index += 1;
+    }
+  }
+  return delimiter === "" ? null : { delimiter, end: index };
+}
+
+/**
+ * The first unquoted heredoc operator in `text`, with the delimiter its body
+ * ends at and whether `<<-` strips leading tabs from the terminator line.
+ * Quote-aware, so a `<<` inside quotes is text; `<<<` is a here-string whose
+ * word stays on the same line, so it has no body and is skipped.
+ */
+function findHeredocOpener(
+  text: string,
+): { operatorStart: number; operatorEnd: number; delimiter: string; stripTabs: boolean } | null {
+  let quote = "";
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]!;
+    if (quote !== "") {
+      if (char === "\\" && quote === '"') index += 1;
+      else if (char === quote) quote = "";
+      continue;
+    }
+    if (char === "\\") { index += 1; continue; }
+    if (char === "'" || char === '"') { quote = char; continue; }
+    if (char !== "<" || text[index + 1] !== "<" || text[index + 2] === "<") continue;
+    const stripTabs = text[index + 2] === "-";
+    const word = readHeredocDelimiter(text, index + (stripTabs ? 3 : 2));
+    if (word === null) return null;
+    return { operatorStart: index, operatorEnd: word.end, delimiter: word.delimiter, stripTabs };
+  }
+  return null;
+}
+
+/**
+ * Remove every heredoc body before the line is split into commands. A heredoc's
+ * body is data, not commands, but it sits on its own lines and the scanner
+ * treats a line break as a separator, so without this the body's lines would be
+ * judged as unknown programs and a pure read would be flagged.
+ *
+ * Only the operator and the body lines are removed: the rest of the command
+ * line stays, so `cat <<EOF; rm x` still shows the `rm x` after it. A heredoc
+ * with no terminator line is left untouched, because an unterminated read
+ * cannot be told from the start of a write and must fail closed.
+ */
+function stripHeredocBodies(text: string): string {
+  let result = text;
+  for (;;) {
+    const opener = findHeredocOpener(result);
+    if (opener === null) return result;
+    const lineEnd = result.indexOf("\n", opener.operatorEnd);
+    if (lineEnd === -1) return result; // No body lines at all: leave it, fail closed.
+    let lineStart = lineEnd + 1;
+    let terminatorEnd = -1;
+    while (lineStart <= result.length) {
+      const nextBreak = result.indexOf("\n", lineStart);
+      const end = nextBreak === -1 ? result.length : nextBreak;
+      const line = result.slice(lineStart, end);
+      if ((opener.stripTabs ? line.replace(/^\t+/, "") : line) === opener.delimiter) {
+        terminatorEnd = end;
+        break;
+      }
+      if (nextBreak === -1) break;
+      lineStart = nextBreak + 1;
+    }
+    if (terminatorEnd === -1) return result; // Missing terminator: fail closed.
+    result =
+      result.slice(0, opener.operatorStart) +
+      result.slice(opener.operatorEnd, lineEnd) +
+      result.slice(terminatorEnd);
+  }
+}
+
 /**
  * True when every command in a shell line only reads. Any redirect, any
  * unknown program, and any mutating `git`/`bb` subcommand makes it work.
@@ -697,7 +813,7 @@ const HELP_OR_VERSION = /(?:^|\s)(?:--help|-h|--version)(?:\s|=|$)/;
 export function isReadOnlyCommand(command: string): boolean {
   const trimmed = command.trim();
   if (trimmed === "") return true;
-  const { unquoted, segments } = scanCommandLine(trimmed);
+  const { unquoted, segments } = scanCommandLine(stripHeredocBodies(trimmed));
   // A redirect writes, whatever the program is. Only unquoted text counts: `echo 'a > b'` writes nothing.
   if (/(^|[^>])>(?!&)/.test(unquoted) || />>/.test(unquoted)) return false;
   if (/\btee\b/.test(unquoted)) return false;
