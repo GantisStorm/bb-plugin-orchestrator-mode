@@ -172,12 +172,22 @@ session timing in more detail.
 
 Workers run on the project's remembered provider and model unless you give them
 their own. **Settings → Installed plugins → Orchestrator Mode → Worker
-execution** has one switch, which opens BB's own provider and model picker:
+execution** has two choices, each a visible pair rather than a switch:
 
-- **Off** — every delegation inherits the project's remembered provider and
-  model.
-- **On** — delegated workers start on the provider, model, reasoning level and
-  service tier you pick. **Reset to project default** clears it again.
+- **Workers run on** — `Inherit` keeps the project's remembered provider and
+  model; `Custom` starts them on the provider, model, reasoning level and
+  service tier you pick with BB's own picker.
+- **Retry a failed worker** — `Report` hands a failure back to the orchestrator;
+  `Retry` re-delegates the same brief on a second provider and model you pick.
+
+The retry runs once, and it covers both ways a worker fails: a spawn the
+provider refuses outright, and a worker thread that lands in `error`. The
+fallback inherits every field it does not name — pick only a different model and
+it keeps the worker permission mode. The orchestrator is told which model the
+retry used, and the contract tells it not to redo the work itself. A delegation
+made with `waitForResult: false` is returned to you before it can fail, so the
+retry happens for a spawn failure but not for a turn failure; the tool says so
+when a fallback is configured.
 
 The picker is BB's, not a copy: choosing a provider shows that provider's
 models, and one pick resolves provider, model, reasoning level and service tier
@@ -206,9 +216,12 @@ not serve the chosen model resolves to the model's own provider, and the
 mismatch is logged.
 
 `bb orchestrator-mode worker` prints the stored execution, sets it with
-`--provider`, `--model`, `--reasoning`, `--tier` and `--permission`, and clears
-it with `--clear`. It needs both a provider and a model, because those two are
-what the stored record and the pickers describe.
+`--provider`, `--model`, `--reasoning`, `--tier` and `--permission`, clears it
+with `--clear`, and manages the retry target with `--fallback-provider`,
+`--fallback-model` and `--clear-fallback`. Each flag changes one thing and
+leaves the rest alone: `worker --permission auto` keeps the provider and model
+already stored. Setting a worker execution or a fallback needs both a provider
+and a model, because those two are what the pickers describe.
 
 **Provider support:** changing a worker's model needs the target provider to
 switch models at session start. `codex` and `claude-code` do. The `acp-omp`
@@ -248,7 +261,7 @@ bb orchestrator-mode off
 | `off [--thread <id>] [--json]` | Disable the thread and clear its enforcement override. |
 | `violations [--thread <id>] [--clear] [--json]` | List violations, or clear them and reset correction counters. |
 | `default [on\|off] [--json]` | Show or set the default for new threads. |
-| `worker [--provider <id>] [--model <id>] [--reasoning <level>] [--tier <default\|fast>] [--permission <mode>] [--clear] [--json]` | Show, set or clear the execution every delegated worker defaults to. |
+| `worker [--provider <id>] [--model <id>] [--reasoning <level>] [--tier <default\|fast>] [--permission <mode>] [--fallback-provider <id>] [--fallback-model <id>] [--clear-fallback] [--clear] [--json]` | Show, set or clear the execution every delegated worker defaults to, and the provider and model a failed worker is retried on. |
 
 `--thread` (alias `-t`) defaults to the thread running the command. In an
 ordinary terminal, provide a thread ID for thread commands.

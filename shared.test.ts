@@ -253,6 +253,14 @@ describe("the contract", () => {
           enforcement,
           allowReadCommands,
           reminders: Array.from({ length: 5 }, (_, index) => `ran \`${"npm test " + index}\``),
+          workerConfig: {
+            providerId: "command-code",
+            model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+            reasoningLevel: "high",
+            serviceTier: "fast",
+            permissionMode: "accept-edits",
+            fallback: { providerId: "claude-code", model: "claude-opus-5-5" },
+          },
         });
         expect(text.length).toBeLessThanOrEqual(4096);
       }
