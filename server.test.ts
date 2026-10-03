@@ -790,6 +790,160 @@ describe("the delegation tool", () => {
     expect(spawned[0]).not.toHaveProperty("reasoningLevel");
   });
 
+  it("retries a failed worker on the configured fallback", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      fallback: { providerId: "claude-code", model: "claude-opus-5-5" },
+    });
+    await enable(harness);
+    let started = 0;
+    harness.inspection.sdk.stub("threads.spawn", async (args) => {
+      spawned.push(args as unknown as Record<string, unknown>);
+      return makeThreadResponse({
+        id: started++ === 0 ? "th_first" : "th_second",
+        parentThreadId: THREAD,
+      });
+    });
+    harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
+      makeThreadResponse({ id: threadId, status: threadId === "th_first" ? "error" : "idle" }),
+    );
+
+    const result = await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Rebuild the index" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    expect(spawned).toHaveLength(2);
+    expect(spawned[0]).toMatchObject({
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      providerId: "acp-omp",
+    });
+    // The fallback replaces the model and keeps the rest of the execution.
+    expect(spawned[1]).toMatchObject({
+      providerId: "claude-code",
+      model: "claude-opus-5-5",
+      prompt: "Rebuild the index",
+      executionInputSources: { providerId: "explicit", model: "explicit" },
+    });
+    expect(String(result)).toContain("th_first failed");
+    expect(String(result)).toContain("th_second");
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      delegations: [{ threadId: "th_first" }, { threadId: "th_second" }],
+    });
+  });
+
+  it("retries on the fallback when the worker cannot start at all", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      fallback: { providerId: "claude-code", model: "claude-opus-5-5" },
+    });
+    await enable(harness);
+    let started = 0;
+    harness.inspection.sdk.stub("threads.spawn", async (args) => {
+      // The provider refuses the first execution outright, as a 503 does.
+      if (started++ === 0) throw new Error("HTTP 503: provider unavailable");
+      spawned.push(args as unknown as Record<string, unknown>);
+      return makeThreadResponse({ id: "th_retry", parentThreadId: THREAD });
+    });
+
+    const result = await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Rebuild the index" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toMatchObject({ providerId: "claude-code", model: "claude-opus-5-5" });
+    expect(String(result)).toContain("could not start");
+    expect(String(result)).toContain("th_retry");
+  });
+
+  it("does not retry a failed worker when no fallback is configured", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+    });
+    await enable(harness);
+    harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
+      makeThreadResponse({ id: threadId, status: "error" }),
+    );
+
+    const result = await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Rebuild the index" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    expect(spawned).toHaveLength(1);
+    expect(String(result)).toContain('status "error"');
+  });
+
+  it("does not retry a worker that finished", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      fallback: { providerId: "claude-code", model: "claude-opus-5-5" },
+    });
+    await enable(harness);
+
+    const result = await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Rebuild the index" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    expect(spawned).toHaveLength(1);
+    expect(String(result)).toContain('status "idle"');
+  });
+
+  it("keeps the execution when only the fallback is cleared", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      fallback: { providerId: "claude-code", model: "claude-opus-5-5" },
+    });
+    expect(
+      await harness.behavior.callRpc("set_worker_execution", {
+        providerId: "acp-omp",
+        model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      }),
+    ).toEqual({ providerId: "acp-omp", model: "command-code/deepseek/deepseek-v4.1-flash-fast" });
+  });
+
+  it("refuses a fallback provider the catalog does not offer", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await expect(
+      harness.behavior.callRpc("set_worker_execution", {
+        providerId: "acp-omp",
+        model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+        fallback: { providerId: "gone", model: "command-code/deepseek/deepseek-v4.1-flash-fast" },
+      }),
+    ).rejects.toThrow(/Unknown worker provider "gone"/);
+    expect(await harness.behavior.callRpc("get_worker_execution", null)).toEqual({});
+  });
+
+  it("drops a stored fallback the catalog no longer offers", async () => {
+    const { harness } = await load({}, undefined, CATALOG, {
+      worker: {
+        providerId: "acp-omp",
+        model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+        fallback: { providerId: "acp-omp", model: "command-code/retired/model" },
+      },
+    });
+    expect(await harness.behavior.callRpc("get_worker_execution", null)).toEqual({
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+    });
+  });
+
   it("refuses a worker model the catalog does not offer", async () => {
     const { harness } = await load({}, undefined, CATALOG);
     await enable(harness);

@@ -50,6 +50,7 @@ import {
   type ServiceTier,
   type Violation,
   type WorkerCatalog,
+  type WorkerConfig,
   type WorkerExecution,
   type WorkerModelOption,
 } from "./shared";
@@ -129,6 +130,11 @@ const workerExecutionSchema = z.object({
   permissionMode: z.enum(PERMISSION_MODES).optional(),
 });
 
+/** The stored configuration: the execution, plus what to retry a failure on. */
+const workerConfigSchema = workerExecutionSchema.extend({
+  fallback: workerExecutionSchema.optional(),
+});
+
 const stateSchema = z.object({
   enabled: z.boolean(),
   enforcement: z.enum(ENFORCEMENT_LEVELS as readonly ["instruct", ...EnforcementLevel[]]).nullable(),
@@ -168,10 +174,10 @@ export const rpcContract = defineRpcContract({
     input: z.object({ enabled: z.boolean() }).strict(),
     output: z.object({ enabled: z.boolean() }),
   },
-  get_worker_execution: { input: z.null(), output: workerExecutionSchema },
+  get_worker_execution: { input: z.null(), output: workerConfigSchema },
   set_worker_execution: {
-    input: workerExecutionSchema.nullable(),
-    output: workerExecutionSchema,
+    input: workerConfigSchema.nullable(),
+    output: workerConfigSchema,
   },
   clear_violations: {
     input: z.object({ threadId: z.string().min(1).max(120) }).strict(),
@@ -323,7 +329,7 @@ export default async function plugin(bb: BbPluginApi) {
     allowReadCommands: true,
     maxNudges: 3,
     /** Worker execution defaults; an absent field means "inherit". */
-    worker: {} as WorkerExecution,
+    worker: {} as WorkerConfig,
   };
 
   /**
@@ -333,7 +339,17 @@ export default async function plugin(bb: BbPluginApi) {
    * remembered defaults exactly as it did before this fork.
    */
   function workerDefaults(): WorkerExecution {
-    return { ...live.worker };
+    return executionOf(live.worker);
+  }
+
+  /**
+   * A configuration's execution, without its fallback. `reconcile` and
+   * `threads.spawn` must never see the `fallback` key: it is this plugin's own
+   * bookkeeping, not a spawn field.
+   */
+  function executionOf(config: WorkerConfig): WorkerExecution {
+    const { fallback: _fallback, ...execution } = config;
+    return execution;
   }
 
   /**
@@ -384,13 +400,30 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
-   * The stored worker execution, with any id the live catalog no longer lists
-   * dropped. The store is written by this plugin's own surfaces, so an unknown
-   * id means a provider's models changed under a saved choice.
+   * The stored worker configuration, with any id the live catalog no longer
+   * lists dropped. The store is written by this plugin's own surfaces, so an
+   * unknown id means a provider's models changed under a saved choice.
    */
-  function storedWorkerExecution(stored: unknown): WorkerExecution {
+  function storedWorkerConfig(stored: unknown): WorkerConfig {
     if (stored === null || typeof stored !== "object") return {};
     const record = stored as Record<string, unknown>;
+    const execution = sanitizeExecution(record);
+    const fallback =
+      record.fallback === undefined || record.fallback === null
+        ? undefined
+        : sanitizeExecution(record.fallback as Record<string, unknown>);
+    return {
+      ...execution,
+      // A fallback that lost its provider or model to the catalog is no retry
+      // target at all: keep none rather than retry on half a choice.
+      ...(fallback?.providerId === undefined || fallback.model === undefined
+        ? {}
+        : { fallback }),
+    };
+  }
+
+  /** One level of the stored configuration, validated against the catalog. */
+  function sanitizeExecution(record: Record<string, unknown>): WorkerExecution {
     const providerId = workerChoice(
       typeof record.providerId === "string" ? record.providerId : undefined,
       catalog.providers,
@@ -464,20 +497,29 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
-   * Replace the stored worker execution. `null` clears it, leaving every
-   * delegation on the project's remembered defaults. A record must name both a
-   * provider and a model — the settings section renders them with BB's picker,
-   * which resolves the pair against the live catalog, and every id it cannot
-   * serve is refused here rather than spawned.
+   * Replace the stored worker configuration. `null` clears it, leaving every
+   * delegation on the project's remembered defaults. Each level must name both
+   * a provider and a model — the settings section renders them with BB's
+   * picker, which resolves the pair against the live catalog, and every id it
+   * cannot serve is refused here rather than spawned.
    */
-  async function setWorkerExecution(next: WorkerExecution | null): Promise<WorkerExecution> {
+  async function setWorkerConfig(next: WorkerConfig | null): Promise<WorkerConfig> {
     if (next !== null) {
-      if (next.providerId === undefined || next.model === undefined) {
-        throw new Error("A worker execution needs both a provider and a model.");
+      for (const level of [next, next.fallback]) {
+        if (level === undefined) continue;
+        if (level.providerId === undefined || level.model === undefined) {
+          throw new Error("A worker execution needs both a provider and a model.");
+        }
+        assertInCatalog(level);
       }
-      assertInCatalog(next);
     }
-    const stored = next === null ? {} : reconcile(next);
+    const stored: WorkerConfig =
+      next === null
+        ? {}
+        : {
+            ...reconcile(executionOf(next)),
+            ...(next.fallback === undefined ? {} : { fallback: reconcile(next.fallback) }),
+          };
     await bb.storage.kv.set(WORKER_KEY, stored);
     live.worker = stored;
     bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
@@ -485,7 +527,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   applySettings(await settings.get());
-  live.worker = storedWorkerExecution(await bb.storage.kv.get<unknown>(WORKER_KEY));
+  live.worker = storedWorkerConfig(await bb.storage.kv.get<unknown>(WORKER_KEY));
   {
     const stored = await bb.storage.kv.get<{ enabledAtMs?: unknown }>(DEFAULT_KEY);
     const storedAt =
@@ -816,6 +858,8 @@ export default async function plugin(bb: BbPluginApi) {
           ? { type: "project-default" as const }
           : { type: "reuse" as const, environmentId: parent.environmentId };
       const workerTitle = title?.trim() || task.trim().split("\n")[0]!.slice(0, 120);
+      const orchestratorId = threadId;
+      const targetProjectId = projectId;
 
       // Per-delegation arguments win over the plugin's worker settings; a field
       // neither names is left out so the worker resolves the project default.
@@ -828,82 +872,133 @@ export default async function plugin(bb: BbPluginApi) {
       });
       assertInCatalog(workerExec);
 
-      const worker = await bb.sdk.threads.spawn({
-        projectId,
-        environment,
-        prompt: task,
-        title: workerTitle,
-        parentThreadId: threadId,
-        ...(hidden === true ? { visibility: "hidden" as const } : {}),
-        ...workerExec,
-        // The server drops a requested provider/model that carries no
-        // provenance source and re-derives it from the project's remembered
-        // defaults, which would silently undo everything above.
-        ...(Object.keys(workerExec).length === 0
-          ? {}
-          : { executionInputSources: executionSources(workerExec) }),
-        pluginMetadata: { workerFor: threadId },
-      });
+      /** Spawn one worker on `exec` and record it against this orchestrator. */
+      async function spawnWorker(exec: WorkerExecution, workerLabel: string): Promise<string> {
+        const spawned = await bb.sdk.threads.spawn({
+          projectId: targetProjectId,
+          environment,
+          prompt: task,
+          title: workerLabel,
+          parentThreadId: orchestratorId,
+          ...(hidden === true ? { visibility: "hidden" as const } : {}),
+          ...exec,
+          // The server drops a requested provider/model that carries no
+          // provenance source and re-derives it from the project's remembered
+          // defaults, which would silently undo everything above.
+          ...(Object.keys(exec).length === 0
+            ? {}
+            : { executionInputSources: executionSources(exec) }),
+          pluginMetadata: { workerFor: orchestratorId },
+        });
+        await mutateState(orchestratorId, (current) => ({
+          ...current,
+          delegations: [
+            ...current.delegations,
+            {
+              threadId: spawned.id,
+              title: workerLabel,
+              task: task.slice(0, 400),
+              createdAt: Date.now(),
+              status: null,
+            },
+          ].slice(-MAX_DELEGATIONS),
+        }));
+        return spawned.id;
+      }
 
-      await mutateState(threadId, (current) => ({
-        ...current,
-        delegations: [
-          ...current.delegations,
-          {
-            threadId: worker.id,
-            title: workerTitle,
-            task: task.slice(0, 400),
-            createdAt: Date.now(),
-            status: null,
-          },
-        ].slice(-MAX_DELEGATIONS),
-      }));
+      interface Settled {
+        status: string | null;
+        output: string | null;
+        /** Still working when the deadline passed. */
+        running: boolean;
+      }
 
-      if (waitForResult === false) {
-        return `Delegated without waiting.\nWorker thread: ${worker.id} — "${workerTitle}"\nCheck on it later and fold its result into your report.`;
+      /** Wait for one worker, record how it settled, and read what it said. */
+      async function settle(workerId: string, timeoutMs: number): Promise<Settled> {
+        const deadline = Date.now() + timeoutMs;
+        try {
+          await bb.sdk.threads.wait({ threadId: workerId, status: "idle", timeoutMs, signal });
+        } catch {
+          // A timeout or an error status both land here; read the real status.
+        }
+        let status: string | null = null;
+        try {
+          status = (await bb.sdk.threads.get({ threadId: workerId })).status;
+        } catch {
+          status = null;
+        }
+        await mutateState(orchestratorId, (current) => ({
+          ...current,
+          delegations: current.delegations.map((delegation) =>
+            delegation.threadId === workerId ? { ...delegation, status } : delegation,
+          ),
+        }));
+        if (Date.now() >= deadline && status !== "idle" && status !== "error") {
+          return { status, output: null, running: true };
+        }
+        let output: string | null = null;
+        try {
+          const result = await bb.sdk.threads.output({ threadId: workerId });
+          output = (result as { output?: string | null }).output ?? null;
+        } catch (cause) {
+          bb.log.warn(`worker output read failed for ${workerId}: ${String(cause)}`);
+        }
+        return { status, output, running: false };
+      }
+
+      /** The text the orchestrator gets back about one finished worker. */
+      function report(workerId: string, settled: Settled): string {
+        if (settled.running) {
+          return `Worker ${workerId} is still running after ${Math.round(timeoutMs / 1000)}s (status: ${settled.status ?? "unknown"}). Delegate the next unit, or wait and check it again — do not start doing its work yourself.`;
+        }
+        const trimmed = (settled.output ?? "").trim();
+        const body =
+          trimmed === ""
+            ? "(the worker produced no final text — open the thread to see what it did)"
+            : trimmed.length > 12_000
+              ? `${trimmed.slice(0, 12_000)}\n\n[truncated]`
+              : trimmed;
+        return `Worker ${workerId} finished with status "${settled.status ?? "unknown"}".\n\n${body}\n\nReview it. If it is wrong or incomplete, send a follow-up to a worker — do not fix it yourself.`;
+      }
+
+      /**
+       * Re-delegate the same brief on the fallback, which inherits every field
+       * it does not name from the execution the first attempt used.
+       */
+      async function retryOnFallback(fallback: WorkerExecution, reason: string): Promise<string> {
+        const retryExec = reconcile({ ...workerExec, ...fallback });
+        const target = retryExec.model ?? "the project default";
+        bb.log.warn(`${reason} Retrying on ${target}.`);
+        const retryId = await spawnWorker(retryExec, `${workerTitle} (fallback)`);
+        const settled = await settle(retryId, timeoutMs);
+        return `${reason} Re-delegated the same brief on \`${target}\` as worker ${retryId}.\n\n${report(retryId, settled)}`;
       }
 
       const timeoutMs = Math.min(Math.max(timeoutSeconds ?? 900, 10), 3600) * 1000;
-      const deadline = Date.now() + timeoutMs;
-      let status: string | null = null;
+      const fallback = live.worker.fallback;
+      let workerId: string;
       try {
-        await bb.sdk.threads.wait({ threadId: worker.id, status: "idle", timeoutMs, signal });
-      } catch {
-        // A timeout or an error status both land here; read the real status.
-      }
-      try {
-        const settled = await bb.sdk.threads.get({ threadId: worker.id });
-        status = settled.status;
-      } catch {
-        status = null;
-      }
-      await mutateState(threadId, (current) => ({
-        ...current,
-        delegations: current.delegations.map((delegation) =>
-          delegation.threadId === worker.id ? { ...delegation, status } : delegation,
-        ),
-      }));
-
-      if (Date.now() >= deadline && status !== "idle" && status !== "error") {
-        return `Worker ${worker.id} is still running after ${Math.round(timeoutMs / 1000)}s (status: ${status ?? "unknown"}). Delegate the next unit, or wait and check it again — do not start doing its work yourself.`;
-      }
-
-      let output: string | null = null;
-      try {
-        const result = await bb.sdk.threads.output({ threadId: worker.id });
-        output = (result as { output?: string | null }).output ?? null;
+        workerId = await spawnWorker(workerExec, workerTitle);
       } catch (cause) {
-        bb.log.warn(`worker output read failed for ${worker.id}: ${String(cause)}`);
+        // A spawn that never started a worker is the clearest case for the
+        // fallback: the provider could not serve the requested execution at all.
+        if (fallback === undefined) throw cause;
+        return await retryOnFallback(
+          fallback,
+          `Worker could not start on \`${workerExec.model ?? "the project default"}\`: ${String(cause)}`,
+        );
       }
 
-      const trimmed = (output ?? "").trim();
-      const body =
-        trimmed === ""
-          ? "(the worker produced no final text — open the thread to see what it did)"
-          : trimmed.length > 12_000
-            ? `${trimmed.slice(0, 12_000)}\n\n[truncated]`
-            : trimmed;
-      return `Worker ${worker.id} finished with status "${status ?? "unknown"}".\n\n${body}\n\nReview it. If it is wrong or incomplete, send a follow-up to a worker — do not fix it yourself.`;
+      if (waitForResult === false) {
+        const retry = fallback === undefined ? "" : " If it fails, re-delegate it on the configured fallback.";
+        return `Delegated without waiting.\nWorker thread: ${workerId} — "${workerTitle}"\nCheck on it later and fold its result into your report.${retry}`;
+      }
+
+      const first = await settle(workerId, timeoutMs);
+      if (first.running || first.status !== "error" || fallback === undefined) {
+        return report(workerId, first);
+      }
+      return await retryOnFallback(fallback, `Worker ${workerId} failed.`);
     },
   });
 
@@ -929,7 +1024,7 @@ export default async function plugin(bb: BbPluginApi) {
         enforcement,
         allowReadCommands: live.allowReadCommands,
         reminders,
-        workerExecution: workerDefaults(),
+        workerConfig: live.worker,
       }),
     };
   });
@@ -1143,8 +1238,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
     get_default: async () => ({ enabled: live.defaultForNewThreads }),
     set_default: async ({ enabled }) => ({ enabled: await setDefault(enabled) }),
-    get_worker_execution: async () => workerDefaults(),
-    set_worker_execution: async (next) => setWorkerExecution(next),
+    get_worker_execution: async () => live.worker,
+    set_worker_execution: async (next) => setWorkerConfig(next),
     clear_violations: async ({ threadId }) => {
       const state = await clearViolations(threadId);
       return toDto(threadId, state);
@@ -1182,6 +1277,13 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** One line naming what a delegation's worker will run on. */
+  /** The retry target, named after the execution it belongs to. */
+  function describeFallback(fallback: WorkerConfig["fallback"]): string {
+    return fallback === undefined
+      ? ""
+      : `\nA failed worker is retried on: ${describeWorkerExecution(fallback)}`;
+  }
+
   function describeWorkerExecution(exec: OrchestratorStateDto["workerExecution"]): string {
     const parts = [
       exec.providerId === undefined ? null : `provider ${exec.providerId}`,
@@ -1337,6 +1439,18 @@ export default async function plugin(bb: BbPluginApi) {
               values: [...PERMISSION_MODES],
               description: "Permission mode for workers",
             },
+            "fallback-provider": {
+              type: "string",
+              description: "Provider to retry a failed worker on; needs --fallback-model",
+            },
+            "fallback-model": {
+              type: "string",
+              description: "Model to retry a failed worker on; needs --fallback-provider",
+            },
+            "clear-fallback": {
+              type: "boolean",
+              description: "Stop retrying failed workers",
+            },
             json: { type: "boolean", description: "Emit machine-readable JSON" },
           },
           async run(input) {
@@ -1353,19 +1467,37 @@ export default async function plugin(bb: BbPluginApi) {
                 ? {}
                 : { permissionMode: input.options.permission as PermissionMode }),
             };
+            const fallbackProvider = input.options["fallback-provider"];
+            const fallbackModel = input.options["fallback-model"];
+            const fallback =
+              fallbackProvider === undefined && fallbackModel === undefined
+                ? undefined
+                : { providerId: fallbackProvider ?? "", model: fallbackModel ?? "" };
             const clearing = input.options.clear === true;
-            if (!clearing && Object.keys(chosen).length === 0) {
+            const clearFallback = input.options["clear-fallback"] === true;
+            if (!clearing && !clearFallback && Object.keys(chosen).length === 0 && fallback === undefined) {
               return render(
                 input.options.json,
-                workerDefaults(),
-                `Workers run as: ${describeWorkerExecution(workerDefaults())}`,
+                live.worker,
+                `Workers run as: ${describeWorkerExecution(workerDefaults())}${describeFallback(live.worker.fallback)}`,
               );
             }
-            const stored = await setWorkerExecution(clearing ? null : chosen);
+            // Each flag changes one thing and leaves the rest of the stored
+            // configuration alone, so `worker --permission auto` on an existing
+            // choice does not drop its provider and model.
+            let next: WorkerConfig | null = null;
+            if (!clearing) {
+              next = { ...workerDefaults(), ...chosen };
+              if (!clearFallback) {
+                const target = fallback ?? live.worker.fallback;
+                if (target !== undefined) next.fallback = { ...live.worker.fallback, ...target };
+              }
+            }
+            const stored = await setWorkerConfig(next);
             return render(
               input.options.json,
               stored,
-              `Workers run as: ${describeWorkerExecution(stored)}`,
+              `Workers run as: ${describeWorkerExecution(stored)}${describeFallback(stored.fallback)}`,
             );
           },
         }),

@@ -71,7 +71,10 @@ and review its result.
 ## Choosing the worker's execution
 
 Workers run on the model and permission mode the plugin's Worker execution
-setting names, falling back to this project's remembered defaults. Override them for one unit
+setting names, falling back to this project's remembered defaults. When the
+plugin has a retry target configured it re-delegates a failed worker once on
+that provider and model before you hear about the failure, so do not re-run a
+failed unit by hand. Override them for one unit
 with `provider`, `model`, `reasoning` and `permissionMode` — a stronger model
 for a hard unit, a cheaper one for a mechanical unit. Valid ids come from
 `bb provider list` and `bb provider models <provider>`, both read-only. A model

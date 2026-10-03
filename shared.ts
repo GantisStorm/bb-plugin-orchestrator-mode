@@ -108,6 +108,19 @@ export interface WorkerExecution {
   permissionMode?: PermissionMode;
 }
 
+/**
+ * What the plugin stores for workers: the execution every delegation starts on,
+ * plus the one to retry with when a worker fails.
+ *
+ * Deliberately a separate type from {@link WorkerExecution}: that one is spread
+ * straight into `threads.spawn`, and a `fallback` key inside it would be an
+ * invalid spawn field.
+ */
+export interface WorkerConfig extends WorkerExecution {
+  /** Re-delegate the same brief on this when the first worker fails. */
+  fallback?: WorkerExecution;
+}
+
 /** One model the SDK's own picker offers, with the provider that serves it. */
 export interface WorkerModelOption {
   id: string;
@@ -514,8 +527,8 @@ export interface InstructionInput {
   allowReadCommands: boolean;
   /** Extra lines a caller wants appended, e.g. recent violations. */
   reminders?: readonly string[];
-  /** The worker execution defaults this plugin configures; absent = inherit. */
-  workerExecution?: WorkerExecution;
+  /** The worker configuration this plugin stores; absent means inherit. */
+  workerConfig?: WorkerConfig;
 }
 
 /**
@@ -523,8 +536,8 @@ export interface InstructionInput {
  * plugin overrides nothing. Kept next to the contract it is spliced into, and
  * deliberately short: `configure` truncates the whole block at 4096 characters.
  */
-export function workerBudget(execution: WorkerExecution | undefined): string {
-  const exec = execution ?? {};
+export function workerBudget(config: WorkerConfig | undefined): string {
+  const exec = config ?? {};
   const parts = [
     exec.model === undefined ? null : `model \`${exec.model}\``,
     exec.providerId === undefined ? null : `provider \`${exec.providerId}\``,
@@ -536,9 +549,15 @@ export function workerBudget(execution: WorkerExecution | undefined): string {
       ? null
       : `permission mode \`${exec.permissionMode}\``,
   ].filter((part): part is string => part !== null);
-  return parts.length === 0
-    ? "Workers run on this project's own execution defaults."
-    : `Workers default to ${parts.join(", ")}, set by this plugin.`;
+  const execution =
+    parts.length === 0
+      ? "Workers run on this project's own execution defaults."
+      : `Workers default to ${parts.join(", ")}, set by this plugin.`;
+  const fallback = exec.fallback;
+  if (fallback === undefined) return execution;
+  // The orchestrator must not re-do a failed worker's unit by hand: the
+  // delegation call already retried it.
+  return `${execution} A worker that fails is retried once on \`${fallback.model ?? "the project default"}\` before you hear about it.`;
 }
 
 /**
@@ -613,7 +632,7 @@ something, stop and delegate it instead.
 
 ## Choosing the worker's model
 
-${workerBudget(input.workerExecution)} Override it per delegation with the
+${workerBudget(input.workerConfig)} Override it per delegation with the
 \`model\`, \`provider\`, \`reasoning\` and \`permissionMode\` arguments of
 \`${DELEGATE_TOOL}\` — give a hard unit a stronger model and a mechanical one a
 cheaper one. Valid ids come from the catalog: \`bb provider list\` names the

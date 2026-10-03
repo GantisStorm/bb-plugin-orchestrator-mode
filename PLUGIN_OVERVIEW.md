@@ -30,7 +30,8 @@ a timeout leaves the worker running.
 Workers run on the project's remembered provider and model unless the **Worker
 execution** settings section gives them their own, using BB's own provider and
 model picker: picking a provider scopes the models to it, and a single
-delegation can override the result in the tool call. An id the catalog does not
+delegation can override the result in the tool call. The same section can name a
+provider and model to retry a failed worker on, once. An id the catalog does not
 offer is refused with the alternatives named.
 
 - **instruct:** contract only.

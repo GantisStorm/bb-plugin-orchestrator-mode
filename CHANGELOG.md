@@ -20,7 +20,16 @@ All notable changes to Orchestrator Mode are documented here. The format follows
   requested field is stamped in `threads.spawn`'s `executionInputSources`,
   without which the server drops it and re-derives the project defaults. A model
   the catalog does not offer is refused with the available ids named.
-- `bb orchestrator-mode worker` shows, sets and clears the stored execution.
+- The worker execution is a visible `Inherit` / `Custom` pair, so inheriting the
+  project's own provider and model is a choice rather than the absence of one.
+- A **Retry a failed worker** target: `Report` (the default) hands a failure
+  back, `Retry` re-delegates the same brief once on a second provider and model.
+  It covers a refused spawn and a worker that lands in `error`, and the retry
+  inherits every field the fallback does not name.
+- `bb orchestrator-mode worker` shows, sets and clears the stored execution, and
+  manages the retry target with `--fallback-provider`, `--fallback-model` and
+  `--clear-fallback`. Each flag leaves the rest of the stored configuration
+  alone.
 - `bb provider list` and `bb provider models` count as read-only commands, so an
   orchestrator can discover valid worker ids.
 - `bb orchestrator-mode status` reports the execution delegations default to.

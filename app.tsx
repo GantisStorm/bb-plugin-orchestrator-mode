@@ -90,12 +90,17 @@ interface WorkerExecutionDto {
   permissionMode?: PermissionModeDto;
 }
 
+interface WorkerConfigDto extends WorkerExecutionDto {
+  fallback?: WorkerExecutionDto;
+}
+
 /** The SDK's value shape for the provider/model picker. */
 interface ExecutionSelection {
   providerId: string;
   model: string;
   reasoningLevel: ReasoningLevelDto;
   serviceTier?: ServiceTierDto;
+  permissionMode?: PermissionModeDto;
 }
 
 /** The mutable handle every surface in one composer shares. */
@@ -356,12 +361,13 @@ function OrchestratorToggle() {
  * provider/model picker resolves provider, model, reasoning level and service
  * tier against the live catalog as one coherent value — the same value
  * `threads.spawn` takes — so the choice is stored through this plugin's RPC and
- * rendered with that picker.
+ * rendered with that picker. Each choice is a pressed pair, so `Inherit` is a
+ * visible option rather than only the absence of one.
  */
 function WorkerExecutionSettings() {
   const rpc = useRpc<typeof rpcContract>();
   const sdk = useSdk();
-  const [stored, setStored] = useState<WorkerExecutionDto | null>(null);
+  const [stored, setStored] = useState<WorkerConfigDto | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
 
@@ -382,11 +388,13 @@ function WorkerExecutionSettings() {
     void load();
   });
 
+  /** Write the configuration. A promise is awaited first, so a caller that has
+   * to read the catalog before it knows the value passes one. */
   const save = useCallback(
-    async (next: WorkerExecutionDto | null) => {
+    async (next: WorkerConfigDto | null | Promise<WorkerConfigDto>) => {
       setBusy(true);
       try {
-        setStored(await rpc.call("set_worker_execution", next));
+        setStored(await rpc.call("set_worker_execution", await next));
       } catch (cause) {
         toast.error(message(cause));
       } finally {
@@ -396,82 +404,141 @@ function WorkerExecutionSettings() {
     [rpc],
   );
 
-  const configured = stored !== null && stored.providerId !== undefined && stored.model !== undefined;
-
   /**
-   * Start from this machine's catalog default, so every field the picker shows
-   * is one the provider it names can actually serve.
+   * This machine's catalog default, so every field the picker shows is one the
+   * provider it names can actually serve. Only the worker execution carries a
+   * permission mode; a fallback inherits the one its workers already use.
    */
-  const choose = useCallback(async () => {
-    setBusy(true);
-    try {
+  const seed = useCallback(
+    async (withPermission: boolean): Promise<WorkerExecutionDto> => {
       const system = await sdk.providers.models();
       const provider = system.providers.find((entry) => entry.available);
       if (provider === undefined) throw new Error("No provider is available on this machine.");
       const listed = await sdk.providers.models({ providerId: provider.id });
       const model = listed.models.find((entry) => entry.isDefault) ?? listed.models[0];
       if (model === undefined) throw new Error(`${provider.id} offers no models.`);
-      setStored(
-        await rpc.call("set_worker_execution", {
-          providerId: provider.id,
-          model: model.id,
-          reasoningLevel: model.defaultReasoningEffort,
-          permissionMode: system.permissionCeiling,
-        }),
-      );
-    } catch (cause) {
-      toast.error(message(cause));
-    } finally {
-      setBusy(false);
-    }
-  }, [rpc, sdk]);
+      return {
+        providerId: provider.id,
+        model: model.id,
+        reasoningLevel: model.defaultReasoningEffort,
+        ...(withPermission ? { permissionMode: system.permissionCeiling } : {}),
+      };
+    },
+    [sdk],
+  );
+
+  /** The stored execution, only when it names the provider and model the
+   * pickers need; null while the workers inherit the project's own. */
+  const execution =
+    stored === null || stored.providerId === undefined || stored.model === undefined
+      ? null
+      : stored;
+  const fallback = stored?.fallback ?? null;
 
   return (
     <div className="rounded-md border border-border bg-surface-recessed/70 p-3">
       <div className="flex items-start justify-between gap-6">
         <div className="min-w-0">
-          <div className="text-sm font-medium">Give workers their own execution</div>
+          <div className="text-sm font-medium">Workers run on</div>
           <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
-            {configured
-              ? "Workers start on the provider and model below. A delegation can still override them."
-              : "Delegated workers inherit this project's remembered provider and model."}
+            {execution === null
+              ? "Inherit this project's remembered provider and model."
+              : "Use the provider and model below. A single delegation can still override them."}
           </p>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          className="shrink-0"
-          disabled={loading || busy}
-          onClick={() => void (configured ? save(null) : choose())}
-        >
-          {configured ? "Reset to project default" : "Choose provider and model"}
-        </Button>
+        <div className="flex shrink-0 items-center gap-1" role="group" aria-label="Worker provider and model">
+          <Button
+            variant={execution === null ? "secondary" : "ghost"}
+            size="sm"
+            aria-pressed={execution === null}
+            disabled={loading || busy}
+            className="h-7 px-2 text-xs"
+            onClick={() => {
+              if (execution !== null) void save(dropPrimary(execution));
+            }}
+          >
+            Inherit
+          </Button>
+          <Button
+            variant={execution === null ? "ghost" : "secondary"}
+            size="sm"
+            aria-pressed={execution !== null}
+            disabled={loading || busy}
+            className="h-7 px-2 text-xs"
+            onClick={() =>
+              void save(seed(true).then((chosen) => ({ ...stored, ...chosen })))
+            }
+          >
+            Custom
+          </Button>
+        </div>
       </div>
 
-      {configured ? (
+      {execution === null ? null : (
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <ProviderModelPicker
-            value={selectionOf(stored)}
+            value={selectionOf(execution)}
             disabled={busy}
             className="h-8 max-w-full"
-            onChange={(next) =>
-              void save({
-                ...next,
-                ...(stored.permissionMode === undefined
-                  ? {}
-                  : { permissionMode: stored.permissionMode }),
-              })
-            }
+            onChange={(next) => void save({ ...execution, ...next })}
           />
           <PermissionModePicker
-            providerId={stored.providerId!}
-            value={stored.permissionMode ?? "full"}
+            providerId={execution.providerId!}
+            value={execution.permissionMode ?? "full"}
             disabled={busy}
             className="h-8 shrink-0"
-            onChange={(permissionMode) => void save({ ...stored, permissionMode })}
+            onChange={(permissionMode) => void save({ ...execution, permissionMode })}
           />
         </div>
-      ) : null}
+      )}
+
+      <div className="mt-3 flex items-start justify-between gap-6 border-t border-border/60 pt-3">
+        <div className="min-w-0">
+          <div className="text-sm font-medium">Retry a failed worker</div>
+          <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
+            {fallback === null
+              ? "A failed worker is reported back to the orchestrator."
+              : "The same brief is re-delegated on this provider and model."}
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-1" role="group" aria-label="Worker fallback">
+          <Button
+            variant={fallback === null ? "secondary" : "ghost"}
+            size="sm"
+            aria-pressed={fallback === null}
+            disabled={loading || busy}
+            className="h-7 px-2 text-xs"
+            onClick={() => {
+              if (fallback !== null) void save(dropFallback(stored));
+            }}
+          >
+            Report
+          </Button>
+          <Button
+            variant={fallback === null ? "ghost" : "secondary"}
+            size="sm"
+            aria-pressed={fallback !== null}
+            disabled={loading || busy}
+            className="h-7 px-2 text-xs"
+            onClick={() =>
+              void save(seed(false).then((chosen) => ({ ...stored, fallback: chosen })))
+            }
+          >
+            Retry
+          </Button>
+        </div>
+      </div>
+
+      {fallback === null ? null : (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <ProviderModelPicker
+            value={selectionOf(fallback)}
+            disabled={busy}
+            className="h-8 max-w-full"
+            onChange={(next) => void save({ ...stored, fallback: next })}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -484,6 +551,17 @@ function selectionOf(stored: WorkerExecutionDto): ExecutionSelection {
     reasoningLevel: stored.reasoningLevel ?? "medium",
     ...(stored.serviceTier === undefined ? {} : { serviceTier: stored.serviceTier }),
   };
+}
+
+/** The config without its worker execution, keeping any fallback. */
+function dropPrimary(config: WorkerConfigDto | null): WorkerConfigDto {
+  return config?.fallback === undefined ? {} : { fallback: config.fallback };
+}
+
+/** The config without a retry target, keeping the worker execution. */
+function dropFallback(config: WorkerConfigDto | null): WorkerConfigDto {
+  const { fallback: _fallback, ...execution } = config ?? {};
+  return execution;
 }
 
 export default definePluginApp((app) => {
