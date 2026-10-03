@@ -17,6 +17,16 @@ export type EnforcementLevel = "instruct" | "guard" | "block";
  */
 export const DELEGATE_TOOL = "orchestrator_delegate";
 
+/**
+ * The tool an orchestrator records a verdict with. Defined here, next to the
+ * contract that requires it, so the two cannot drift apart.
+ */
+export const REVIEW_TOOL = "orchestrator_review";
+
+/** What the orchestrator decided about a worker's output. */
+export const REVIEW_VERDICTS = ["accepted", "rejected"] as const;
+export type ReviewVerdict = (typeof REVIEW_VERDICTS)[number];
+
 export const ENFORCEMENT_LEVELS: readonly EnforcementLevel[] = [
   "instruct",
   "guard",
@@ -109,6 +119,20 @@ export interface WorkerExecution {
 }
 
 /**
+ * The unit classes an execution preset can name: the delegate-mode recipes, as
+ * one word the orchestrator can pass instead of five ids.
+ */
+export const WORKER_PRESETS = ["build", "review", "research"] as const;
+export type WorkerPresetName = (typeof WORKER_PRESETS)[number];
+
+export function isWorkerPreset(value: unknown): value is WorkerPresetName {
+  return (
+    typeof value === "string" &&
+    (WORKER_PRESETS as readonly string[]).includes(value)
+  );
+}
+
+/**
  * What the plugin stores for workers: the execution every delegation starts on,
  * plus the one to retry with when a worker fails.
  *
@@ -119,6 +143,13 @@ export interface WorkerExecution {
 export interface WorkerConfig extends WorkerExecution {
   /** Re-delegate the same brief on this when the first worker fails. */
   fallback?: WorkerExecution;
+  /**
+   * Per-unit-class overrides, applied under a delegation's own arguments and
+   * over the worker execution: a preset may set only the fields that differ, so
+   * `research` can mean a cheaper model and a read-only access on whatever the
+   * workers already run on.
+   */
+  presets?: Partial<Record<WorkerPresetName, WorkerExecution>>;
 }
 
 /** One model the SDK's own picker offers, with the provider that serves it. */
@@ -327,6 +358,125 @@ const READ_ONLY_PROGRAMS: ReadonlySet<string> = new Set([
   "basename",
 ]);
 
+/**
+ * Programs that plausibly appear as the first word of a real command. Not a
+ * safety list: a command outside it is still work if it carries the shape of a
+ * command — see {@link looksLikeShellCommand}. Its job is to tell a command from
+ * the *title* some providers give a plugin tool call, which arrives as a
+ * `command` row whose text is a sentence like "Recording verdict for X".
+ */
+const PLAUSIBLE_PROGRAMS: ReadonlySet<string> = new Set([
+  ...READ_ONLY_PROGRAMS,
+  // Mutating programs an agent runs, by hand or through a script.
+  "bb",
+  "git",
+  "gh",
+  "glab",
+  "npm",
+  "npx",
+  "pnpm",
+  "yarn",
+  "bun",
+  "node",
+  "deno",
+  "python",
+  "python3",
+  "pip",
+  "pip3",
+  "uv",
+  "poetry",
+  "cargo",
+  "rustc",
+  "go",
+  "zig",
+  "make",
+  "cmake",
+  "gradle",
+  "mvn",
+  "docker",
+  "podman",
+  "kubectl",
+  "helm",
+  "terraform",
+  "aws",
+  "gcloud",
+  "az",
+  "brew",
+  "apt",
+  "apt-get",
+  "pytest",
+  "vitest",
+  "jest",
+  "tsc",
+  "eslint",
+  "prettier",
+  "ruff",
+  "black",
+  "mypy",
+  "sh",
+  "bash",
+  "zsh",
+  "fish",
+  "sed",
+  "awk",
+  "perl",
+  "ruby",
+  "java",
+  "javac",
+  "swift",
+  "xcodebuild",
+  "openssl",
+  "ssh",
+  "scp",
+  "rsync",
+  "curl",
+  "wget",
+  "tar",
+  "zip",
+  "unzip",
+  "gzip",
+  "cp",
+  "mv",
+  "rm",
+  "mkdir",
+  "rmdir",
+  "touch",
+  "chmod",
+  "chown",
+  "ln",
+  "tee",
+  "truncate",
+  "dd",
+  "kill",
+  "pkill",
+  "killall",
+  "ps",
+  "launchctl",
+  "systemctl",
+  "crontab",
+  "sqlite3",
+  "psql",
+  "mysql",
+  "redis-cli",
+  "patch",
+]);
+
+/**
+ * Whether a `command` row's text is shaped like something that was actually
+ * run, rather than the sentence a provider used as a tool call's title.
+ *
+ * A known program is enough. Anything else has to carry shell evidence — a
+ * path, a flag, a redirect, a pipe, an assignment — because no real invocation
+ * of an unknown program looks like prose.
+ */
+export function looksLikeShellCommand(command: string): boolean {
+  const text = command.trim();
+  if (text === "") return false;
+  const first = text.split(/\s+/)[0] ?? "";
+  if (PLAUSIBLE_PROGRAMS.has(first)) return true;
+  return /[|&;<>()$`\\{}*?[\]]|\s-{1,2}\w|\/|\.\w|=\S/.test(text);
+}
+
 const READ_ONLY_GIT_SUBCOMMANDS: ReadonlySet<string> = new Set([
   "status",
   "log",
@@ -500,6 +650,13 @@ export function classifyRow(
     if (allowReadCommands && command !== "" && isReadOnlyCommand(command)) {
       return null;
     }
+    // Some providers render a plugin tool call as a command row whose text is
+    // the call's title. That is not the orchestrator running anything, and
+    // flagging it tells the orchestrator off for using the tools this plugin
+    // gave it — the fastest way for a watchdog to lose its authority.
+    if (command !== "" && !looksLikeShellCommand(command)) {
+      return null;
+    }
     const shown = command.length > 80 ? `${command.slice(0, 77)}...` : command;
     return {
       ...base,
@@ -522,6 +679,36 @@ export function classifyRow(
 // The contract the agent is handed
 // ---------------------------------------------------------------------------
 
+/**
+ * The shapes of contract this plugin can inject. A preset swaps sections rather
+ * than appending to them, so the whole block stays inside `configure`'s
+ * 4096-character ceiling whatever the settings say.
+ */
+export const CONTRACT_PRESETS = [
+  "standard",
+  "delegate-only",
+  "research-first",
+  "review-heavy",
+] as const;
+export type ContractPresetId = (typeof CONTRACT_PRESETS)[number];
+
+export function isContractPreset(value: unknown): value is ContractPresetId {
+  return (
+    typeof value === "string" &&
+    (CONTRACT_PRESETS as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * How much appended instruction text the plugin accepts. `configure` truncates
+ * the whole block at 4096 characters, and the tail is the part that explains
+ * what to do when delegation is impossible, so the append is capped below the
+ * worst case the contract itself reaches: the budget test measures that case
+ * with an append at exactly this length, which is what keeps this number
+ * honest when the contract grows.
+ */
+export const EXTRA_INSTRUCTION_LIMIT = 370;
+
 export interface InstructionInput {
   enforcement: EnforcementLevel;
   allowReadCommands: boolean;
@@ -529,6 +716,10 @@ export interface InstructionInput {
   reminders?: readonly string[];
   /** The worker configuration this plugin stores; absent means inherit. */
   workerConfig?: WorkerConfig;
+  /** Project rules the user appended, emitted verbatim and last. */
+  extra?: string;
+  /** Which shape of contract to emit. Defaults to `standard`. */
+  preset?: ContractPresetId;
 }
 
 /**
@@ -574,7 +765,29 @@ export function buildInstructions(input: InstructionInput): string {
         ? "A watchdog reads your timeline. Every direct-work act is recorded and reported back to you, and you will be told to re-delegate it."
         : "A watchdog reads your timeline and STOPS the turn the moment you do direct work. Work you did yourself is thrown away.";
 
-  const commands = input.allowReadCommands
+  const preset = input.preset ?? "standard";
+  // `delegate-only` takes the research out of the orchestrator's hands
+  // entirely, so the read-only allowance stops applying.
+  const readCommands = preset === "delegate-only" ? false : input.allowReadCommands;
+  const research =
+    preset === "research-first"
+      ? "\n   Read enough of the repository first to write a brief that stands alone."
+      : preset === "delegate-only"
+        ? "\n   Even finding things out is a unit of work: hand a worker the question rather than searching yourself."
+        : "";
+  const reviewStep =
+    preset === "review-heavy"
+      ? `4. Every unit gets checked before you trust it: delegate it with \`verify: true\` so an
+   independent worker inspects the result, then record a verdict for that unit
+   with the \`${REVIEW_TOOL}\` tool. If the check fails, re-delegate the unit — never
+   patch it yourself.`
+      : `4. Review what comes back, and record a verdict for every worker with the
+   \`${REVIEW_TOOL}\` tool. Pass \`verify: true\` when you delegate a unit whose
+   result you cannot judge from its report alone: that adds an independent
+   check unit. If a result is wrong or incomplete, send a follow-up to a
+   worker — never patch it yourself.`;
+
+  const commands = readCommands
     ? "Read-only shell commands (`ls`, `cat`, `rg`, `git status`, `git diff`, `git log`, `find`, `wc`) are allowed so you can orient yourself. Anything that writes, builds, installs, commits or otherwise changes state is not."
     : "Do not run shell commands at all. Reading files and searching is enough to orient yourself.";
 
@@ -609,7 +822,7 @@ ${commands}
 ## Required — how you work instead
 
 1. Understand the request. Read and search freely; ask the user when the goal
-   is ambiguous.
+   is ambiguous.${research}
 2. Decompose it into independent units of work with explicit, self-contained
    briefs. A worker cannot see this conversation, so each brief carries its own
    goal, context, constraints and definition of done.
@@ -619,8 +832,7 @@ ${commands}
    the mode was switched on and cannot gain tools mid-flight: do no work,
    invent no substitute mechanism, say plainly that the tool arrives with the
    next session, and stop.
-4. Review what comes back. If a result is wrong or incomplete, send a follow-up
-   to a worker — never patch it yourself.
+${reviewStep}
 5. Report by synthesizing: what was delegated, what each worker produced, what
    is left. Link worker threads by id so the user can open them.
 
@@ -639,11 +851,96 @@ cheaper one. Valid ids come from the catalog: \`bb provider list\` names the
 providers, \`bb provider models <provider>\` lists their models. Both are
 read-only.
 
-## If you cannot delegate
+${extraBudget(input.extra)}## If you cannot delegate
 
 Say so plainly and stop. "I cannot do this without doing the work myself" is a
 correct answer; doing the work yourself is not. Do not disable or argue with
 this mode — ask the user to turn it off in the composer if it is wrong.${reminders}`;
+}
+
+/**
+ * The brief a verification unit gets. The verifier cannot see the parent
+ * conversation, so it carries the original brief, what the first worker said it
+ * did, and what to report. It is told to inspect and report, never to fix: a
+ * verifier that repairs the work destroys the evidence of whether it was right.
+ */
+export function buildVerifierBrief(input: {
+  task: string;
+  workerTitle: string;
+  workerOutput: string | null;
+}): string {
+  const trim = (text: string, limit: number): string =>
+    text.length > limit ? `${text.slice(0, limit)}\n\n[truncated]` : text;
+  const claimed =
+    input.workerOutput === null || input.workerOutput.trim() === ""
+      ? "(the worker reported no final text)"
+      : trim(input.workerOutput.trim(), 8_000);
+  return `# Check another worker's work
+
+A worker was asked to do this, and reported back:
+
+## The brief it was given
+
+${trim(input.task, 8_000)}
+
+## What it reported ("${input.workerTitle}")
+
+${claimed}
+
+## What to do
+
+Verify the work against the brief by inspecting the repository itself — the
+files it claims to have touched, whether they exist, and whether they do what
+the brief asked. Do not trust the report alone, and do not fix anything: an
+unverified claim and a missing change are both findings.
+
+Report, in this order:
+
+1. What you actually inspected (paths, commands).
+2. What is correct.
+3. What is wrong, missing or unverified, each with the evidence.
+4. A final line: \`VERDICT: pass\` or \`VERDICT: fail\`, then one sentence of
+   reasoning.
+
+Do not modify any file. If the work is wrong, say so plainly.`;
+}
+
+/**
+ * The corrective message sent when a turn ended with workers nobody judged.
+ * Deliberately separate from {@link buildNudge}: that one is about doing the
+ * work yourself, and telling an orchestrator off for the wrong thing is how a
+ * watchdog loses its authority.
+ */
+/**
+ * The user's appended rules, under a heading that names where they come from.
+ * Kept after the plugin's own sections so a project rule adds to the contract
+ * rather than silently replacing the parts the watchdog enforces.
+ */
+export function extraBudget(extra: string | undefined): string {
+  const text = extra?.trim() ?? "";
+  return text === "" ? "" : `## Rules for this project\n\n${text}\n\n`;
+}
+
+export function buildReviewNudge(
+  unreviewed: readonly string[],
+  enforcement: EnforcementLevel,
+): string {
+  const acts = unreviewed
+    .slice(0, 5)
+    .map((title) => `- ${title}`)
+    .join("\n");
+  const stopped =
+    enforcement === "block"
+      ? " This turn had already finished, so nothing was stopped: the review gate cannot stop a turn that is over."
+      : "";
+  return `Orchestrator review is missing:${stopped}
+
+${acts}
+
+You finished the turn without recording a verdict for these workers. Call
+\`${REVIEW_TOOL}\` once per worker — \`accepted\` or \`rejected\` with a line of
+notes — then fold the verdicts into your report. A rejected result is
+re-delegated to a worker, never fixed by you.`;
 }
 
 /** The corrective message sent after a detected violation. */

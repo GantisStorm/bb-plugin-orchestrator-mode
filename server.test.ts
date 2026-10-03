@@ -7,6 +7,7 @@ import {
   type FakePluginHarness,
 } from "@get-bb/plugin-sdk/testing";
 import type { BbPluginApi, PluginSettingValue } from "@get-bb/plugin-sdk";
+import { REVIEW_TOOL } from "./shared";
 import plugin, { DELEGATE_TOOL, type OrchestratorStateDto } from "./server";
 import { writeMirror } from "./shared";
 
@@ -20,6 +21,7 @@ let timelineMaxSeq = 0;
 let metadata: Record<string, Record<string, unknown>> = {};
 let sentTexts: string[] = [];
 let stoppedThreads: string[] = [];
+let archivedThreads: string[] = [];
 let spawned: Record<string, unknown>[] = [];
 
 /** Every loaded host, disposed after each test so no scan timer leaks into the next. */
@@ -154,6 +156,10 @@ async function load(
           stoppedThreads.push(threadId);
           return { threadId };
         },
+        archive: async ({ threadId }: { threadId: string }) => {
+          archivedThreads.push(threadId);
+          return { threadId };
+        },
       },
     },
   });
@@ -178,6 +184,7 @@ beforeEach(() => {
   metadata = {};
   sentTexts = [];
   stoppedThreads = [];
+  archivedThreads = [];
   spawned = [];
 });
 
@@ -241,7 +248,8 @@ describe("agent configuration", () => {
       }),
     );
     expect(resolved.instructions).toContain("ORCHESTRATOR MODE IS ON");
-    expect(resolved.tools.map((tool) => tool.name)).toEqual([DELEGATE_TOOL]);
+    // The contract names both tools, so the session must receive both.
+    expect(resolved.tools.map((tool) => tool.name)).toEqual([DELEGATE_TOOL, REVIEW_TOOL]);
   });
 
   it("contributes nothing to a thread that is not orchestrating", async () => {
@@ -423,7 +431,7 @@ describe("the watchdog", () => {
 
     await idle(harness);
     await new Promise((resolve) => setTimeout(resolve, 350));
-    const state = await harness.behavior.callRpc("get_state", { threadId: THREAD });
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as OrchestratorStateDto;
     expect(state).toMatchObject({ violations: [{ id: "row_delta" }], nudgeCount: 1 });
     expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
     expect(sentTexts).toHaveLength(1);
@@ -1012,6 +1020,431 @@ describe("the delegation tool", () => {
       ),
     ).rejects.toThrow(/Unknown worker model "gpt-9-imaginary"/);
     expect(spawned).toHaveLength(0);
+  });
+
+  it("records a verdict for a worker", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    const result = await harness.behavior.callAgentTool(
+      REVIEW_TOOL,
+      { workerThreadId: WORKER, verdict: "accepted", notes: "read the diff" },
+      { threadId: THREAD },
+    );
+
+    expect(String(result)).toContain("Recorded accepted");
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as OrchestratorStateDto;
+    expect(state).toMatchObject({ reviewed: 1, unreviewed: 0 });
+    expect(state.delegations[0]).toMatchObject({ verdict: "accepted", notes: "read the diff" });
+  });
+
+  it("refuses a verdict for a thread it never delegated", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    await expect(
+      harness.behavior.callAgentTool(
+        REVIEW_TOOL,
+        { workerThreadId: "th_never", verdict: "accepted" },
+        { threadId: THREAD },
+      ),
+    ).rejects.toThrow(/no worker th_never/);
+  });
+
+  it("reminds an idle orchestrator about an unjudged worker exactly once", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    const reviews = () => sentTexts.filter((text) => /review is missing/i.test(text));
+
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(reviews()).toHaveLength(1);
+
+    // The same unjudged worker is not nagged about again.
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(reviews()).toHaveLength(1);
+  });
+
+  it("leaves the review gate silent at the instruct level", async () => {
+    const { harness } = await load({ enforcement: "instruct" });
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(sentTexts.filter((text) => /review is missing/i.test(text))).toEqual([]);
+  });
+
+  it("spawns a check unit when a delegation asks to be verified", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    let started = 0;
+    harness.inspection.sdk.stub("threads.spawn", async (args) => {
+      spawned.push(args as unknown as Record<string, unknown>);
+      return makeThreadResponse({
+        id: started++ === 0 ? "th_unit" : "th_check",
+        parentThreadId: THREAD,
+      });
+    });
+    harness.inspection.sdk.stub("threads.output", async ({ threadId }) => ({
+      output: threadId === "th_check" ? "VERDICT: pass\nthe file exists" : "did the thing",
+    }));
+
+    const result = await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Add a retry to src/retry.ts", verify: true },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    expect(spawned).toHaveLength(2);
+    // The check unit carries the original brief and the worker's claim, and is
+    // told to inspect rather than repair.
+    const brief = String(spawned[1]!.prompt);
+    expect(brief).toContain("Add a retry to src/retry.ts");
+    expect(brief).toContain("did the thing");
+    expect(brief).toContain("Do not modify any file");
+    expect(String(result)).toContain("VERDICT: pass");
+
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as OrchestratorStateDto;
+    expect(state.delegations).toHaveLength(2);
+    expect(state.delegations[0]).toMatchObject({ verifiedBy: "th_check" });
+    // A check unit is evidence, not a unit the orchestrator must judge.
+    expect(state).toMatchObject({ unreviewed: 1 });
+  });
+
+  it("does not check a worker that failed", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
+      makeThreadResponse({ id: threadId, status: "error" }),
+    );
+
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it", verify: true },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    expect(spawned).toHaveLength(1);
+  });
+
+  it("hands the orchestrator a worker's failure reason", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it", waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    await harness.behavior.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: WORKER, status: "error" }),
+      error: "Provider refused the model",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 350));
+
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as OrchestratorStateDto;
+    expect(state.delegations[0]).toMatchObject({
+      status: "error",
+      failure: "Provider refused the model",
+    });
+  });
+
+  it("refuses a delegation past the parallel cap, and says which cap", async () => {
+    const { harness } = await load({ maxParallelWorkers: 2, maxDelegationsPerTurn: 0 });
+    await enable(harness);
+    const delegate = () =>
+      harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task: "Do it", waitForResult: false },
+        { threadId: THREAD, projectId: "proj_1" },
+      );
+
+    await delegate();
+    await delegate();
+    await expect(delegate()).rejects.toThrow(/caps parallel workers at 2/);
+    expect(spawned).toHaveLength(2);
+  });
+
+  it("does not send a fan-out refusal to the fallback", async () => {
+    const { harness } = await load({ maxParallelWorkers: 1, maxDelegationsPerTurn: 0 }, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      fallback: RETRY_TARGET,
+    });
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it", waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    // A cap is the plugin's own refusal: retrying it on the fallback would fail
+    // twice and hide the reason.
+    await expect(
+      harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task: "Do it", waitForResult: false },
+        { threadId: THREAD, projectId: "proj_1" },
+      ),
+    ).rejects.toThrow(/caps parallel workers at 1/);
+    expect(spawned).toHaveLength(1);
+  });
+
+  it("caps how many workers one turn may delegate", async () => {
+    const { harness } = await load({ maxDelegationsPerTurn: 2, maxParallelWorkers: 0 });
+    await enable(harness);
+    const handler = harness.inspection.registrations.hooks["message.dispatch"];
+    await handler!(
+      makeMessageDispatchHookContext({ thread: makeThreadResponse({ id: THREAD }) }),
+    );
+
+    const delegate = () =>
+      harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task: "Do it", waitForResult: false },
+        { threadId: THREAD, projectId: "proj_1" },
+      );
+
+    await delegate();
+    await delegate();
+    await expect(delegate()).rejects.toThrow(/caps a turn at 2/);
+  });
+
+  it("offers no cap when a cap is set to zero", async () => {
+    const { harness } = await load({ maxParallelWorkers: 0, maxDelegationsPerTurn: 0 });
+    await enable(harness);
+    for (let index = 0; index < 8; index += 1) {
+      await harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task: `Unit ${index}`, waitForResult: false },
+        { threadId: THREAD, projectId: "proj_1" },
+      );
+    }
+    expect(spawned).toHaveLength(8);
+  });
+
+  it("exposes the exact contract and the appended rules", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    const before = (await harness.behavior.callRpc("get_contract", { threadId: null })) as {
+      text: string;
+      extra: string;
+      limit: number;
+    };
+    expect(before).toMatchObject({ extra: "", limit: 370 });
+    expect(String(before.text)).toContain("ORCHESTRATOR MODE IS ON");
+    expect(String(before.text)).toContain("orchestrator_review");
+
+    const after = (await harness.behavior.callRpc("set_contract", {
+      extra: "Never edit src/legacy.",
+    })) as { text: string; extra: string; limit: number };
+    expect(after).toMatchObject({ extra: "Never edit src/legacy." });
+    expect(String(after.text)).toContain("## Rules for this project");
+    expect(String(after.text)).toContain("Never edit src/legacy.");
+  });
+
+  it("refuses appended rules past the cap", async () => {
+    const { harness } = await load();
+    await expect(
+      harness.behavior.callRpc("set_contract", { extra: "x".repeat(371) }),
+    ).rejects.toThrow();
+  });
+
+  it("sets and clears the project rules from the CLI", async () => {
+    const { harness } = await load();
+
+    await harness.behavior.runCli(["contract", "--rules", "Never edit generated/."]);
+    const set = (await harness.behavior.callRpc("get_contract", { threadId: null })) as {
+      extra: string;
+      text: string;
+    };
+    expect(set.extra).toBe("Never edit generated/.");
+    expect(set.text).toContain("Never edit generated/.");
+
+    await harness.behavior.runCli(["contract", "--clear-rules"]);
+    const cleared = (await harness.behavior.callRpc("get_contract", { threadId: null })) as {
+      extra: string;
+      text: string;
+    };
+    expect(cleared.extra).toBe("");
+    expect(cleared.text).not.toContain("Never edit generated/.");
+  });
+
+  it("prints the contract from the CLI", async () => {
+    const { harness } = await load();
+    const result = await harness.behavior.runCli(["contract"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("ORCHESTRATOR MODE IS ON");
+    expect(result.stdout).toContain("orchestrator_delegate");
+  });
+
+  it("spawns a preset's execution on top of the worker execution", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      reasoningLevel: "low",
+      presets: { build: { model: "claude-opus-5-5", permissionMode: "full" } },
+    });
+    await enable(harness);
+
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Build it", preset: "build" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    // The preset named only a model and an access; the provider follows the
+    // model and the reasoning level stays what the worker execution said.
+    expect(spawned[0]).toMatchObject({
+      providerId: "claude-code",
+      model: "claude-opus-5-5",
+      reasoningLevel: "low",
+      permissionMode: "full",
+    });
+  });
+
+  it("lets a call's own arguments beat the preset", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      presets: { build: { model: "claude-opus-5-5" } },
+    });
+    await enable(harness);
+
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Build it", preset: "build", model: "claude-haiku-4-5-20251001" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    expect(spawned[0]).toMatchObject({
+      providerId: "claude-code",
+      model: "claude-haiku-4-5-20251001",
+    });
+  });
+
+  it("refuses a preset that is not stored, naming the ones that are", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      presets: { research: { model: "claude-haiku-4-5-20251001" } },
+    });
+    await enable(harness);
+
+    await expect(
+      harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task: "Build it", preset: "build" },
+        { threadId: THREAD, projectId: "proj_1" },
+      ),
+    ).rejects.toThrow(/No `build` worker preset is stored. Stored presets: research/);
+    expect(spawned).toHaveLength(0);
+  });
+
+  it("writes and clears one preset from the CLI without touching the rest", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      fallback: RETRY_TARGET,
+    });
+
+    const written = await harness.behavior.runCli([
+      "worker",
+      "--preset",
+      "build",
+      "--model",
+      "claude-opus-5-5",
+    ]);
+    expect(written.exitCode).toBe(0);
+    expect(written.stdout).toContain("preset build");
+    expect(written.stdout).toContain("claude-opus-5-5");
+
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      workerExecution: Record<string, unknown>;
+    };
+    expect(state.workerExecution).toMatchObject({
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+    });
+
+    const cleared = await harness.behavior.runCli(["worker", "--clear-preset", "build"]);
+    expect(cleared.exitCode).toBe(0);
+    const config = (await harness.behavior.callRpc("get_worker_execution", null)) as Record<string, unknown>;
+    expect(config.presets).toBeUndefined();
+    // The retry target and the execution survived the preset edit.
+    expect(config).toMatchObject({ fallback: RETRY_TARGET });
+  });
+
+  it("archives a settled worker when retention says so", async () => {
+    const { harness } = await load({ workerRetention: "archive-all" });
+    await enable(harness);
+
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    expect(archivedThreads).toEqual([WORKER]);
+  });
+
+  it("keeps every worker by default", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(archivedThreads).toEqual([]);
+  });
+
+  it("archives only check units under the checks policy", async () => {
+    const { harness } = await load({ workerRetention: "archive-checks" });
+    await enable(harness);
+    let started = 0;
+    harness.inspection.sdk.stub("threads.spawn", async (args) => {
+      spawned.push(args as unknown as Record<string, unknown>);
+      return makeThreadResponse({
+        id: started++ === 0 ? "th_unit" : "th_check",
+        parentThreadId: THREAD,
+      });
+    });
+
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it", verify: true },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    expect(archivedThreads).toEqual(["th_check"]);
+  });
+
+  it("emits the contract shape the setting names", async () => {
+    const { harness } = await load({ contractPreset: "review-heavy" });
+    const contract = (await harness.behavior.callRpc("get_contract", { threadId: null })) as {
+      text: string;
+    };
+    expect(contract.text).toContain("Every unit gets checked before you trust it");
+    expect(contract.text).not.toContain("Pass `verify: true` when you delegate a unit whose");
   });
 
   it("rejects an empty brief", async () => {

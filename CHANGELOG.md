@@ -27,6 +27,30 @@ All notable changes to Orchestrator Mode are documented here. The format follows
   access. It covers a refused spawn and a worker that lands in `error`, and the
   retry inherits every field the fallback does not name, so a fallback with no
   access of its own runs with the worker's permission mode.
+- **The review gate.** `orchestrator_review` records a verdict per worker, and a
+  turn that ends with unjudged workers tells an idle orchestrator once. Counts
+  appear in the composer strip and in `status`. `verify: true` on a delegation
+  spawns an independent check unit, told to inspect and report rather than
+  repair, and records its thread as that delegation's evidence.
+- **Inspectable contract.** `bb orchestrator-mode contract` prints the exact text
+  a thread receives and sets or clears the appended project rules with `--rules`
+  / `--clear-rules`; the settings section shows it with its length against the
+  4096-character ceiling; project rules append their own section under a measured
+  cap; and `contractPreset` picks between `standard`, `delegate-only`,
+  `research-first` and `review-heavy`.
+- **Fan-out guardrails.** `maxParallelWorkers` and `maxDelegationsPerTurn`
+  (both `0` for no cap) refuse a delegation with a readable error, and a refusal
+  is never retried on the fallback.
+- **Worker retention.** `workerRetention` can archive check units, or every
+  worker whose result has been read, once that result is in the orchestrator's
+  hands.
+- **Execution presets.** `--preset` / the `preset` tool argument name a stored
+  per-unit-class execution (`build`, `review`, `research`), applied under the
+  call's own arguments and over the worker execution. A preset may set only the
+  fields that differ.
+- A worker's failure text is carried from `thread.failed` onto its delegation
+  record, so the orchestrator is told why a worker failed rather than only that
+  it did.
 - `bb orchestrator-mode worker` shows, sets and clears the stored execution, and
   manages the retry target with `--fallback-provider`, `--fallback-model` and
   `--clear-fallback`. Each flag leaves the rest of the stored configuration
@@ -50,6 +74,13 @@ All notable changes to Orchestrator Mode are documented here. The format follows
   and how ongoing watchdog checks help catch that behaviour.
 
 ### Fixed
+
+- A plugin tool call that a provider renders as a `command` row no longer reads
+  as the orchestrator running a shell command. Those rows carry a call's title
+  ("Recording accepted verdict"), not a command line, and flagging them told the
+  orchestrator off for using the tools this plugin gives it. A command row now
+  has to look like an invocation — a known program, or shell evidence such as a
+  path, a flag, a pipe or an assignment.
 
 - Read incremental timeline patches and nested work in completed turns so the
   watchdog does not miss direct work.

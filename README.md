@@ -79,8 +79,10 @@ brief and can wait for its result. Workers use the parent's environment and
 appear in the sidebar unless you request a hidden worker.
 
 You choose their provider and model with BB's own picker in the plugin's
-settings, or per delegation in the tool call. See
-[Worker execution](#worker-execution).
+settings, or per delegation in the tool call, and the orchestrator has to record
+a verdict for every worker it used. See [Worker
+execution](#worker-execution) and [Reviewing worker
+output](#reviewing-worker-output).
 
 </td>
 </tr>
@@ -232,8 +234,88 @@ provider answers an ACP `session/set_model` call with *Unknown ACP ext method*,
 so asking for any model other than the one it already runs fails that worker's
 start — leave workers on the project default when delegating to `acp-omp`.
 
+## Reviewing worker output
+
+Every delegation is meant to end in a verdict, and the plugin checks for one.
+The orchestrator records it with the `orchestrator_review` tool — one call per
+worker whose result it used, with `accepted` or `rejected` and a line of notes —
+and the watchdog notices when a turn ends without one:
+
+- The composer strip and `bb orchestrator-mode status` show how many workers are
+  judged and how many are waiting.
+- At `guard` and `block`, an idle orchestrator with unjudged workers is told
+  once. It is asked once per set of workers, not once per turn.
+- A finished turn cannot be stopped after the fact, so `block` behaves as
+  `guard` for the review gate. That limit is a consequence of BB giving plugins
+  no pre-tool veto, not a setting.
+
+`orchestrator_delegate` takes `verify: true`, which spawns an **independent
+check unit** on the same brief: a second worker told to inspect the repository
+and report `VERDICT: pass` or `VERDICT: fail`, and told not to modify anything —
+a checker that repairs the work destroys the evidence it was asked for. Its
+thread is recorded as that delegation's evidence and its report comes back with
+the worker's. A check unit is not itself a unit to judge, so it does not add a
+second verdict to record.
+
+## Guardrails
+
+Two caps stop a fan-out from running away, both read from the plugin's own
+records so the refusal can name what it hit:
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `maxParallelWorkers` | `6` | Refuses a delegation while this many workers are still running. Every worker counts, including check units and fallbacks. |
+| `maxDelegationsPerTurn` | `20` | Refuses a delegation once one turn has delegated this many. |
+
+`0` removes either cap. A refusal is returned to the orchestrator as a readable
+error, and it is never retried on the fallback: a cap is the plugin's own
+decision, not a provider that could not start.
+
+`workerRetention` decides what happens to a worker once its result has been
+read: `keep` (default) leaves every thread in the sidebar, `archive-checks`
+archives check units, `archive-all` archives every worker the orchestrator has
+read. Archiving is recoverable, and a worker is only archived after its output
+is already in the orchestrator's hands.
+
+## The contract
+
+The instructions a session receives are inspectable and extensible, but not
+rewritable — the contract states exactly which acts the watchdog flags, so a
+free-form replacement could desync the two and make the watchdog wrong.
+
+```sh
+bb orchestrator-mode contract                              # the text this thread receives
+bb orchestrator-mode contract --rules "Never edit generated/."
+bb orchestrator-mode contract --clear-rules
+bb orchestrator-mode contract --json                       # plus its length and the append cap
+```
+
+**Settings → Installed plugins → Orchestrator Mode** shows the same text behind
+a disclosure, with its length against `configure`'s 4096-character ceiling.
+
+**Project rules** appends its own section to the contract. The append is capped
+(370 characters) because `configure` truncates the block, and the tail of it
+is the part that says what to do when delegation is impossible. The cap is
+measured, not guessed: the budget test builds the largest contract every preset
+can produce with an append at the cap and asserts it fits.
+
+**Contract shape** picks which sections are emitted:
+
+| Preset | What it changes |
+| --- | --- |
+| `standard` (default) | Delegation and review, as documented above. |
+| `delegate-only` | Also delegates research: no commands at all, and finding things out becomes a unit to hand over. |
+| `research-first` | Asks for enough reading to write a brief that stands alone. |
+| `review-heavy` | Requires a check unit for every delegation, and a recorded verdict for each. |
+
 ## Enforcement limits
 
+- **A command has to look like one.** A `command` row counts as work when it
+  names a program an agent plausibly runs, or carries shell evidence — a path, a
+  flag, a pipe, a redirect, an assignment. A provider that renders a plugin tool
+  call as a command row carries the call's title there instead, and a title is
+  not a command. The cost is that a bare unknown program name with no arguments
+  reads as a title; a write it performs still shows up as a file change.
 - **Detection follows the action.** BB exposes no pre-tool-call veto. `block`
   stops a turn after detection, so a fast write can complete before the stop.
 - **Grace turns are intentional.** Enabling an idle thread skips its next turn
@@ -262,21 +344,27 @@ bb orchestrator-mode off
 | `status [--thread <id>] [--json]` | Show mode, enforcement, violations, nudges and delegations. |
 | `on [--thread <id>] [--enforcement instruct\|guard\|block] [--json]` | Enable the thread, with an optional enforcement override. |
 | `off [--thread <id>] [--json]` | Disable the thread and clear its enforcement override. |
+| `contract [--thread <id>] [--rules <text>] [--clear-rules] [--json]` | Print the exact instructions this thread receives, or set and clear the project rules appended to them. |
 | `violations [--thread <id>] [--clear] [--json]` | List violations, or clear them and reset correction counters. |
 | `default [on\|off] [--json]` | Show or set the default for new threads. |
-| `worker [--provider <id>] [--model <id>] [--reasoning <level>] [--tier <default\|fast>] [--permission <mode>] [--fallback-provider <id>] [--fallback-model <id>] [--fallback-permission <mode>] [--clear-fallback] [--clear] [--json]` | Show, set or clear the execution every delegated worker defaults to, and the provider, model and access a failed worker is retried on. |
+| `worker [--provider <id>] [--model <id>] [--reasoning <level>] [--tier <default\|fast>] [--permission <mode>] [--fallback-provider <id>] [--fallback-model <id>] [--fallback-permission <mode>] [--clear-fallback] [--preset <name>] [--clear-preset <name>] [--clear] [--json]` | Show, set or clear the execution every delegated worker defaults to, the provider, model and access a failed worker is retried on, and the named execution presets. With `--preset`, the execution flags write that preset instead of the worker execution. |
 
 `--thread` (alias `-t`) defaults to the thread running the command. In an
 ordinary terminal, provide a thread ID for thread commands.
 
 </details>
 
-**Agent tool:**
-`orchestrator_delegate({ task, title?, waitForResult?, timeoutSeconds?, hidden?, provider?, model?, reasoning?, permissionMode? })`.
+**Agent tools:**
+`orchestrator_delegate({ task, title?, waitForResult?, timeoutSeconds?, hidden?, preset?, verify?, provider?, model?, reasoning?, permissionMode? })`,
+and `orchestrator_review({ workerThreadId, verdict, notes?, verifiedBy? })`, which
+the watchdog expects once per worker whose result was used.
 The brief is required and limited to 20,000 characters; the title is limited to
 200. Waiting defaults to `true`, with a 900-second timeout (range 10–3,600).
 `hidden` defaults to `false`. A timeout returns the worker's status and leaves it
-running. The four execution arguments are optional and fall back to the
+running. `preset` names a stored execution preset, applied under the call's own
+arguments; asking for one that is not stored is an error that names the ones
+that are. `verify` adds a [check unit](#reviewing-worker-output). The four
+execution arguments are optional and fall back to a preset, then the
 [worker execution](#worker-execution), then the project defaults. The
 bundled [skill](skills/orchestrator-mode/SKILL.md) explains the mode, delegation
 and CLI; enabled sessions receive the contract directly.
@@ -294,7 +382,11 @@ Orchestrator Mode**.
 | `defaultForNewThreads` | `false` | Enable qualifying root threads created while the default is on, at a user-initiated dispatch. |
 | `enforcement` | `guard` | `instruct`: contract only. `guard`: record and correct. `block`: also stop. A thread override takes precedence. |
 | `allowReadCommands` | `true` | Treat recognised read-only shell commands as exploration; when off, all commands count as work. |
-| `maxNudges` | `3` | Corrective messages per enablement; non-negative numbers are rounded down. `0` disables nudges. Recording and `block` stops continue after the cap. |
+| `maxNudges` | `3` | Corrective messages per enablement, for direct work and for unjudged workers; non-negative numbers are rounded down. `0` disables nudges. Recording and `block` stops continue after the cap. |
+| `contractPreset` | `standard` | Which [contract shape](#the-contract) a session receives. |
+| `workerRetention` | `keep` | What happens to a worker once its result has been read: keep it, archive check units, or archive every read worker. |
+| `maxParallelWorkers` | `6` | Refuse a delegation while this many workers are running. `0` removes the cap. |
+| `maxDelegationsPerTurn` | `20` | Refuse a delegation once a turn has delegated this many. `0` removes the cap. |
 
 The worker execution above is stored by the plugin rather than set here, so it
 can use BB's own provider and model picker. See
