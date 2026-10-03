@@ -6,6 +6,70 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- A redirection's `&` is no longer a command separator: `ls 2>&1`, `git log >&2`
+  and `ls 2>&-` are read-only again, while `&&` and a standalone `&` still
+  separate, and a real redirect (`ls 2>&1 > out.txt`, `ls &> out.txt`) is still
+  a write.
+- `git diff --output-indicator-new='+'`/`--output-indicator-old='-'` are
+  read-only display flags again; only `--output=<file>` and `--output <file>`
+  count as a write.
+- The shell-command doc comment now states the real rule and the known residual:
+  a detached capitalised program with a lowercase argument (`Gradlew build`,
+  `Just test`) reads as prose and is missed; its lowercase and path forms are
+  still work.
+- The direct-work classifier no longer reads a destructive or program-running
+  command as read-only: `find -delete/-exec/-fprint/-ok`, `fd -x/-X`, `rg --pre`,
+  `env <program>`, `yq -i`, `date -s`, `hostname <name>`, `git config --list
+  --unset`, a `git diff --output=` write, process substitution (`<(cmd)`), and
+  `git` global options before the subcommand (`git -C dir status` now reads as a
+  query, not as a command). Quoted metacharacters are arguments: `rg "a|b"`,
+  `grep 'a;b'` and `echo 'a > b'` are read-only again. A mixed `find`/`rg`/`fd`/
+  `yq` form that carries both a read action and a writing one is work.
+- A malformed timeline row can no longer wedge the watchdog: a non-string
+  `command` is judged as work instead of throwing, a row that throws is logged
+  and skipped, and a non-numeric `maxSeq` no longer poisons the cursor.
+- A row id reused by a later turn is judged again, so the second turn's work is
+  not silently dropped as a redelivery.
+- The orchestrator contract can no longer exceed `configure`'s 4096-character
+  ceiling: the reminder block is trimmed to fit, so the thread receives the whole
+  contract instead of a silent truncation of its tail.
+- The fan-out caps are enforced under concurrency: the check runs in the same
+  queue as the writes and counts the claims already in flight, so two
+  simultaneous delegations cannot both pass `maxParallelWorkers` or
+  `maxDelegationsPerTurn`. The per-turn cap also applies before a thread's first
+  dispatch, counted from when the mode was enabled.
+- The review gate claims its reminder atomically, so two events for the same
+  unjudged set send one reminder and spend one of the budget; a failed send gives
+  the reminder back.
+- `orchestrator_delegate` refuses a delegation once the thread's mode is off.
+- A null, partial or foreign state row is tolerated everywhere (including the
+  agent-configuration path), reading as defaults instead of failing the RPC, the
+  CLI or the composer.
+- The delegation record keeps every worker still owed a verdict when it is
+  trimmed, so a late verdict is not refused for a record that aged out.
+- The command classifier tells a provider's prose tool-call title from a
+  command by the first token rather than by shell punctuation, so
+  `Recording verdict for src/app.ts` and `Running the build (2 files)` are no
+  longer violations, while an unknown program (`gradlew build`, `just test`,
+  `flutter build apk`) is work in both read modes and the title rule never
+  excuses a command-shaped row when read-only commands are disallowed.
+- The first post-enable turn is excused even when its rows carry no
+  `startedAt` (a partial or delta row), and a historical row with an earlier
+  timestamp no longer spends that grace slot.
+- Block mode stops and nudges the live turn, not the first violation's turn,
+  and two turns whose rows carry no `turnId` no longer collapse into one
+  sentinel that suppressed every stop after the first.
+- A delivered work row without a string `id` is judged rather than dropped,
+  keyed by its sequence so a redelivery is still deduped.
+- A malformed element inside a stored `violations`, `delegations`, `seenRowIds`
+  or `graceTurnIds` array is dropped on read instead of reaching the contract,
+  the RPC output or an event handler; a non-numeric `touchedAt` falls back to 0
+  so pruning stays least-recently-touched.
+- `bb orchestrator-mode worker --preset <name>` with no execution flags reports
+  the current configuration instead of storing an empty preset entry.
+
 ### Added
 
 - **Worker execution control.** A **Worker execution** settings section with a

@@ -316,6 +316,38 @@ describe("agent configuration", () => {
     );
     expect(resolved.instructions).toBeNull();
   });
+
+  it("still hands the contract over when a stored violation is malformed", async () => {
+    const { harness } = await load({ enforcement: "guard" }, {
+      [THREAD]: {
+        enabled: true,
+        enforcement: null,
+        enabledAt: new Date().toISOString(),
+        touchedAt: Date.now(),
+        violations: [null],
+        seenRowIds: [],
+        lastSeq: 0,
+        graceTurnIds: [],
+        graceSlots: 1,
+        nudgeCount: 0,
+        lastNudgeTurnId: null,
+        lastStopTurnId: null,
+        delegations: [],
+        turnStartedAt: 0,
+        lastReviewNudge: null,
+      },
+    });
+    // Warm the state cache the synchronous configure callback reads.
+    await harness.behavior.callRpc("get_state", { threadId: THREAD });
+    const resolved = await harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({
+        thread: { id: THREAD },
+        pluginMetadata: writeMirror({ enabled: true, enforcement: null }),
+      }),
+    );
+    expect(resolved.instructions).toContain("ORCHESTRATOR MODE IS ON");
+    expect(resolved.tools.map((tool) => tool.name)).toEqual([DELEGATE_TOOL, REVIEW_TOOL]);
+  });
 });
 
 describe("the dispatch checkpoint", () => {
@@ -613,6 +645,147 @@ describe("the watchdog", () => {
     await idle(harness);
     await vi.waitFor(() => expect(stoppedThreads).toEqual([THREAD]));
   });
+
+  it("excuses the first post-enable turn when its rows carry no startedAt", async () => {
+    const { harness } = await load({ enforcement: "block" });
+    timelineRows = [
+      workRow({ id: "row_prior", workKind: "file-read", turnId: "turn_0", sourceSeqStart: 1, sourceSeqEnd: 1 }),
+    ];
+    timelineMaxSeq = 1;
+    await enable(harness);
+    // A partial row: the timeline puts startedAt on the completed summary, so a
+    // delta patch of the live turn arrives without one. It is still the first
+    // post-enable turn, so the grace slot must cover it.
+    timelineRows = [
+      ...timelineRows,
+      workRow({
+        id: "row_first",
+        workKind: "file-change",
+        turnId: "turn_1",
+        sourceSeqStart: 2,
+        sourceSeqEnd: 2,
+        change: { path: "a.ts" },
+        startedAt: undefined,
+      }),
+    ];
+    timelineMaxSeq = 2;
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(stoppedThreads).toEqual([]);
+    expect(sentTexts).toEqual([]);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      violations: [],
+      nudgeCount: 0,
+    });
+  });
+
+  it("does not let a historical row spend the first post-enable turn's grace", async () => {
+    const { harness } = await load({ enforcement: "block" });
+    timelineRows = [
+      workRow({ id: "row_prior", workKind: "file-read", turnId: "turn_0", sourceSeqStart: 1, sourceSeqEnd: 1 }),
+    ];
+    timelineMaxSeq = 1;
+    await enable(harness);
+    timelineRows = [
+      ...timelineRows,
+      // History first: its timestamp predates the enable, so it must not
+      // consume the grace slot the live turn needs.
+      workRow({
+        id: "row_hist",
+        workKind: "file-read",
+        turnId: "turn_hist",
+        sourceSeqStart: 2,
+        sourceSeqEnd: 2,
+        startedAt: Date.now() - 60_000,
+      }),
+      workRow({
+        id: "row_first",
+        workKind: "file-change",
+        turnId: "turn_1",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 3,
+        change: { path: "a.ts" },
+        startedAt: undefined,
+      }),
+    ];
+    timelineMaxSeq = 3;
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(stoppedThreads).toEqual([]);
+    expect(sentTexts).toEqual([]);
+  });
+
+  it("stops each live turn that does direct work even when the rows carry no turnId", async () => {
+    const { harness } = await load({ enforcement: "block" });
+    await arm(harness);
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: "row_a", workKind: "file-change", turnId: undefined, sourceSeqStart: 3, sourceSeqEnd: 4, change: { path: "a.ts" } }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    await vi.waitFor(() => expect(stoppedThreads).toHaveLength(1));
+
+    // A second turn, again with no turnId: it must be stopped too rather than
+    // collapsing into the same sentinel as the first.
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: "row_b", workKind: "file-change", turnId: undefined, sourceSeqStart: 5, sourceSeqEnd: 6, change: { path: "b.ts" } }),
+    ];
+    timelineMaxSeq = 6;
+    await idle(harness);
+    await vi.waitFor(() => expect(stoppedThreads).toHaveLength(2));
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(sentTexts).toHaveLength(2);
+  });
+
+  it("attributes the stop to the newest turn in the batch", async () => {
+    const { harness } = await load({ enforcement: "block" });
+    await arm(harness);
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: "row_t2", workKind: "file-change", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, change: { path: "a.ts" } }),
+      workRow({ id: "row_t3", workKind: "file-change", turnId: "turn_3", sourceSeqStart: 5, sourceSeqEnd: 6, change: { path: "b.ts" } }),
+    ];
+    timelineMaxSeq = 6;
+    await idle(harness);
+    await vi.waitFor(() => expect(stoppedThreads).toHaveLength(1));
+
+    // turn_3 is the live turn, so further work in it must not stop it again.
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: "row_t3b", workKind: "file-change", turnId: "turn_3", sourceSeqStart: 7, sourceSeqEnd: 8, change: { path: "c.ts" } }),
+    ];
+    timelineMaxSeq = 8;
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(stoppedThreads).toHaveLength(1);
+    expect(sentTexts).toHaveLength(1);
+  });
+
+  it("judges a work row that carries no id", async () => {
+    const { harness } = await load({ enforcement: "block" });
+    await arm(harness);
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: undefined, workKind: "file-change", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, change: { path: "a.ts" } }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    await vi.waitFor(() => expect(stoppedThreads).toEqual([THREAD]));
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      violations: { detail: string }[];
+    };
+    expect(state.violations).toHaveLength(1);
+    expect(state.violations[0]!.detail).toContain("a.ts");
+
+    // The sequence is the key, so a later scan does not judge it again.
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      nudgeCount: 1,
+    });
+  });
 });
 
 describe("the delegation tool", () => {
@@ -660,6 +833,7 @@ describe("the delegation tool", () => {
 
   it("returns immediately when asked not to wait", async () => {
     const { harness } = await load();
+    await enable(harness);
     const result = await harness.behavior.callAgentTool(
       DELEGATE_TOOL,
       { task: "Do it", waitForResult: false },
@@ -1462,6 +1636,16 @@ describe("the delegation tool", () => {
     expect(config).toMatchObject({ fallback: RETRY_TARGET });
   });
 
+  it("writes no preset when a preset is named with no execution flags", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    const result = await harness.behavior.runCli(["worker", "--preset", "build"]);
+    expect(result.exitCode).toBe(0);
+    // `--preset build` on its own names no value, so it reports rather than
+    // storing an empty preset a delegation could then resolve.
+    const config = (await harness.behavior.callRpc("get_worker_execution", null)) as Record<string, unknown>;
+    expect(config.presets).toBeUndefined();
+  });
+
   it("archives a settled worker when retention says so", async () => {
     const { harness } = await load({ workerRetention: "archive-all" });
     await enable(harness);
@@ -1650,6 +1834,98 @@ describe("rpc", () => {
       harness.inspection.realtimeSignals.some((signal) => signal.channel === "orchestrator-state"),
     ).toBe(true);
   });
+
+  it("drops malformed entries in a stored array instead of failing a read", async () => {
+    const { harness } = await load({ enforcement: "guard" }, {
+      [THREAD]: {
+        enabled: true,
+        enforcement: null,
+        enabledAt: new Date().toISOString(),
+        touchedAt: Date.now(),
+        violations: [
+          { id: "v1", turnId: "t1", workKind: "command", detail: "ran `x`", detectedAt: 1 },
+          null,
+          {},
+        ],
+        seenRowIds: ["row_1", null, 7],
+        delegations: [
+          { threadId: WORKER, title: "w", task: "t", createdAt: 1, status: "completed" },
+          null,
+          {},
+        ],
+        lastSeq: 0,
+        graceTurnIds: [null, "turn_1"],
+        graceSlots: 1,
+        nudgeCount: 0,
+        lastNudgeTurnId: null,
+        lastStopTurnId: null,
+        turnStartedAt: 0,
+        lastReviewNudge: null,
+      },
+    });
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      violations: { id: string }[];
+      delegations: { threadId: string }[];
+      unreviewed: number;
+    };
+    // The valid entries survive intact; the foreign ones are dropped.
+    expect(state.violations.map((violation) => violation.id)).toEqual(["v1"]);
+    expect(state.delegations.map((delegation) => delegation.threadId)).toEqual([WORKER]);
+    expect(state.unreviewed).toBe(1);
+    // A later scan over the repaired state keeps working.
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      violations: [{ id: "v1" }],
+    });
+  });
+
+  it("survives an idle event whose stored delegation is malformed", async () => {
+    const unhandled: unknown[] = [];
+    const listener = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", listener);
+    try {
+      const { harness } = await load({}, {
+        [THREAD]: {
+          enabled: true,
+          enforcement: null,
+          enabledAt: new Date().toISOString(),
+          touchedAt: Date.now(),
+          violations: [],
+          seenRowIds: [],
+          delegations: [null],
+          lastSeq: 0,
+          graceTurnIds: [],
+          graceSlots: 1,
+          nudgeCount: 0,
+          lastNudgeTurnId: null,
+          lastStopTurnId: null,
+          turnStartedAt: 0,
+          lastReviewNudge: null,
+        },
+      });
+      await idle(harness);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", listener);
+    }
+  });
+
+  it("evicts by touch time even when a stored touchedAt is not a number", async () => {
+    const seed: Record<string, unknown> = {};
+    for (let index = 1; index <= 300; index += 1) {
+      seed[`th_${index}`] = { enabled: false, touchedAt: index };
+    }
+    seed.th_bad = { enabled: false, touchedAt: "recently" };
+    const { bb, harness } = await load({}, seed);
+    await enable(harness);
+    const raw = (await bb.storage.kv.get("state")) as Record<string, unknown>;
+    expect(Object.keys(raw)).toHaveLength(300);
+    // The unreadable timestamp falls back to 0, so that row is the oldest.
+    expect(raw.th_bad).toBeUndefined();
+    expect(raw.th_2).toBeDefined();
+  });
 });
 
 describe("cli", () => {
@@ -1746,5 +2022,133 @@ describe("cli", () => {
     const result = await harness.behavior.runCli(["--help"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("orchestrator-mode");
+  });
+});
+
+describe("sweep regressions", () => {
+  it("sends one reminder when two idle events race for the same unjudged worker", async () => {
+    const { harness } = await load({ enforcement: "guard" }, {
+      [THREAD]: {
+        enabled: true,
+        enforcement: null,
+        enabledAt: new Date(Date.now() - 60_000).toISOString(),
+        delegations: [
+          { threadId: WORKER, title: "Do it", task: "Do it", createdAt: Date.now() - 1_000, status: "idle", verdict: null },
+        ],
+      },
+    });
+    await Promise.all([idle(harness), idle(harness)]);
+    await vi.waitFor(() => expect(sentTexts.length).toBeGreaterThan(0));
+    // The scan runs on the plugin's own debounce timer, so this settle is real time by nature and fake timers cannot
+    // drive it; a second reminder would have to arrive inside the same window. Promise.withResolvers is newer than
+    // this project's lib, so the file's own idiom is used.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(sentTexts).toHaveLength(1);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({ nudgeCount: 1 });
+  });
+
+  it("counts delegations against the per-turn cap before the first dispatch", async () => {
+    const { harness } = await load({ maxDelegationsPerTurn: 1, maxParallelWorkers: 0 });
+    await enable(harness);
+    const delegate = (task: string) =>
+      harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task, waitForResult: false },
+        { threadId: THREAD, projectId: "proj_1" },
+      );
+    await delegate("First");
+    await expect(delegate("Second")).rejects.toThrow(/caps a turn at 1/);
+    expect(spawned).toHaveLength(1);
+  });
+
+  it("counts two simultaneous delegations against the parallel cap", async () => {
+    const { harness } = await load({ maxParallelWorkers: 1, maxDelegationsPerTurn: 0 });
+    await enable(harness);
+    const settled = await Promise.allSettled(["First", "Second"].map((task) =>
+      harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task, waitForResult: false },
+        { threadId: THREAD, projectId: "proj_1" },
+      ),
+    ));
+    expect(settled.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(settled.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(spawned).toHaveLength(1);
+  });
+
+  it("refuses a delegation once the thread is switched off", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    await harness.behavior.callRpc("set_enabled", { threadId: THREAD, enabled: false, enforcement: null });
+    await expect(harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Do it", waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    )).rejects.toThrow(/not in orchestrator mode/);
+    expect(spawned).toHaveLength(0);
+  });
+
+  it("reads a null or partial state row instead of failing", async () => {
+    const partial = "th_partial";
+    const { harness } = await load({}, { [THREAD]: null, [partial]: { enabled: true } });
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      enabled: false,
+      enforcement: null,
+      enabledAt: null,
+    });
+    expect(await harness.behavior.callRpc("get_state", { threadId: partial })).toMatchObject({
+      enabled: true,
+      enforcement: null,
+      enabledAt: null,
+    });
+  });
+
+  it("judges a later turn that reuses a seen row id", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: "row_dup", workKind: "file-change", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, change: { path: "a.ts" } }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    await vi.waitFor(async () => {
+      const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as { violations: unknown[] };
+      expect(state.violations).toHaveLength(1);
+    });
+    // The same id in a later turn is a different act, not a redelivery of the first.
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: "row_dup", workKind: "file-change", turnId: "turn_3", sourceSeqStart: 5, sourceSeqEnd: 6, change: { path: "b.ts" } }),
+    ];
+    timelineMaxSeq = 6;
+    await idle(harness);
+    await vi.waitFor(async () => {
+      const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as { violations: { turnId: string | null }[] };
+      expect(state.violations.map((violation) => violation.turnId)).toEqual(["turn_2", "turn_3"]);
+    });
+  });
+
+  it("keeps workers that are still owed a verdict when the record is trimmed", async () => {
+    const { harness } = await load({ enforcement: "instruct", maxParallelWorkers: 0, maxDelegationsPerTurn: 0 });
+    await enable(harness, THREAD, "instruct");
+    let workerNumber = 0;
+    harness.inspection.sdk.stub("threads.spawn", async () =>
+      makeThreadResponse({ id: `th_worker_${++workerNumber}`, parentThreadId: THREAD }),
+    );
+    // One past the record window: the oldest unjudged record must survive the trim, or its verdict becomes impossible.
+    for (let index = 0; index < 51; index += 1) {
+      await harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task: `Task ${index}` },
+        { threadId: THREAD, projectId: "proj_1" },
+      );
+    }
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      delegations: { threadId: string }[];
+      unreviewed: number;
+    };
+    expect(state.unreviewed).toBe(51);
+    expect(state.delegations.map((delegation) => delegation.threadId)).toContain("th_worker_1");
   });
 });
