@@ -919,7 +919,12 @@ export default async function plugin(bb: BbPluginApi) {
         try {
           await bb.sdk.threads.wait({ threadId: workerId, status: "idle", timeoutMs, signal });
         } catch {
-          // A timeout or an error status both land here; read the real status.
+          // `wait` matches one status and polls, so an errored thread never
+          // reaches `idle`: the server rejects the wait immediately with
+          // "will not reach idle by waiting alone" rather than holding until the
+          // timeout. That rejection is what notices a failure promptly — the
+          // status read below then decides whether to retry. A timeout lands
+          // here too, which is why the status is read either way.
         }
         let status: string | null = null;
         try {

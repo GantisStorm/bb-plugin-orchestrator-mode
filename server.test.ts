@@ -790,14 +790,26 @@ describe("the delegation tool", () => {
     expect(spawned[0]).not.toHaveProperty("reasoningLevel");
   });
 
-  it("retries a failed worker on the configured fallback", async () => {
+  /** Enable a thread whose workers run on a stored execution and retry target.
+   * Pass `null` for a thread with no retry target. */
+  async function armFallback(
+    fallback: { providerId: string; model: string } | null = {
+      providerId: "claude-code",
+      model: "claude-opus-5-5",
+    },
+  ): Promise<FakePluginHarness> {
     const { harness } = await load({}, undefined, CATALOG);
     await harness.behavior.callRpc("set_worker_execution", {
       providerId: "acp-omp",
       model: "command-code/deepseek/deepseek-v4.1-flash-fast",
-      fallback: { providerId: "claude-code", model: "claude-opus-5-5" },
+      ...(fallback === null ? {} : { fallback }),
     });
     await enable(harness);
+    return harness;
+  }
+
+  /** Spawn two workers in order, the first of which behaves differently. */
+  function twoWorkers(harness: FakePluginHarness): void {
     let started = 0;
     harness.inspection.sdk.stub("threads.spawn", async (args) => {
       spawned.push(args as unknown as Record<string, unknown>);
@@ -806,6 +818,11 @@ describe("the delegation tool", () => {
         parentThreadId: THREAD,
       });
     });
+  }
+
+  it("retries a failed worker on the configured fallback", async () => {
+    const harness = await armFallback();
+    twoWorkers(harness);
     harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
       makeThreadResponse({ id: threadId, status: threadId === "th_first" ? "error" : "idle" }),
     );
@@ -835,14 +852,32 @@ describe("the delegation tool", () => {
     });
   });
 
-  it("retries on the fallback when the worker cannot start at all", async () => {
-    const { harness } = await load({}, undefined, CATALOG);
-    await harness.behavior.callRpc("set_worker_execution", {
-      providerId: "acp-omp",
-      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
-      fallback: { providerId: "claude-code", model: "claude-opus-5-5" },
+  it("retries when the wait rejects for an errored worker", async () => {
+    const harness = await armFallback();
+    twoWorkers(harness);
+    // What the server actually does: an errored thread never reaches `idle`, so
+    // the wait rejects instead of holding until the timeout.
+    harness.inspection.sdk.stub("threads.wait", async ({ threadId }) => {
+      if (threadId === "th_first") throw new Error("Thread is in status error and will not reach idle by waiting alone.");
+      return { matched: true, threadId };
     });
-    await enable(harness);
+    harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
+      makeThreadResponse({ id: threadId, status: threadId === "th_first" ? "error" : "idle" }),
+    );
+
+    const result = await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Rebuild the index" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    expect(spawned).toHaveLength(2);
+    expect(spawned[1]).toMatchObject({ providerId: "claude-code", model: "claude-opus-5-5" });
+    expect(String(result)).toContain("th_first failed");
+  });
+
+  it("retries on the fallback when the worker cannot start at all", async () => {
+    const harness = await armFallback();
     let started = 0;
     harness.inspection.sdk.stub("threads.spawn", async (args) => {
       // The provider refuses the first execution outright, as a 503 does.
@@ -864,12 +899,7 @@ describe("the delegation tool", () => {
   });
 
   it("does not retry a failed worker when no fallback is configured", async () => {
-    const { harness } = await load({}, undefined, CATALOG);
-    await harness.behavior.callRpc("set_worker_execution", {
-      providerId: "acp-omp",
-      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
-    });
-    await enable(harness);
+    const harness = await armFallback(null);
     harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
       makeThreadResponse({ id: threadId, status: "error" }),
     );
@@ -885,13 +915,7 @@ describe("the delegation tool", () => {
   });
 
   it("does not retry a worker that finished", async () => {
-    const { harness } = await load({}, undefined, CATALOG);
-    await harness.behavior.callRpc("set_worker_execution", {
-      providerId: "acp-omp",
-      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
-      fallback: { providerId: "claude-code", model: "claude-opus-5-5" },
-    });
-    await enable(harness);
+    const harness = await armFallback();
 
     const result = await harness.behavior.callAgentTool(
       DELEGATE_TOOL,
