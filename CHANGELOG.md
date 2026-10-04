@@ -6,6 +6,10 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `contractPreset: "thorough"` composes the `research-first` reading requirement with `review-heavy`'s mandatory check unit and verdict, for work whose result is expensive to get wrong. The contract budget test covers it with every other preset, and it keeps honouring the read-only command allowance that `delegate-only` withdraws.
+
 ### Fixed
 
 - The read-only classifier is sound before permissive. A line is now only

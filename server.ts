@@ -448,7 +448,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "select",
       label: "What the orchestrator is told",
       description:
-        "standard delegates the work and reviews it. delegate-only also hands over research, so it may not run commands at all. research-first asks for enough reading to write a brief that stands alone. review-heavy gives every unit an independent check unit before it is accepted. Read the exact text with bb orchestrator-mode contract.",
+        "standard delegates the work and reviews it. delegate-only also hands over research, so it may not run commands at all. research-first asks for enough reading to write a brief that stands alone. review-heavy gives every unit an independent check unit before it is accepted. thorough is both: enough reading to brief well, and a check unit for every unit. Read the exact text with bb orchestrator-mode contract.",
       options: [...CONTRACT_PRESETS],
       default: "standard",
     },

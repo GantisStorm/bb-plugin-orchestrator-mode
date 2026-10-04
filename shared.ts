@@ -1157,13 +1157,17 @@ export function classifyRow(
 /**
  * The shapes of contract this plugin can inject. A preset swaps sections rather
  * than appending to them, so the whole block stays inside `configure`'s
- * 4096-character ceiling whatever the settings say.
+ * 4096-character ceiling whatever the settings say. `thorough` is the one
+ * composition: the research line of `research-first` with the strict review step
+ * of `review-heavy`, which is the shape for work whose result is expensive to
+ * get wrong.
  */
 export const CONTRACT_PRESETS = [
   "standard",
   "delegate-only",
   "research-first",
   "review-heavy",
+  "thorough",
 ] as const;
 export type ContractPresetId = (typeof CONTRACT_PRESETS)[number];
 
@@ -1244,13 +1248,13 @@ export function buildInstructions(input: InstructionInput): string {
   // entirely, so the read-only allowance stops applying.
   const readCommands = preset === "delegate-only" ? false : input.allowReadCommands;
   const research =
-    preset === "research-first"
+    preset === "research-first" || preset === "thorough"
       ? "\n   Read enough of the repository first to write a brief that stands alone."
       : preset === "delegate-only"
         ? "\n   Even finding things out is a unit of work: hand a worker the question rather than searching yourself."
         : "";
   const reviewStep =
-    preset === "review-heavy"
+    preset === "review-heavy" || preset === "thorough"
       ? `4. Every unit gets checked before you trust it: delegate it with \`verify: true\` so an
    independent worker inspects the result, then record a verdict for that unit
    with the \`${REVIEW_TOOL}\` tool. If the check fails, re-delegate the unit. Never
