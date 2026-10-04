@@ -307,6 +307,7 @@ can produce with an append at the cap and asserts it fits.
 | `delegate-only` | Also delegates research: no commands at all, and finding things out becomes a unit to hand over. |
 | `research-first` | Asks for enough reading to write a brief that stands alone. |
 | `review-heavy` | Requires a check unit for every delegation, and a recorded verdict for each. |
+| `thorough` | Both of the last two: reading enough to write a brief that stands alone, and an independent check unit per unit. |
 
 ## Enforcement limits
 

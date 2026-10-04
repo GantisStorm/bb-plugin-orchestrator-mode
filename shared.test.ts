@@ -561,6 +561,33 @@ describe("the contract", () => {
     }
   });
 
+  it("thorough composes research-first and review-heavy without losing the command allowance", () => {
+    const thorough = buildInstructions({ enforcement: "guard", allowReadCommands: true, preset: "thorough" });
+    const research = buildInstructions({ enforcement: "guard", allowReadCommands: true, preset: "research-first" });
+    const review = buildInstructions({ enforcement: "guard", allowReadCommands: true, preset: "review-heavy" });
+    const standard = buildInstructions({ enforcement: "guard", allowReadCommands: true, preset: "standard" });
+
+    // The research line: present in research-first, so also in thorough.
+    const researchLine = "Read enough of the repository first to write a brief that stands alone.";
+    expect(research).toContain(researchLine);
+    expect(thorough).toContain(researchLine);
+    expect(standard).not.toContain(researchLine);
+
+    // The strict review step: present in review-heavy, so also in thorough.
+    const strictStep = "Every unit gets checked before you trust it";
+    expect(review).toContain(strictStep);
+    expect(thorough).toContain(strictStep);
+    expect(standard).not.toContain(strictStep);
+
+    // thorough is a composition, not a stricter delegate-only: the read-only
+    // allowance still applies, and only delegate-only withdraws it.
+    expect(thorough).toContain("Read-only shell commands");
+    expect(buildInstructions({ enforcement: "guard", allowReadCommands: true, preset: "delegate-only" }))
+      .toContain("Do not run shell commands at all");
+    expect(buildInstructions({ enforcement: "guard", allowReadCommands: false, preset: "thorough" }))
+      .toContain("Do not run shell commands at all");
+  });
+
   it("names the delegation tool and forbids editing files", () => {
     const text = buildInstructions({ enforcement: "guard", allowReadCommands: true });
     expect(text).toContain("orchestrator_delegate");
