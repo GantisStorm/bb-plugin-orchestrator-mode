@@ -368,7 +368,8 @@ The brief is required and limited to 20,000 characters; the title is limited to
 `hidden` defaults to `false`. A timeout returns the worker's status and leaves it
 running. `preset` names a stored execution preset, applied under the call's own
 arguments; asking for one that is not stored is an error that names the ones
-that are. `verify` adds a [check unit](#reviewing-worker-output). The four
+that are, and the contract names the stored kinds so the orchestrator knows what
+it may ask for. `verify` adds a [check unit](#reviewing-worker-output). The four
 execution arguments are optional and fall back to a preset, then the
 [worker execution](#worker-execution), then the project defaults. The
 bundled [skill](skills/orchestrator-mode/SKILL.md) explains the mode, delegation

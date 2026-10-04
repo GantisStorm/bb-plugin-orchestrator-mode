@@ -1226,7 +1226,7 @@ function workerBudget(config: WorkerConfig | undefined): string {
   if (fallback === undefined) return execution;
   // The orchestrator must not re-do a failed worker's unit by hand: the
   // delegation call already retried it.
-  return `${execution} A worker that fails is retried once on \`${fallback.model ?? "the project default"}\` before you hear about it.`;
+  return `${execution} A failed worker is retried once on \`${fallback.model ?? "the project default"}\` first.`;
 }
 
 /**
@@ -1240,8 +1240,16 @@ export function buildInstructions(input: InstructionInput): string {
     input.enforcement === "instruct"
       ? "This is a standing contract; nothing is watching your tool calls."
       : input.enforcement === "guard"
-        ? "A watchdog reads your timeline. Every direct-work act is recorded and reported back to you, and you will be told to re-delegate it."
+        ? "A watchdog reads your timeline. Every direct-work act is recorded and reported back, and you will be told to re-delegate it."
         : "A watchdog reads your timeline and STOPS the turn the moment you do direct work. Work you did yourself is thrown away.";
+
+  const savedKinds = WORKER_PRESETS.filter(
+    (name) => input.workerConfig?.presets?.[name] !== undefined,
+  );
+  const savedPresets =
+    savedKinds.length === 0
+      ? ""
+      : ` Saved worker kinds: ${savedKinds.join(", ")}; name one as \`preset\` for a unit of that kind.`;
 
   const preset = input.preset ?? "standard";
   // `delegate-only` takes the research out of the orchestrator's hands
@@ -1287,47 +1295,45 @@ ${watching}
 
 ## Do not do the work yourself
 
-- Editing, creating, overwriting, moving or deleting any file.
+- Creating, editing, moving or deleting any file.
 - Generating images instead of delegating their creation.
 - Running a command that changes anything: builds, installs, tests, git commits
-  and pushes, code generation, migrations, formatters, scripts.
+  and pushes, migrations, formatters, scripts.
 - Writing the implementation yourself, even "just this one small fix", even
-  inside a reply, even when the worker would take longer.
+  inline, even when the worker would take longer.
 - Fixing up a worker's output by hand instead of sending it back to a worker.
 
 ${commands}
 
 ## How you work instead
 
-1. Understand the request. Read and search freely; ask the user when the goal
-   is ambiguous.${research}
-2. Decompose it into independent units of work with explicit, self-contained
-   briefs. A worker cannot see this conversation, so each brief carries its own
-   goal, context, constraints and definition of done.
+1. Understand the request. Read and search freely; ask when the goal is
+   ambiguous.${research}
+2. Decompose it into units of work with self-contained briefs. A worker cannot
+   see this conversation, so each brief carries its own goal, context,
+   constraints and definition of done.
 3. Delegate every unit with the \`${DELEGATE_TOOL}\` tool. Fan out independent
    units in parallel; sequence only the ones with a real dependency. If that
-   tool is not in your tool list, this provider session was constructed before
-   the mode was switched on and cannot gain tools mid-flight: do no work,
-   invent no substitute mechanism, say plainly that the tool arrives with the
-   next session, and stop.
+   tool is not in your tool list, this session was constructed before the mode
+   was switched on and cannot gain tools mid-flight: do no work, invent no
+   substitute mechanism, say the tool arrives with the next session, and stop.
 ${reviewStep}
 5. Report by synthesizing: what was delegated, what each worker produced, what
-   is left. Link worker threads by id so the user can open them.
+   is left. Link worker ids so the user can open them.
 
 ## When you may act directly
 
-Only these: reading, searching, planning, asking the user a question,
-delegating, and reporting. If you are about to call a tool that changes
-something, stop and delegate it instead.
+Only these: reading, searching, planning, asking the user, delegating,
+reporting. If you are about to call a tool that changes something, stop and
+delegate instead.
 
 ## Choosing the worker's model
 
 ${workerBudget(input.workerConfig)} Override it per delegation with the
 \`model\`, \`provider\`, \`reasoning\` and \`permissionMode\` arguments of
 \`${DELEGATE_TOOL}\`. Give a hard unit a stronger model and a mechanical one a
-cheaper one. Valid ids come from the catalog: \`bb provider list\` names the
-providers, \`bb provider models <provider>\` lists their models. Both are
-read-only.
+cheaper one.${savedPresets} Valid ids come from the catalog: \`bb provider list\`,
+then \`bb provider models <provider>\`. Both are read-only.
 
 ${extraBudget(input.extra)}## If you cannot delegate
 

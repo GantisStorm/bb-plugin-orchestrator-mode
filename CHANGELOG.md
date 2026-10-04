@@ -9,6 +9,13 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 ### Added
 
 - `contractPreset: "thorough"` composes the `research-first` reading requirement with `review-heavy`'s mandatory check unit and verdict, for work whose result is expensive to get wrong. The contract budget test covers it with every other preset, and it keeps honouring the read-only command allowance that `delegate-only` withdraws.
+- The contract names the worker execution presets you have actually stored (`Saved worker
+  kinds: build, review; name one as \`preset\` for a unit of that kind.`), and says nothing when
+  none are, so the pre-delegation override the tool already accepted is discoverable from the
+  instructions rather than only from the tool schema. The added sentence is paid for by trimming
+  prose in the same block: the worst case measured (five reminders, a full project-rules append,
+  a complete worker configuration, and presets in every kind) went from 6 to 127 characters of
+  headroom under `configure`'s 4096-character ceiling, and the budget test now builds that case.
 
 ### Fixed
 
