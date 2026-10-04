@@ -551,6 +551,11 @@ describe("the contract", () => {
             serviceTier: "fast",
             permissionMode: "accept-edits",
             fallback: { providerId: "claude-code", model: "claude-opus-5-5" },
+            presets: {
+              build: { model: "command-code/deepseek-v4.1-flash-fast" },
+              review: { model: "claude-opus-5-5" },
+              research: { reasoningLevel: "high" },
+            },
           },
           extra: "x".repeat(EXTRA_INSTRUCTION_LIMIT),
           preset,
@@ -586,6 +591,29 @@ describe("the contract", () => {
       .toContain("Do not run shell commands at all");
     expect(buildInstructions({ enforcement: "guard", allowReadCommands: false, preset: "thorough" }))
       .toContain("Do not run shell commands at all");
+  });
+
+  it("names the saved worker kinds, and stays silent when none are stored", () => {
+    const withPresets = buildInstructions({
+      enforcement: "guard",
+      allowReadCommands: true,
+      preset: "thorough",
+      workerConfig: {
+        presets: {
+          research: { reasoningLevel: "high" },
+          build: { model: "command-code/deepseek-v4.1-flash-fast" },
+        },
+      },
+    });
+    expect(withPresets).toContain("Saved worker kinds: build, research");
+    expect(withPresets).toContain("name one as `preset`");
+    // Enum order, not insertion order: build before research however the map was written.
+    expect(withPresets.indexOf("build")).toBeLessThan(withPresets.indexOf("research"));
+
+    // Nothing saved means nothing advertised: the contract never invents a knob.
+    const without = buildInstructions({ enforcement: "guard", allowReadCommands: true, preset: "thorough" });
+    expect(without).not.toContain("Saved worker kinds");
+    expect(without).not.toContain("`preset`");
   });
 
   it("names the delegation tool and forbids editing files", () => {
