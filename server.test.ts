@@ -1964,6 +1964,131 @@ describe("rpc", () => {
   });
 });
 
+describe("state persistence", () => {
+  it("counts the byte budget in UTF-8 bytes, not code units", async () => {
+    // ~100 K code units but ~200 K UTF-8 bytes: a code-unit budget would keep
+    // the whole map, the byte budget has to evict the oldest row.
+    const seed: Record<string, unknown> = {
+      th_old: { enabled: false, touchedAt: 1, lastReviewNudge: "😀".repeat(50_000) },
+      th_new: { enabled: false, touchedAt: 2 },
+    };
+    expect(JSON.stringify(seed).length).toBeLessThan(MAX_STATE_BYTES);
+    expect(Buffer.byteLength(JSON.stringify(seed), "utf8")).toBeGreaterThan(MAX_STATE_BYTES);
+
+    const { bb, harness } = await load({}, seed);
+    await enable(harness, "th_write");
+
+    const raw = (await bb.storage.kv.get("state")) as Record<string, unknown>;
+    expect(Buffer.byteLength(JSON.stringify(raw), "utf8")).toBeLessThanOrEqual(MAX_STATE_BYTES);
+    expect(raw.th_old).toBeUndefined();
+    expect(raw.th_new).toBeDefined();
+    expect(raw.th_write).toMatchObject({ enabled: true });
+    // The eviction is announced, never silent.
+    expect(
+      harness.inspection.logEntries.some(
+        (entry) => entry.level === "warn" && entry.message.includes("th_old"),
+      ),
+    ).toBe(true);
+  });
+
+  it("starts empty when the stored state cannot be read, then recovers on the next write", async () => {
+    const { bb, harness } = await load();
+    const realGet = bb.storage.kv.get.bind(bb.storage.kv);
+    const read = vi.spyOn(bb.storage.kv, "get").mockImplementation(async (key: string) => {
+      if (key === "state") throw new Error("corrupt json");
+      return realGet(key);
+    });
+    try {
+      // A corrupt store must not throw out of a read: an unknown thread simply
+      // has no state, which is what every caller already handles.
+      const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as OrchestratorStateDto;
+      expect(state.enabled).toBe(false);
+      expect(
+        harness.inspection.logEntries.some(
+          (entry) => entry.level === "warn" && entry.message.includes("state read failed"),
+        ),
+      ).toBe(true);
+    } finally {
+      read.mockRestore();
+    }
+    await enable(harness);
+    expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { enabled: true } });
+  });
+
+  it("treats an array-shaped stored state as empty instead of harvesting its indices", async () => {
+    const { bb, harness } = await load(
+      {},
+      [{ enabled: true, touchedAt: 1 }] as unknown as Record<string, unknown>,
+    );
+    await enable(harness);
+    const raw = (await bb.storage.kv.get("state")) as Record<string, unknown>;
+    // The array's element must not come back as a thread keyed "0".
+    expect(Object.keys(raw)).toEqual([THREAD]);
+    expect(
+      harness.inspection.logEntries.some(
+        (entry) => entry.level === "warn" && entry.message.includes("not an object"),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps a stored __proto__ thread id instead of letting it become the map's prototype", async () => {
+    // A hostile or stale store can name a row "__proto__": a plain
+    // `map[id] = row` would set the map's prototype and the row would vanish
+    // from Object.keys and JSON.stringify.
+    const seed: Record<string, unknown> = {};
+    for (let index = 0; index < 300; index += 1) {
+      seed[`th_${index}`] = { enabled: false, touchedAt: index };
+    }
+    Object.defineProperty(seed, "__proto__", {
+      value: { enabled: true, touchedAt: 9_999 },
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+
+    const { bb, harness } = await load({}, seed);
+    await enable(harness);
+
+    const raw = (await bb.storage.kv.get("state")) as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(raw, "__proto__")).toBe(true);
+    // The count cap still evicted the oldest real row, not the newer proto row.
+    expect(raw.th_0).toBeUndefined();
+    expect(raw.th_299).toBeDefined();
+    // Nothing leaked onto Object.prototype.
+    expect(({} as Record<string, unknown>).enabled).toBeUndefined();
+  });
+
+  it("does not let a read that was in flight when a write landed resurrect the pre-write map", async () => {
+    const { bb, harness } = await load();
+    const realGet = bb.storage.kv.get.bind(bb.storage.kv);
+    let stateReads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const read = vi.spyOn(bb.storage.kv, "get").mockImplementation(async (key: string) => {
+      const value = await realGet(key);
+      // Hold the first state read open until a write has already committed, so
+      // it resolves with a snapshot older than the cache.
+      if (key === "state" && (stateReads += 1) === 1) await gate;
+      return value;
+    });
+    try {
+      const pending = harness.behavior.callRpc("get_state", { threadId: "th_read" });
+      await vi.waitFor(() => expect(stateReads).toBe(1));
+      await enable(harness, "th_a");
+      release();
+      await pending;
+      await enable(harness, "th_b");
+
+      const raw = (await bb.storage.kv.get("state")) as Record<string, unknown>;
+      expect(raw).toMatchObject({ th_a: { enabled: true }, th_b: { enabled: true } });
+    } finally {
+      read.mockRestore();
+    }
+  });
+});
+
 describe("cli", () => {
   it("turns the mode on and reports it", async () => {
     const { harness } = await load();

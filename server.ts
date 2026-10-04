@@ -861,14 +861,39 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function readAll(): Promise<Record<string, ThreadState>> {
     if (cache !== null) return cache;
-    const stored = await bb.storage.kv.get<Record<string, ThreadState>>(STATE_KEY);
-    const rows = stored !== undefined && typeof stored === "object" && stored !== null ? stored : {};
+    // A corrupt or unreadable store must not throw out of a read: every caller
+    // (the toggle, the dispatch hook, the watchdog, the contract builder) treats
+    // "no row" as an ordinary state, so degrade to an empty map and log.
+    let rows: Record<string, unknown> = {};
+    try {
+      const stored = await bb.storage.kv.get<unknown>(STATE_KEY);
+      if (stored === undefined || stored === null) {
+        rows = {};
+      } else if (typeof stored === "object" && !Array.isArray(stored)) {
+        rows = stored as Record<string, unknown>;
+      } else {
+        bb.log.warn(
+          `stored state is not an object (${Array.isArray(stored) ? "array" : typeof stored}); starting empty`,
+        );
+      }
+    } catch (cause) {
+      bb.log.warn(`state read failed; starting empty: ${String(cause)}`);
+    }
     // Normalize here, not only in getState and mutateState: every reader shares this
     // cache, including the agent-configuration path, and a row written by an older
     // build must not reach a caller with a missing array.
-    cache = Object.fromEntries(
-      Object.entries(rows).map(([threadId, state]) => [threadId, normalize(state)]),
+    const loaded = Object.fromEntries(
+      Object.entries(rows).map(([threadId, state]) => [
+        threadId,
+        // The store is untyped input: `normalize` is what turns a foreign shape
+        // into the row this build expects.
+        normalize(state as ThreadState | null | undefined),
+      ]),
     );
+    // A read already in flight can resolve after a write landed, with a snapshot
+    // older than the cache. Adopting it would resurrect the pre-write map in
+    // memory, and the next mutation would persist that stale map over the write.
+    if (cache === null) cache = loaded;
     return cache;
   }
 
@@ -952,7 +977,7 @@ export default async function plugin(bb: BbPluginApi) {
         return undefined;
       }
       next.touchedAt = Date.now();
-      all[threadId] = next;
+      setRow(all, threadId, next);
       await persist(prune(all, inFlightThreads(threadId)));
       return next;
     });
@@ -979,6 +1004,21 @@ export default async function plugin(bb: BbPluginApi) {
    */
   function inFlightThreads(threadId: string): string[] {
     return [threadId, ...scanning, ...scanTimers.keys()];
+  }
+
+  /**
+   * Store a row as an own data property. A plain `map[threadId] = row` treats
+   * the key `__proto__` as the object's prototype setter instead, so that row
+   * would disappear from `Object.keys`/`JSON.stringify` and the map would start
+   * inheriting the row's fields. A hostile or stale store can carry such a key.
+   */
+  function setRow(map: Record<string, ThreadState>, threadId: string, state: ThreadState): void {
+    Object.defineProperty(map, threadId, {
+      value: state,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
 
   /**
@@ -1009,7 +1049,7 @@ export default async function plugin(bb: BbPluginApi) {
       // value. Summed with the braces and commas this equals stringified size.
       const grown = bytes + (count === 0 ? 0 : 1) + byteLength(id) + 1 + byteLength(all[id]);
       if (keep.has(id) || (count < MAX_THREADS && grown <= MAX_STATE_BYTES)) {
-        out[id] = all[id]!;
+        setRow(out, id, all[id]!);
         bytes = grown;
         count += 1;
       } else {
