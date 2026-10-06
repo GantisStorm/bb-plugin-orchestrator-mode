@@ -373,6 +373,42 @@ describe("read-only classifier soundness (oracle-found defects)", () => {
   }
 });
 
+describe("Git global option operands", () => {
+  // Ported from upstream 5bbf7b3: a directory operand used to end the check before
+  // the subcommand, so a program-running option after it went unseen.
+  for (const prefix of ["-C repo", "--git-dir repo/.git", "--work-tree repo", "--namespace team"]) {
+    it.each([
+      "-c core.pager=cat",
+      "-ccore.pager=cat",
+      "--config-env core.pager=REVIEW_PAGER",
+      "--config-env=core.pager=REVIEW_PAGER",
+      "--exec-path /tmp/git-programs",
+      "--exec-path=/tmp/git-programs",
+    ])(`refuses program-running options after ${prefix}: %s`, (option) => {
+      expect(isReadOnlyCommand(`git ${prefix} ${option} log`)).toBe(false);
+    });
+  }
+
+  it.each([
+    "git -C first -C second -c core.fsmonitor=/tmp/git-hook status",
+    "git --git-dir repo/.git --work-tree repo --namespace team -C repo --exec-path=/tmp/git-programs status",
+  ])("refuses program-running options after repeated or mixed operands: %s", (command) => {
+    expect(isReadOnlyCommand(command)).toBe(false);
+  });
+
+  it.each(["git -C repo status", "git --git-dir repo/.git log", "git --work-tree repo status", "git --namespace team log"])(
+    "still reads through ordinary operands: %s",
+    (command) => {
+      expect(isReadOnlyCommand(command)).toBe(true);
+    },
+  );
+
+  it("does not read an operand value as a subcommand", () => {
+    // `repo` is a literal directory, not a program or a subcommand.
+    expect(isReadOnlyCommand("git -C -c log")).toBe(true);
+  });
+});
+
 describe("stderr suppression", () => {
   // Ported from upstream 176eadc: literal stderr discard reads like the command
   // it belongs to, while every other redirect still writes.

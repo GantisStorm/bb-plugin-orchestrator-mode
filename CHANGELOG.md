@@ -8,6 +8,12 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ### Fixed
 
+- Git's program-running global options stay work after a `-C`, `--git-dir`,
+  `--work-tree` or `--namespace` operand: a directory value used to end the check
+  before the subcommand, so `git -C repo -c core.pager=/tmp/hook log` read as
+  read-only and ran the hook. Ordinary reads still pass, including operands whose
+  literal values look like those options. Ported from upstream `5bbf7b3`.
+
 - Stderr suppression is reading, not writing: `ls 2>/dev/null` and friends no
   longer trip the watchdog, while every other redirect, `tee`, substitution and
   `find` action keeps its veto. Ported from upstream `176eadc`.
