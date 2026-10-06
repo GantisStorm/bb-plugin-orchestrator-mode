@@ -318,8 +318,7 @@ describe("the settings section", () => {
       maxNudges: 3,
       maxParallelWorkers: 6,
       maxDelegationsPerTurn: 20,
-      research: "as-is",
-      verification: "when-needed",
+      contractPreset: "standard",
       workerRetention: "keep",
     };
     const projectWorker: Record<string, WorkerConfig> = {};
@@ -513,20 +512,21 @@ describe("the settings section", () => {
     });
     expect((within(slot.container).getByLabelText("Enforcement") as HTMLSelectElement).value).toBe("block");
 
-    // The two contract settings are rows of their own, and each writes its own key.
-    const verification = within(slot.container).getByLabelText("How hard the review is") as HTMLSelectElement;
-    expect(Array.from(verification.options, (option) => option.textContent)).toEqual([
-      "when-needed",
-      "every-unit",
+    // The contract level is one row with three levels, and writes its own key.
+    const shape = within(slot.container).getByLabelText("What the orchestrator is told") as HTMLSelectElement;
+    expect(Array.from(shape.options, (option) => option.textContent)).toEqual([
+      "standard",
+      "review-heavy",
+      "delegate-only",
     ]);
     await act(async () => {
-      fireEvent.change(verification, { target: { value: "every-unit" } });
+      fireEvent.change(shape, { target: { value: "delegate-only" } });
     });
     await flush();
     expect(rpc.calls.filter((call) => call.method === "set_scope_setting").at(-1)?.input).toEqual({
       projectId: null,
-      key: "verification",
-      value: "every-unit",
+      key: "contractPreset",
+      value: "delegate-only",
     });
   });
 

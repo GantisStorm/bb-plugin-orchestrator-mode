@@ -39,9 +39,9 @@ export const DEFAULT_ENFORCEMENT: EnforcementLevel = "guard";
 export const ENFORCEMENT_DESCRIPTIONS: Record<EnforcementLevel, string> = {
   instruct: "Instruct writes the rules into every turn and checks nothing.",
   guard:
-    "Guard writes the rules and warns the orchestrator when it does work itself or leaves a worker unjudged.",
+    "Guard writes the rules and warns the orchestrator when it does the work itself or leaves a worker unjudged.",
   block:
-    "Block writes the rules too and stops the turn as soon as the orchestrator does work itself, though a fast write can still land first.",
+    "Block writes the rules too, and stops the turn as soon as the orchestrator does the work itself. A fast write can still land first.",
 };
 
 /** One runtime check for every `as const` union this module declares. */
@@ -1195,40 +1195,26 @@ export function classifyRow(
 // ---------------------------------------------------------------------------
 
 /**
- * Who is expected to find things out before work is delegated. Each mode is one
- * of the contract's own sentences, so a row picking one names the rule the agent
- * will actually be given; `as-is` adds nothing and leaves it to the orchestrator.
+ * The three contract shapes. Each changes what a session does with its own hands:
+ * `standard` delegates and checks a unit only when a report cannot settle it,
+ * `review-heavy` puts an independent check unit in front of every unit, and
+ * `delegate-only` hands the reading over too and runs no shell commands at all.
  */
-export const RESEARCH_MODES = ["as-is", "read-first", "delegated"] as const;
-export type ResearchMode = (typeof RESEARCH_MODES)[number];
+export const CONTRACT_PRESETS = ["standard", "review-heavy", "delegate-only"] as const;
+export type ContractPresetId = (typeof CONTRACT_PRESETS)[number];
 
 /**
- * How much verification a unit needs before it is trusted. `when-needed` asks for a
- * verdict on every worker and a check unit where the report cannot settle it;
- * `every-unit` puts a check unit in front of every unit.
+ * One line per level, so the settings row explains every level rather than only the
+ * one in force. Each opens with the preset's own name, which is the convention the
+ * row relies on to emphasise it.
  */
-export const VERIFICATION_MODES = ["when-needed", "every-unit"] as const;
-export type VerificationMode = (typeof VERIFICATION_MODES)[number];
-
-/**
- * One line per mode, so a settings row explains every choice rather than only the
- * one in force. Each opens with the mode's own name, which is the convention the
- * rows rely on to emphasise it.
- */
-export const RESEARCH_DESCRIPTIONS: Record<ResearchMode, string> = {
-  "as-is":
-    "As-is says nothing about research, so the orchestrator reads or delegates as the unit needs.",
-  "read-first":
-    "Read-first asks for enough reading to write a brief that stands alone before anything is handed over.",
-  delegated:
-    "Delegated makes finding things out a unit of work: the question goes to a worker, and the orchestrator runs no shell commands at all.",
-};
-
-export const VERIFICATION_DESCRIPTIONS: Record<VerificationMode, string> = {
-  "when-needed":
-    "When-needed records a verdict on every worker, and adds a check unit only where the report cannot settle the unit.",
-  "every-unit":
-    "Every-unit puts an independent check unit in front of every unit before it is trusted, and records a verdict on each.",
+export const CONTRACT_PRESET_DESCRIPTIONS: Record<ContractPresetId, string> = {
+  standard:
+    "Standard delegates the work, reviews what comes back, and checks a unit only when a report cannot settle it.",
+  "review-heavy":
+    "Review-heavy puts an independent check unit in front of every unit. Each one runs what the unit claims, so it roughly doubles the work in flight.",
+  "delegate-only":
+    "Delegate-only hands the reading over too. The orchestrator runs no shell commands, and finding things out is a unit of work.",
 };
 
 /**
@@ -1256,10 +1242,8 @@ interface InstructionInput {
   workerConfig?: WorkerConfig;
   /** Project rules the user appended, emitted verbatim and last. */
   extra?: string;
-  /** Who finds things out before a delegation. Defaults to `as-is`. */
-  research?: ResearchMode;
-  /** How much verification a unit needs. Defaults to `when-needed`. */
-  verification?: VerificationMode;
+  /** Which level of contract to emit. Defaults to `standard`. */
+  preset?: ContractPresetId;
 }
 
 /**
@@ -1313,22 +1297,18 @@ export function buildInstructions(input: InstructionInput): string {
       ? ""
       : ` Saved worker kinds: ${savedKinds.join(", ")}; name one as \`preset\` for a unit of that kind.`;
 
-  const researchMode = input.research ?? "as-is";
-  const verification = input.verification ?? "when-needed";
-  // `delegated` takes the research out of the orchestrator's hands entirely, so
-  // the read-only allowance stops applying.
-  const readCommands = researchMode === "delegated" ? false : input.allowReadCommands;
+  const preset = input.preset ?? "standard";
+  // `delegate-only` takes the reading out of the orchestrator's hands entirely: the
+  // question goes to a worker, and the shell goes away with it.
   const research =
-    researchMode === "read-first"
-      ? "\n   Read enough of the repository first to write a brief that stands alone."
-      : researchMode === "delegated"
-        ? "\n   Even finding things out is a unit of work: hand a worker the question rather than searching yourself."
-        : "";
+    preset === "delegate-only"
+      ? "\n   Even finding things out is a unit of work. Hand a worker the question instead of searching yourself."
+      : "";
   const reviewStep =
-    verification === "every-unit"
+    preset === "review-heavy"
       ? `4. Every unit gets checked before you trust it: delegate it with \`verify: true\` so an
-   independent worker runs what the unit claims — the tests, the command, the paths
-   — and reports its raw output, then record a verdict for that unit with the
+   independent worker runs what the unit claims (the tests, the command, the paths)
+   and reports its raw output, then record a verdict for that unit with the
    \`${REVIEW_TOOL}\` tool. If the check fails, re-delegate the unit. Never patch it
    yourself.`
       : `4. Review what comes back, and record a verdict for every worker with the
@@ -1337,7 +1317,7 @@ export function buildInstructions(input: InstructionInput): string {
    check unit. If a result is wrong or incomplete, send a follow-up to a
    worker. Never patch it yourself.`;
 
-  const commands = readCommands
+  const commands = input.allowReadCommands && preset !== "delegate-only"
     ? "Read-only shell commands (`ls`, `cat`, `rg`, `git status`, `git diff`, `git log`, `find`, `wc`) are allowed so you can orient yourself. Anything that writes, builds, installs, commits or otherwise changes state is not."
     : "Do not run shell commands at all. Reading files and searching is enough to orient yourself.";
 

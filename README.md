@@ -300,18 +300,16 @@ is the part that says what to do when delegation is impossible. The cap is
 measured, not guessed: the budget test builds the largest contract every preset
 can produce with an append at the cap and asserts it fits.
 
-**Two settings pick what the contract says** beyond enforcement:
+**Contract level** picks what a session does itself, and how much it checks:
 
-| Setting | Value | What it changes |
-| --- | --- | --- |
-| Research | `as-is` (default) | Says nothing about research: the orchestrator reads or delegates as the unit needs. |
-| | `read-first` | Asks for enough reading to write a brief that stands alone before anything is handed over. |
-| | `delegated` | Makes finding things out a unit of work — the question goes to a worker — and withdraws the shell entirely, whatever the read-only allowance says. |
-| Verification | `when-needed` (default) | Records a verdict on every worker, and adds a check unit only where a report cannot settle a unit. |
-| | `every-unit` | Puts a check unit in front of every unit before it is trusted, and records a verdict on each. A check unit counts against `maxParallelWorkers`, so this roughly doubles the workers a task needs. |
+| Level | What a session does |
+| --- | --- |
+| `standard` (default) | Delegates the work, records a verdict on every worker, and adds a check unit only where a report cannot settle a unit. |
+| `review-heavy` | Puts an independent check unit in front of every unit. Each one runs what the unit claims, and counts against `maxParallelWorkers`, so this roughly doubles the work in flight. |
+| `delegate-only` | Hands the reading over too: no shell commands at all, and finding things out is a unit of work. |
 
-The check unit is adversarial, not a reread: it runs what the unit claims — the
-tests, the command, the paths — pastes the raw output, and reports `VERDICT: pass`
+The check unit is adversarial, not a reread: it runs what the unit claims (the
+tests, the command, the paths), pastes the raw output, and reports `VERDICT: pass`
 or `VERDICT: fail`.
 
 ## Enforcement limits
@@ -355,7 +353,7 @@ bb orchestrator-mode off
 | `status [--thread <id>] [--json]` | Show mode, enforcement, violations, nudges and delegations. |
 | `on [--thread <id>] [--enforcement instruct\|guard\|block] [--json]` | Enable the thread, with an optional enforcement override. |
 | `off [--thread <id>] [--json]` | Disable the thread and clear its enforcement override. |
-| `scope [--global \| --project <id>] [--enforcement <level>] [--read-commands on\|off] [--max-nudges <n>] [--max-parallel <n>] [--max-per-turn <n>] [--research <as-is\|read-first\|delegated>] [--verification <when-needed\|every-unit>] [--retention <policy>] [--worker-provider <id>] [--worker-model <id>] [--clear-worker] [--rules <text>] [--clear-rules] [--inherit <key>] [--inherit-all] [--json]` | With `--global`, read or write the record every project inherits (settings only; the worker execution and rules have their own commands). With `--project`, read or write that project's overrides: settings, worker execution and appended rules. Without either, list every project that has any. |
+| `scope [--global \| --project <id>] [--enforcement <level>] [--read-commands on\|off] [--max-nudges <n>] [--max-parallel <n>] [--max-per-turn <n>] [--contract-preset <standard\|review-heavy\|delegate-only>] [--retention <policy>] [--worker-provider <id>] [--worker-model <id>] [--clear-worker] [--rules <text>] [--clear-rules] [--inherit <key>] [--inherit-all] [--json]` | With `--global`, read or write the record every project inherits (settings only; the worker execution and rules have their own commands). With `--project`, read or write that project's overrides: settings, worker execution and appended rules. Without either, list every project that has any. |
 | `contract [--thread <id>] [--rules <text>] [--clear-rules] [--json]` | Print the exact instructions this thread receives, or set and clear the project rules appended to them. |
 | `violations [--thread <id>] [--clear] [--json]` | List violations, or clear them and reset correction counters. |
 | `default [on\|off] [--json]` | Show or set the default for new threads. |
@@ -400,7 +398,7 @@ A project that overrides nothing inherits everything, so an install that never
 touches the selector behaves exactly as it did before. The selector lists Global
 plus every project; the rows below it show each field's effective value, whether
 it is overridden, and the Inherit action that hands it back. `defaultForNewThreads`
-stays global on purpose — it is a composer default rather than thread behaviour,
+stays global on purpose: it is a composer default rather than thread behaviour,
 and its row appears only in Global scope. `defaultEnabledAtMs` is bookkeeping for it.
 
 ```sh
@@ -408,7 +406,7 @@ bb orchestrator-mode scope                                     # every project t
 bb orchestrator-mode scope --global --max-parallel 2           # the record every project inherits
 bb orchestrator-mode scope --global --read-commands off        # ...for read-only shell commands
 bb orchestrator-mode scope --project <id> --max-parallel 2     # cap fan-out for one project
-bb orchestrator-mode scope --project <id> --research read-first --verification every-unit --rules "Never touch generated/."
+bb orchestrator-mode scope --project <id> --contract-preset delegate-only --rules "Never touch generated/."
 bb orchestrator-mode scope --project <id> --inherit maxNudges  # one field back to the global value
 bb orchestrator-mode scope --project <id> --inherit-all        # this project inherits everything again
 ```
@@ -437,8 +435,7 @@ CLI, and the composer toggles.
 | `enforcement` | `guard` | `instruct`: contract only. `guard`: record and correct. `block`: also stop. A thread override takes precedence. |
 | `allowReadCommands` | `true` | Treat recognised read-only shell commands as exploration; when off, all commands count as work. |
 | `maxNudges` | `3` | Corrective messages per enablement, for direct work and for unjudged workers. It is one budget shared by both gates, whichever spends it first, and `bb orchestrator-mode status` reports the split; non-negative numbers are rounded down. `0` disables nudges. Recording and `block` stops continue after the cap. |
-| `research` | `as-is` | Who finds things out: `as-is`, `read-first` or `delegated` (see [The contract](#the-contract)). |
-| `verification` | `when-needed` | How hard the review is: `when-needed` or `every-unit`. |
+| `contractPreset` | `standard` | Which [contract level](#the-contract) a session receives. |
 | `workerRetention` | `keep` | What happens to a worker once its result has been read: keep it, archive check units, or archive every read worker. |
 | `maxParallelWorkers` | `6` | Refuse a delegation while this many workers are running. `0` removes the cap. |
 | `maxDelegationsPerTurn` | `20` | Refuse a delegation once a turn has delegated this many. `0` removes the cap. |
