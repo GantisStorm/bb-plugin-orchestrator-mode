@@ -67,7 +67,7 @@ your environment and use ordinary provider resources.
 `--clear`), `default`, `worker` and `contract`. Thread commands accept
 `--thread`; every command supports `--json`. Settings control the new-thread
 default, enforcement, read-only command handling, the corrective-message cap,
-research, verification, worker retention and the two fan-out caps. The worker
+the contract level, worker retention and the two fan-out caps. The worker
 execution and its presets are stored by the plugin and edited in Settings or
 with `bb orchestrator-mode worker`; `contract` prints the exact instructions a
 thread receives.

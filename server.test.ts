@@ -1741,12 +1741,12 @@ describe("the delegation tool", () => {
   });
 
   it("emits the contract the two settings name", async () => {
-    const { harness } = await load({ research: "read-first", verification: "every-unit" });
+    const { harness } = await load({ contractPreset: "review-heavy" });
     const contract = (await harness.behavior.callRpc("get_contract", { threadId: null })) as {
       text: string;
     };
     expect(contract.text).toContain("Every unit gets checked before you trust it");
-    expect(contract.text).toContain("Read enough of the repository first to write a brief that stands alone.");
+    expect(contract.text).toContain("runs what the unit claims");
     expect(contract.text).not.toContain("Pass `verify: true` when you delegate a unit whose");
   });
 
@@ -1824,8 +1824,7 @@ describe("rpc", () => {
       maxNudges: 5,
       maxParallelWorkers: 6,
       maxDelegationsPerTurn: 20,
-      research: "as-is",
-      verification: "when-needed",
+      contractPreset: "standard",
       workerRetention: "keep",
     };
     expect(await harness.behavior.callRpc("get_scope_settings", { projectId: null })).toEqual({
@@ -2514,7 +2513,7 @@ describe("project scopes", () => {
     const { harness } = await load();
     await enable(harness, THREAD);
     await harness.behavior.runCli([
-      "scope", "--project", PROJECT, "--research", "read-first", "--verification", "every-unit",
+      "scope", "--project", PROJECT, "--contract-preset", "review-heavy",
       "--rules", "Never touch files under generated/.",
     ]);
     const scoped = await harness.behavior.resolveAgentConfiguration(
@@ -2561,7 +2560,7 @@ describe("project scopes", () => {
       "scope", "--global", "--read-commands", "off", "--max-parallel", "3",
     ]);
     expect(written.exitCode).toBe(0);
-    expect(written.stdout).toContain("global — what every project inherits");
+    expect(written.stdout).toContain("global: what every project inherits");
     expect(written.stdout).toContain("enforcement:          instruct");
     expect(written.stdout).toContain("read commands:        all commands are work");
     expect(written.stdout).toContain("fan-out cap:          3 in flight, 20 per turn");
@@ -2581,30 +2580,29 @@ describe("project scopes", () => {
     expect(both.stderr).toContain("--global");
   });
 
-  it("folds a stored contractPreset into the two settings that replaced it", async () => {
-    const { bb, harness } = await load({ contractPreset: "thorough" }, undefined, {}, {
-      project_settings: { [PROJECT]: { contractPreset: "delegate-only" } },
+  it("folds a retired contract shape into one of the three levels", async () => {
+    const { bb, harness } = await load({ contractPreset: "research-first" }, undefined, {}, {
+      // The two-knob shape, and the five-preset shape, in the same store.
+      project_settings: { [PROJECT]: { research: "delegated", verification: "every-unit" } },
     });
 
-    // Global: thorough was read-first + every-unit.
+    // Global: research-first was reading without the mandatory check, which is standard.
     expect(await harness.behavior.callRpc("get_scope_settings", { projectId: null })).toMatchObject({
-      values: { research: "read-first", verification: "every-unit" },
+      values: { contractPreset: "standard", allowReadCommands: true },
       overridden: [],
     });
-    // A project's override folds the same way, and counts as overriding both fields.
+    // A project's two-knob pair folds to the one level that covers it: delegated
+    // research is what `delegate-only` is, and the mandatory check is subsumed in a
+    // level that already takes the shell away.
     expect(await harness.behavior.callRpc("get_scope_settings", { projectId: PROJECT })).toMatchObject({
-      values: { research: "delegated", verification: "when-needed" },
-      overridden: ["research", "verification"],
+      values: { contractPreset: "delegate-only", allowReadCommands: true },
+      overridden: ["contractPreset"],
     });
 
-    // Written back once on load, so nothing reads the retired key from then on.
-    expect(await bb.storage.kv.get("settings")).toMatchObject({
-      research: "read-first",
-      verification: "every-unit",
-    });
-    expect(await bb.storage.kv.get("settings")).not.toHaveProperty("contractPreset");
+    // Written back once on load, so nothing reads the retired keys from then on.
+    expect(await bb.storage.kv.get("settings")).toMatchObject({ contractPreset: "standard" });
     expect(await bb.storage.kv.get("project_settings")).toEqual({
-      [PROJECT]: { research: "delegated", verification: "when-needed" },
+      [PROJECT]: { contractPreset: "delegate-only" },
     });
   });
 });

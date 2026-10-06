@@ -33,13 +33,11 @@ import {
 import { toast } from "sonner";
 import { WORKER_RETENTION, WORKER_RETENTION_DESCRIPTIONS, type ContractDto, type OrchestratorStateDto, type ScopeSettingsDto, type SettingsViewDto, type rpcContract } from "./server";
 import {
+  CONTRACT_PRESET_DESCRIPTIONS,
+  CONTRACT_PRESETS,
   ENFORCEMENT_DESCRIPTIONS,
   ENFORCEMENT_LEVELS,
   INSTRUCTION_LIMIT,
-  RESEARCH_DESCRIPTIONS,
-  RESEARCH_MODES,
-  VERIFICATION_DESCRIPTIONS,
-  VERIFICATION_MODES,
   type WorkerConfig,
   type WorkerExecution,
   type WorkerPresetName,
@@ -559,8 +557,8 @@ function ScopeSettings() {
           label="Scope"
           hint={
             scope === null
-              ? "Global: the values every project inherits."
-              : "This project's overrides. Anything it does not override comes from Global, and Inherit hands one back."
+              ? "The values every project inherits."
+              : "Only what this project changes. Anything else comes from Global; Inherit hands a field back."
           }
         >
           <select
@@ -588,7 +586,7 @@ function ScopeSettings() {
         {enumRow(
           "enforcement",
           "Enforcement",
-          "How hard the watchdog pushes back when the orchestrator does work itself.",
+          "How hard the watchdog pushes back when the orchestrator does the work itself.",
           ENFORCEMENT_LEVELS.map((level) => ({
             value: level,
             label: level,
@@ -598,59 +596,49 @@ function ScopeSettings() {
         {enumRow(
           "allowReadCommands",
           "Read-only commands",
-          "Whether looking around with the shell counts as work.",
+          "Whether a read counts as looking around, or as work.",
           [
             {
               value: "true",
               label: "allowed",
-              help: "Allowed treats ls, cat, rg, git status, git diff and similar as looking around rather than doing the work.",
+              help: "Allowed treats ls, cat, rg, git status and similar as looking around instead of work.",
             },
             {
               value: "false",
               label: "every command is work",
-              help: "Every command is work counts even a read as the orchestrator doing the work itself.",
+              help: "Every command is work counts a read as the orchestrator doing the work itself.",
             },
           ],
         )}
         {numberRow(
           "maxNudges",
           "Reminders per thread",
-          "How many times this plugin may prod one thread, for either reason: doing work itself, or leaving a worker unjudged. One budget shared by both gates, whichever spends it first, and `bb orchestrator-mode status` reports the split. 0 turns reminders off; violations keep being recorded.",
+          "How many times this plugin may prod one thread. One budget covers both gates: doing the work itself, and leaving a worker unjudged. `bb orchestrator-mode status` reports the split. 0 turns reminders off, and violations are still recorded.",
         )}
         {numberRow(
           "maxParallelWorkers",
           "Workers running at once",
-          "Once this many workers are running, further delegations are refused and told why. Check units and fallbacks count too. 0 removes the cap.",
+          "Further delegations are refused once this many workers are running. Check units and fallbacks count. 0 removes the cap.",
         )}
         {numberRow(
           "maxDelegationsPerTurn",
           "Workers per turn",
-          "A delegation is refused once one turn has delegated this many, so a runaway fan-out stops instead of filling the sidebar. Check units and fallback retries are the plugin's own doing and do not count. 0 removes the cap.",
+          "A turn stops delegating at this many, so a fan-out cannot fill the sidebar. Check units and fallback retries are this plugin's own doing and do not count. 0 removes the cap.",
         )}
         {enumRow(
-          "research",
-          "Who finds things out",
-          "What the orchestrator is told about research, before it hands a unit over.",
-          RESEARCH_MODES.map((mode) => ({
-            value: mode,
-            label: mode,
-            help: RESEARCH_DESCRIPTIONS[mode],
-          })),
-        )}
-        {enumRow(
-          "verification",
-          "How hard the review is",
-          "What has to be true before a unit counts as done. Every-unit doubles the workers a task needs, and check units count against the parallel cap above.",
-          VERIFICATION_MODES.map((mode) => ({
-            value: mode,
-            label: mode,
-            help: VERIFICATION_DESCRIPTIONS[mode],
+          "contractPreset",
+          "What the orchestrator is told",
+          "What a session does itself, and how much it checks.",
+          CONTRACT_PRESETS.map((preset) => ({
+            value: preset,
+            label: preset,
+            help: CONTRACT_PRESET_DESCRIPTIONS[preset],
           })),
         )}
         {enumRow(
           "workerRetention",
           "Workers afterwards",
-          "What happens to a worker once its result has been read. Archiving hides a thread from the sidebar, but it stays recoverable.",
+          "What happens to a worker once its result has been read. Archiving hides it from the sidebar; it stays recoverable.",
           WORKER_RETENTION.map((policy) => ({
             value: policy,
             label: policy,
@@ -662,16 +650,16 @@ function ScopeSettings() {
             label="Start new threads as orchestrators"
             hint={
               <>
-                A composer default, the same for every project; threads already open, child workers and
-                side chats are never affected.
+                One plugin-wide default. Threads already open, child workers and side chats are not
+                affected.
                 <OptionHelp>
                   <OptionLine
                     label="On"
-                    help="starts the threads you create from the composer in orchestrator mode."
+                    help="starts threads you create from the composer in orchestrator mode."
                   />
                   <OptionLine
                     label="Off"
-                    help="starts new threads as ordinary threads; you can still switch any thread on yourself."
+                    help="leaves new threads ordinary; you can still switch any thread on yourself."
                   />
                 </OptionHelp>
               </>
@@ -706,7 +694,7 @@ function ScopeSettings() {
           <div className="text-sm font-medium">Which provider and model workers use</div>
           <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
             {execution === null
-              ? "Workers use this project's remembered provider and model."
+              ? "Workers use the project's remembered provider and model."
               : "Every worker starts on the provider and model below."}
           </p>
         </div>
@@ -825,9 +813,9 @@ function ScopeSettings() {
       <div className="mt-3 border-t border-border/60 pt-3">
         <div className="text-sm font-medium">Presets</div>
         <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
-          Save a model and an access level for each kind of work. When the orchestrator hands
-          a unit to a worker it can name the kind, and that unit runs on what you saved here
-          instead of the default above. A kind left off uses the default.
+          Save a model and an access level per kind of work. A delegation can name a kind, and
+          that unit runs on what you saved here instead of the default above. A kind left off
+          uses the default.
         </p>
         <div className="mt-2 flex flex-col gap-2">
           {PRESET_ROWS.map(({ name, label, hint }) => {
@@ -909,8 +897,8 @@ function ScopeSettings() {
         <div className="text-sm font-medium">Extra rules</div>
         <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
           {scope === null
-            ? "Added to the contract as its own section, so a rule adds to what the orchestrator is told instead of replacing the rules the watchdog enforces."
-            : "Added to the contract the same way. A project with rules of its own uses them in place of the global ones."}
+            ? "Appended to the contract as its own section. A rule adds to what the orchestrator is told; it does not replace what the watchdog enforces."
+            : "Appended the same way. A project with rules of its own uses them in place of the global ones."}
         </p>
         <textarea
           value={draft ?? contract?.extra ?? ""}
@@ -983,12 +971,20 @@ function SettingRow({
 }
 
 /**
- * What every choice of one setting does, one line each. A `select` cannot explain
- * the options it is not on, and "which of these do I want" is decided by exactly
- * that, so the row carries the list.
+ * What every choice of one setting does, folded away. A row should read at a
+ * glance, and the list is reference material for the moment you actually have to
+ * pick: a `select` cannot explain the options it is not on, so the answer lives
+ * one click under the row instead of in the label column.
  */
 function OptionHelp({ children }: { children: ReactNode }) {
-  return <ul className="mt-1.5 flex flex-col gap-0.5">{children}</ul>;
+  return (
+    <details className="mt-1">
+      <summary className="w-fit cursor-pointer text-xs text-subtle-foreground/75 underline decoration-dotted underline-offset-2 hover:text-foreground">
+        What each option does
+      </summary>
+      <ul className="mt-1 flex flex-col gap-0.5">{children}</ul>
+    </details>
+  );
 }
 
 /**
@@ -1042,7 +1038,7 @@ export default definePluginApp((app) => {
     id: "scope",
     title: "Settings",
     description:
-      "Pick a scope with the selector: Global edits the values every project inherits, a project edits only what it changes. The plugin renders this itself, because BB's settings form holds one value per install and these resolve per project.",
+      "Pick a scope, then edit what it runs with. Global is what every project inherits; a project stores only what it changes. The plugin renders this section itself, since BB's settings form holds one value per install and these resolve per project.",
     component: ScopeSettings,
   });
 
