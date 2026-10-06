@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_ENFORCEMENT,
-  CONTRACT_PRESETS,
   EXTRA_INSTRUCTION_LIMIT,
   INSTRUCTION_LIMIT,
+  RESEARCH_MODES,
+  VERIFICATION_MODES,
   buildInstructions,
   buildNudge,
   classifyRow,
@@ -13,6 +14,8 @@ import {
   readMirror,
   writeMirror,
   type EnforcementLevel,
+  type ResearchMode,
+  type VerificationMode,
 } from "./shared";
 
 /** A minimal timeline work row, plus the id the classifier dedupes on. */
@@ -567,7 +570,8 @@ describe("the contract", () => {
   it("fits the 4096-character configure() budget in every mode", () => {
     for (const enforcement of levels) {
       for (const allowReadCommands of [true, false]) {
-       for (const preset of CONTRACT_PRESETS) {
+       for (const research of RESEARCH_MODES) {
+        for (const verification of VERIFICATION_MODES) {
         const text = buildInstructions({
           enforcement,
           allowReadCommands,
@@ -586,49 +590,57 @@ describe("the contract", () => {
             },
           },
           extra: "x".repeat(EXTRA_INSTRUCTION_LIMIT),
-          preset,
+          research,
+          verification,
         });
         expect(text.length).toBeLessThanOrEqual(INSTRUCTION_LIMIT);
         // The clamp exists so the tail — what to do when delegation is impossible —
         // is never the part BB silently cuts.
         expect(text).toContain("If you cannot delegate");
+        }
        }
       }
     }
   });
 
-  it("thorough composes research-first and review-heavy without losing the command allowance", () => {
-    const thorough = buildInstructions({ enforcement: "guard", allowReadCommands: true, preset: "thorough" });
-    const research = buildInstructions({ enforcement: "guard", allowReadCommands: true, preset: "research-first" });
-    const review = buildInstructions({ enforcement: "guard", allowReadCommands: true, preset: "review-heavy" });
-    const standard = buildInstructions({ enforcement: "guard", allowReadCommands: true, preset: "standard" });
-
-    // The research line: present in research-first, so also in thorough.
-    const researchLine = "Read enough of the repository first to write a brief that stands alone.";
-    expect(research).toContain(researchLine);
-    expect(thorough).toContain(researchLine);
-    expect(standard).not.toContain(researchLine);
-
-    // The strict review step: present in review-heavy, so also in thorough.
+  it("composes the two knobs independently, and only delegated research withdraws the command allowance", () => {
+    const readFirst =
+      "Read enough of the repository first to write a brief that stands alone.";
+    const delegated = "Even finding things out is a unit of work";
     const strictStep = "Every unit gets checked before you trust it";
-    expect(review).toContain(strictStep);
-    expect(thorough).toContain(strictStep);
-    expect(standard).not.toContain(strictStep);
+    const onDemandStep = "Pass `verify: true` when you delegate a unit";
 
-    // thorough is a composition, not a stricter delegate-only: the read-only
-    // allowance still applies, and only delegate-only withdraws it.
-    expect(thorough).toContain("Read-only shell commands");
-    expect(buildInstructions({ enforcement: "guard", allowReadCommands: true, preset: "delegate-only" }))
-      .toContain("Do not run shell commands at all");
-    expect(buildInstructions({ enforcement: "guard", allowReadCommands: false, preset: "thorough" }))
-      .toContain("Do not run shell commands at all");
+    const contract = (research: ResearchMode, verification: VerificationMode, allowReadCommands = true) =>
+      buildInstructions({ enforcement: "guard", allowReadCommands, research, verification });
+
+    // Every cell of the grid is reachable and says exactly what it should.
+    const baseline = contract("as-is", "when-needed");
+    expect(baseline).not.toContain(readFirst);
+    expect(baseline).not.toContain(strictStep);
+    expect(baseline).toContain(onDemandStep);
+
+    expect(contract("read-first", "when-needed")).toContain(readFirst);
+    expect(contract("as-is", "every-unit")).toContain(strictStep);
+    const both = contract("read-first", "every-unit");
+    expect(both).toContain(readFirst);
+    expect(both).toContain(strictStep);
+    expect(both).not.toContain(onDemandStep);
+
+    // Delegated research is the one mode that takes the shell away, whatever the
+    // read-only allowance says; every other mode honours the allowance.
+    expect(contract("delegated", "when-needed")).toContain(delegated);
+    expect(contract("delegated", "when-needed")).toContain("Do not run shell commands at all");
+    expect(contract("delegated", "every-unit")).toContain("Do not run shell commands at all");
+    expect(contract("read-first", "every-unit")).toContain("Read-only shell commands");
+    expect(contract("read-first", "every-unit", false)).toContain("Do not run shell commands at all");
   });
 
   it("names the saved worker kinds, and stays silent when none are stored", () => {
     const withPresets = buildInstructions({
       enforcement: "guard",
       allowReadCommands: true,
-      preset: "thorough",
+      research: "read-first",
+      verification: "every-unit",
       workerConfig: {
         presets: {
           research: { reasoningLevel: "high" },
@@ -642,7 +654,7 @@ describe("the contract", () => {
     expect(withPresets.indexOf("build")).toBeLessThan(withPresets.indexOf("research"));
 
     // Nothing saved means nothing advertised: the contract never invents a knob.
-    const without = buildInstructions({ enforcement: "guard", allowReadCommands: true, preset: "thorough" });
+    const without = buildInstructions({ enforcement: "guard", allowReadCommands: true, research: "read-first", verification: "every-unit" });
     expect(without).not.toContain("Saved worker kinds");
     expect(without).not.toContain("`preset`");
   });

@@ -1195,37 +1195,40 @@ export function classifyRow(
 // ---------------------------------------------------------------------------
 
 /**
- * The shapes of contract this plugin can inject. A preset swaps sections rather
- * than appending to them, so the whole block stays inside `configure`'s
- * 4096-character ceiling whatever the settings say. `thorough` is the one
- * composition: the research line of `research-first` with the strict review step
- * of `review-heavy`, which is the shape for work whose result is expensive to
- * get wrong.
+ * Who is expected to find things out before work is delegated. Each mode is one
+ * of the contract's own sentences, so a row picking one names the rule the agent
+ * will actually be given; `as-is` adds nothing and leaves it to the orchestrator.
  */
-export const CONTRACT_PRESETS = [
-  "standard",
-  "delegate-only",
-  "research-first",
-  "review-heavy",
-  "thorough",
-] as const;
-export type ContractPresetId = (typeof CONTRACT_PRESETS)[number];
+export const RESEARCH_MODES = ["as-is", "read-first", "delegated"] as const;
+export type ResearchMode = (typeof RESEARCH_MODES)[number];
 
 /**
- * One line per preset, so the settings row can explain every shape rather than
- * only the one in force. Wording is the same as the contract's own, shortened to
- * one sentence each.
+ * How much verification a unit needs before it is trusted. `when-needed` asks for a
+ * verdict on every worker and a check unit where the report cannot settle it;
+ * `every-unit` puts a check unit in front of every unit.
  */
-export const CONTRACT_PRESET_DESCRIPTIONS: Record<ContractPresetId, string> = {
-  standard: "Standard delegates the work and reviews what comes back.",
-  "delegate-only":
-    "Delegate-only hands research over as well, so the orchestrator may not run commands at all.",
-  "research-first":
-    "Research-first asks for enough reading to write a brief that stands alone.",
-  "review-heavy":
-    "Review-heavy gives every unit an independent check unit before it is accepted.",
-  thorough:
-    "Thorough is both: enough reading to brief well, and a check unit for every unit.",
+export const VERIFICATION_MODES = ["when-needed", "every-unit"] as const;
+export type VerificationMode = (typeof VERIFICATION_MODES)[number];
+
+/**
+ * One line per mode, so a settings row explains every choice rather than only the
+ * one in force. Each opens with the mode's own name, which is the convention the
+ * rows rely on to emphasise it.
+ */
+export const RESEARCH_DESCRIPTIONS: Record<ResearchMode, string> = {
+  "as-is":
+    "As-is says nothing about research, so the orchestrator reads or delegates as the unit needs.",
+  "read-first":
+    "Read-first asks for enough reading to write a brief that stands alone before anything is handed over.",
+  delegated:
+    "Delegated makes finding things out a unit of work: the question goes to a worker, and the orchestrator runs no shell commands at all.",
+};
+
+export const VERIFICATION_DESCRIPTIONS: Record<VerificationMode, string> = {
+  "when-needed":
+    "When-needed records a verdict on every worker, and adds a check unit only where the report cannot settle the unit.",
+  "every-unit":
+    "Every-unit puts an independent check unit in front of every unit before it is trusted, and records a verdict on each.",
 };
 
 /**
@@ -1253,8 +1256,10 @@ interface InstructionInput {
   workerConfig?: WorkerConfig;
   /** Project rules the user appended, emitted verbatim and last. */
   extra?: string;
-  /** Which shape of contract to emit. Defaults to `standard`. */
-  preset?: ContractPresetId;
+  /** Who finds things out before a delegation. Defaults to `as-is`. */
+  research?: ResearchMode;
+  /** How much verification a unit needs. Defaults to `when-needed`. */
+  verification?: VerificationMode;
 }
 
 /**
@@ -1308,22 +1313,24 @@ export function buildInstructions(input: InstructionInput): string {
       ? ""
       : ` Saved worker kinds: ${savedKinds.join(", ")}; name one as \`preset\` for a unit of that kind.`;
 
-  const preset = input.preset ?? "standard";
-  // `delegate-only` takes the research out of the orchestrator's hands
-  // entirely, so the read-only allowance stops applying.
-  const readCommands = preset === "delegate-only" ? false : input.allowReadCommands;
+  const researchMode = input.research ?? "as-is";
+  const verification = input.verification ?? "when-needed";
+  // `delegated` takes the research out of the orchestrator's hands entirely, so
+  // the read-only allowance stops applying.
+  const readCommands = researchMode === "delegated" ? false : input.allowReadCommands;
   const research =
-    preset === "research-first" || preset === "thorough"
+    researchMode === "read-first"
       ? "\n   Read enough of the repository first to write a brief that stands alone."
-      : preset === "delegate-only"
+      : researchMode === "delegated"
         ? "\n   Even finding things out is a unit of work: hand a worker the question rather than searching yourself."
         : "";
   const reviewStep =
-    preset === "review-heavy" || preset === "thorough"
+    verification === "every-unit"
       ? `4. Every unit gets checked before you trust it: delegate it with \`verify: true\` so an
-   independent worker inspects the result, then record a verdict for that unit
-   with the \`${REVIEW_TOOL}\` tool. If the check fails, re-delegate the unit. Never
-   patch it yourself.`
+   independent worker runs what the unit claims — the tests, the command, the paths
+   — and reports its raw output, then record a verdict for that unit with the
+   \`${REVIEW_TOOL}\` tool. If the check fails, re-delegate the unit. Never patch it
+   yourself.`
       : `4. Review what comes back, and record a verdict for every worker with the
    \`${REVIEW_TOOL}\` tool. Pass \`verify: true\` when you delegate a unit whose
    result you cannot judge from its report alone: that adds an independent
@@ -1450,16 +1457,19 @@ ${claimed}
 
 ## What to do
 
-Verify the work against the brief by inspecting the repository itself. Look at
-the files it claims to have touched, whether they exist, and whether they do
-what the brief asked. Do not trust the report alone, and do not fix anything: an
-unverified claim and a missing change are both findings.
+Verify the work against the brief by going after it, not by reading the report:
+run the tests, the command or the steps the brief names, look at the files it
+claims to have touched, and try to find the case it gets wrong. Do not trust the
+report alone, and do not fix anything: an unverified claim and a missing change
+are both findings.
 
 Report, in this order:
 
-1. What you actually inspected (paths, commands).
+1. What you actually ran and inspected (exact commands and paths, with their raw
+   output — paste it, do not summarise it).
 2. What is correct.
-3. What is wrong, missing or unverified, each with the evidence.
+3. What is wrong, missing or unverified, each with the evidence, and what you
+   tried that did not falsify the claim.
 4. A final line: \`VERDICT: pass\` or \`VERDICT: fail\`, then one sentence of
    reasoning.
 
