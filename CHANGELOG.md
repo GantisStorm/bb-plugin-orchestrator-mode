@@ -32,6 +32,25 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ### Added
 
+- **Mixed checkouts.** `workerWorkspace` gained `mixed`: the orchestrator decides
+  per delegation, every call must name `workspace: "shared"` or
+  `workspace: "worktree"`, and the contract says to give a worktree to a unit that
+  would touch files another unit is touching. An unnamed choice is refused with
+  both options spelled out, since a silent default would make mixed behave like
+  shared.
+
+- **Worktrees for delegated units.** A scope's `workerWorkspace` (`shared`
+  by default, `worktree` per delegation) decides where a unit runs. A worktree
+  delegation gets its own git worktree and branch, created by BB from the project's
+  default branch on the orchestrator's own machine; its check unit and any fallback
+  retry reuse that environment, so all three work in one checkout. The result names
+  the branch and the environment id (`bb environment diff <id>` shows the change),
+  and nothing lands in the main checkout until it is merged. Worktrees only hold
+  tracked files, so a repo needs a committed `.bb-env-setup.sh` before a check unit
+  can run its tests. The contract says how a worktree lands: the orchestrator
+  cannot merge by hand without the watchdog counting it as work, so it delegates a
+  merge unit with `workspace: "shared"` or names the branch for the user.
+
 - Per-project configuration. The plugin settings, the worker execution, the execution
   presets and the appended rules now resolve thread → project → global → built-in
   default, and **Settings → Installed plugins → Orchestrator Mode** gains a scope
@@ -42,7 +61,7 @@ All notable changes to Orchestrator Mode are documented here. The format follows
   surprising cap or contract is traceable to the layer that set it. `defaultForNewThreads`
   stays global: it is a composer default, not thread behaviour.
 
-- The contract shape is three levels instead of five presets: `standard` (delegate and review, with a check unit only where a report cannot settle a unit), `review-heavy` (an independent check unit in front of every unit) and `delegate-only` (no shell commands at all, reading handed to workers). Each level changes what a session does with its own hands rather than reword one sentence. Every retired shape folds into a level where a record is read, globals and project overrides alike: `research-first` and `thorough` fold to `standard` and `review-heavy` (reading alone was never a level), and a stored `research: "delegated"` folds to `delegate-only`.
+- The contract shape is three levels instead of five presets: `standard` (delegate and review, with a check unit only where a report cannot settle a unit), `review-heavy` (an independent check unit in front of every unit) and `delegate-only` (no shell commands at all, reading handed to workers). Each level changes what a session does with its own hands rather than reword one sentence. A key an earlier build of this branch wrote is ignored, and a stored `contractPreset` that is not one of the three levels resolves to `standard`.
 - The contract names the worker execution presets you have actually stored (`Saved worker
   kinds: build, review; name one as \`preset\` for a unit of that kind.`), and says nothing when
   none are, so the pre-delegation override the tool already accepted is discoverable from the

@@ -406,7 +406,7 @@ describe("direct-work classification", () => {
     expect(text.length).toBeLessThanOrEqual(INSTRUCTION_LIMIT);
     // The tail is what BB would cut, so the contract has to survive whole.
     expect(text).toContain("## If you cannot delegate");
-    expect(text).toContain("Do not disable or argue with");
+    expect(text).toContain("Do not argue with the mode");
   });
 
   it("flags Git commands that mutate branches, tags or remotes", () => {
@@ -566,9 +566,13 @@ describe("the contract", () => {
   const levels: EnforcementLevel[] = ["instruct", "guard", "block"];
 
   it("fits the 4096-character configure() budget in every mode", () => {
+    // A distinctive marker, so "the append survived" is checkable and not just "the
+    // text is short enough".
+    const appended = `RULES:${"x".repeat(EXTRA_INSTRUCTION_LIMIT - 6)}`;
     for (const enforcement of levels) {
       for (const allowReadCommands of [true, false]) {
        for (const preset of CONTRACT_PRESETS) {
+        for (const workspace of ["shared", "worktree", "mixed"] as const) {
         const text = buildInstructions({
           enforcement,
           allowReadCommands,
@@ -586,13 +590,19 @@ describe("the contract", () => {
               research: { reasoningLevel: "high" },
             },
           },
-          extra: "x".repeat(EXTRA_INSTRUCTION_LIMIT),
+          extra: appended,
           preset,
+          workspace,
         });
         expect(text.length).toBeLessThanOrEqual(INSTRUCTION_LIMIT);
         // The clamp exists so the tail — what to do when delegation is impossible —
         // is never the part BB silently cuts.
         expect(text).toContain("If you cannot delegate");
+        // An append at the cap survives whole: the clamp is the last resort, not
+        // the mechanism that makes room. Growing the contract means trimming it,
+        // and this is the assertion that says so.
+        expect(text).toContain(appended);
+        }
        }
       }
     }
@@ -600,7 +610,7 @@ describe("the contract", () => {
 
   it("gives each level one idea: the check unit, or the shell", () => {
     const strictStep = "Every unit gets checked before you trust it";
-    const onDemandStep = "Pass `verify: true` when you delegate a unit";
+    const onDemandStep = "`verify: true` for a unit whose result you cannot judge";
     const delegated = "Even finding things out is a unit of work";
     const contract = (preset: ContractPresetId, allowReadCommands = true) =>
       buildInstructions({ enforcement: "guard", allowReadCommands, preset });
@@ -615,7 +625,7 @@ describe("the contract", () => {
     // than rereading it. Nothing else changes.
     const reviewHeavy = contract("review-heavy");
     expect(reviewHeavy).toContain(strictStep);
-    expect(reviewHeavy).toContain("runs what the unit claims");
+    expect(reviewHeavy).toContain("runs what it claims");
     expect(reviewHeavy).not.toContain(onDemandStep);
     expect(reviewHeavy).not.toContain(delegated);
     expect(reviewHeavy).toContain("Read-only shell commands");

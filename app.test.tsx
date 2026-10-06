@@ -2,7 +2,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { act, cleanup, fireEvent, within } from "@testing-library/react";
 import { loadPluginApp, renderSlot, type RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
-import type { rpcContract } from "./server";
 import type { EnforcementLevel, Violation, WorkerConfig } from "./shared";
 
 const app = await loadPluginApp(() => import("./app"));
@@ -320,6 +319,7 @@ describe("the settings section", () => {
       maxDelegationsPerTurn: 20,
       contractPreset: "standard",
       workerRetention: "keep",
+      workerWorkspace: "shared",
     };
     const projectWorker: Record<string, WorkerConfig> = {};
     const projectRules: Record<string, string> = {};

@@ -31,7 +31,7 @@ import {
   type PluginComposerScope,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
-import { WORKER_RETENTION, WORKER_RETENTION_DESCRIPTIONS, type ContractDto, type OrchestratorStateDto, type ScopeSettingsDto, type SettingsViewDto, type rpcContract } from "./server";
+import { WORKER_RETENTION, WORKER_RETENTION_DESCRIPTIONS, WORKER_WORKSPACE_DESCRIPTIONS, WORKER_WORKSPACES, type ContractDto, type OrchestratorStateDto, type ScopeSettingsDto, type SettingsViewDto, type rpcContract } from "./server";
 import {
   CONTRACT_PRESET_DESCRIPTIONS,
   CONTRACT_PRESETS,
@@ -633,6 +633,16 @@ function ScopeSettings() {
             value: preset,
             label: preset,
             help: CONTRACT_PRESET_DESCRIPTIONS[preset],
+          })),
+        )}
+        {enumRow(
+          "workerWorkspace",
+          "Where workers run",
+          "Shared keeps every worker in the checkout you are in, worktree gives each unit its own copy, and mixed lets the orchestrator name one per unit.",
+          WORKER_WORKSPACES.map((mode) => ({
+            value: mode,
+            label: mode,
+            help: WORKER_WORKSPACE_DESCRIPTIONS[mode],
           })),
         )}
         {enumRow(

@@ -1244,6 +1244,11 @@ interface InstructionInput {
   extra?: string;
   /** Which level of contract to emit. Defaults to `standard`. */
   preset?: ContractPresetId;
+  /**
+   * Where the scope's units run. `worktree` and `mixed` add a section on what a
+   * worktree leaves behind and how it lands; `shared` says nothing.
+   */
+  workspace?: "shared" | "worktree" | "mixed";
 }
 
 /**
@@ -1307,18 +1312,28 @@ export function buildInstructions(input: InstructionInput): string {
   const reviewStep =
     preset === "review-heavy"
       ? `4. Every unit gets checked before you trust it: delegate it with \`verify: true\` so an
-   independent worker runs what the unit claims (the tests, the command, the paths)
-   and reports its raw output, then record a verdict for that unit with the
-   \`${REVIEW_TOOL}\` tool. If the check fails, re-delegate the unit. Never patch it
-   yourself.`
-      : `4. Review what comes back, and record a verdict for every worker with the
-   \`${REVIEW_TOOL}\` tool. Pass \`verify: true\` when you delegate a unit whose
-   result you cannot judge from its report alone: that adds an independent
-   check unit. If a result is wrong or incomplete, send a follow-up to a
-   worker. Never patch it yourself.`;
+   independent worker runs what it claims (the tests, the command, the paths) and
+   reports raw output, then record a verdict on it with the \`${REVIEW_TOOL}\` tool.
+   Re-delegate a failed check; never patch it yourself.`
+      : `4. Record a verdict on every worker with the \`${REVIEW_TOOL}\` tool. Pass
+   \`verify: true\` for a unit whose result you cannot judge from its report: that
+   adds a check unit. Send a wrong or incomplete result back to a worker; never
+   patch it yourself.`;
+
+  /**
+   * What a worktree leaves behind, and how it lands. Only emitted when the scope
+   * can produce one: the orchestrator cannot merge by hand without the watchdog
+   * calling it work, so the section says to delegate the merge instead.
+   */
+  const workspaceRule =
+    input.workspace === "worktree"
+      ? `\n\n   Units run in their own worktrees, so nothing a worker writes reaches your\n   checkout until it is merged. To land one, delegate the merge as its own unit\n   with \`workspace: "shared"\`, naming the branch.`
+      : input.workspace === "mixed"
+        ? `\n\n   Name where each unit runs: \`workspace: "shared"\` edits your checkout at once,\n   \`workspace: "worktree"\` keeps it on a branch. Give a worktree to a unit that\n   would touch files another unit touches, or should not disturb the working tree.\n   To land one, delegate the merge as its own unit with \`workspace: "shared"\`.`
+        : "";
 
   const commands = input.allowReadCommands && preset !== "delegate-only"
-    ? "Read-only shell commands (`ls`, `cat`, `rg`, `git status`, `git diff`, `git log`, `find`, `wc`) are allowed so you can orient yourself. Anything that writes, builds, installs, commits or otherwise changes state is not."
+    ? "Read-only shell commands (`ls`, `cat`, `rg`, `git status`, `git diff`, `git log`, `find`, `wc`) are allowed for orientation; anything that writes, builds, installs or commits is not."
     : "Do not run shell commands at all. Reading files and searching is enough to orient yourself.";
 
   const reminderLines = (input.reminders ?? [])
@@ -1331,9 +1346,8 @@ export function buildInstructions(input: InstructionInput): string {
 
   const render = (lines: readonly string[], extra = input.extra): string => `# ORCHESTRATOR MODE IS ON FOR THIS THREAD
 
-You are an orchestrator. You do not do the work. Every unit of actual work is
-handed to a worker thread, and your own output is the plan, the delegation, and
-the synthesis of what came back.
+You are an orchestrator: you do not do the work. Every unit goes to a worker
+thread, and your output is the plan, the delegation and the synthesis.
 
 ${watching}
 
@@ -1341,49 +1355,45 @@ ${watching}
 
 - Creating, editing, moving or deleting any file.
 - Generating images instead of delegating their creation.
-- Running a command that changes anything: builds, installs, tests, git commits
-  and pushes, migrations, formatters, scripts.
-- Writing the implementation yourself, even "just this one small fix", even
-  inline, even when the worker would take longer.
+- Running a command that changes anything: builds, installs, tests, commits,
+  migrations, formatters.
+- Writing code yourself, even a one-line fix, even when a worker would be slower.
 - Fixing up a worker's output by hand instead of sending it back to a worker.
 
 ${commands}
 
 ## How you work instead
-
+${workspaceRule}
 1. Understand the request. Read and search freely; ask when the goal is
    ambiguous.${research}
 2. Decompose it into units of work with self-contained briefs. A worker cannot
    see this conversation, so each brief carries its own goal, context,
    constraints and definition of done.
 3. Delegate every unit with the \`${DELEGATE_TOOL}\` tool. Fan out independent
-   units in parallel; sequence only the ones with a real dependency. If that
-   tool is not in your tool list, this session was constructed before the mode
-   was switched on and cannot gain tools mid-flight: do no work, invent no
-   substitute mechanism, say the tool arrives with the next session, and stop.
+   units in parallel; sequence only real dependencies. If the tool is missing,
+   this session predates the mode: say it arrives with the next session, do no
+   work, and stop.
 ${reviewStep}
 5. Report by synthesizing: what was delegated, what each worker produced, what
    is left. Link worker ids so the user can open them.
 
 ## When you may act directly
 
-Only these: reading, searching, planning, asking the user, delegating,
-reporting. If you are about to call a tool that changes something, stop and
-delegate instead.
+Only reading, searching, planning, asking, delegating and reporting. Before a
+tool that changes something, stop and delegate.
 
 ## Choosing the worker's model
 
-${workerBudget(input.workerConfig)} Override it per delegation with the
-\`model\`, \`provider\`, \`reasoning\` and \`permissionMode\` arguments of
-\`${DELEGATE_TOOL}\`. Give a hard unit a stronger model and a mechanical one a
-cheaper one.${savedPresets} Valid ids come from the catalog: \`bb provider list\`,
-then \`bb provider models <provider>\`. Both are read-only.
+${workerBudget(input.workerConfig)} Override per delegation with \`model\`,
+\`provider\`, \`reasoning\` and \`permissionMode\`. Give a hard unit a stronger
+model, a mechanical one a cheaper one.${savedPresets} Ids come from
+\`bb provider list\` and \`bb provider models <provider>\`; both are read-only.
 
 ${extraBudget(extra)}## If you cannot delegate
 
 Say so plainly and stop. "I cannot do this without doing the work myself" is a
-correct answer; doing the work yourself is not. Do not disable or argue with
-this mode. Ask the user to turn it off in the composer if it is wrong.${reminderBlock(lines)}`;
+correct answer; doing the work is not. Do not argue with the mode; ask the user
+to turn it off in the composer if it is wrong.${reminderBlock(lines)}`;
 
   const whole = render(reminderLines);
   if (whole.length <= INSTRUCTION_LIMIT) return whole;
