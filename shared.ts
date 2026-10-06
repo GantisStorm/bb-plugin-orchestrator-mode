@@ -238,10 +238,13 @@ export interface Violation {
 interface ClassifierOptions {
   /** Read-only shell commands are research, not work. Default true. */
   allowReadCommands: boolean;
+  /** Worker threads this orchestrator recorded, so a message to one is steering. */
+  workerThreadIds: readonly string[];
 }
 
 const DEFAULT_CLASSIFIER_OPTIONS: ClassifierOptions = {
   allowReadCommands: true,
+  workerThreadIds: [],
 };
 
 /**
@@ -911,12 +914,18 @@ const SHELL_WORD_BREAK = /[\s;&|()<>]/;
  * null when there is no complete word to read, which is not a heredoc we can
  * bound.
  */
-function readHeredocDelimiter(text: string, start: number): { delimiter: string; end: number } | null {
+function readHeredocDelimiter(
+  text: string,
+  start: number,
+): { delimiter: string; end: number; literal: boolean } | null {
   let index = start;
   while (index < text.length && (text[index] === " " || text[index] === "\t")) index += 1;
   let delimiter = "";
   let quote = "";
   let sawChar = false;
+  /** True once a quote or a backslash made the word literal: the shell then leaves
+   * the body alone, so its lines are data rather than commands. */
+  let literal = false;
   while (index < text.length) {
     const char = text[index]!;
     if (quote !== "") {
@@ -924,6 +933,7 @@ function readHeredocDelimiter(text: string, start: number): { delimiter: string;
         const next = text[index + 1];
         if (next === undefined) return null;
         delimiter += next;
+        literal = true;
         index += 2;
         continue;
       }
@@ -942,11 +952,13 @@ function readHeredocDelimiter(text: string, start: number): { delimiter: string;
       if (next === undefined) return null;
       delimiter += next;
       sawChar = true;
+      literal = true;
       index += 2;
       continue;
     }
     if (char === "'" || char === '"') {
       quote = char;
+      literal = true;
       index += 1;
       continue;
     }
@@ -956,7 +968,7 @@ function readHeredocDelimiter(text: string, start: number): { delimiter: string;
     index += 1;
   }
   if (quote !== "" || !sawChar) return null;
-  return { delimiter, end: index };
+  return { delimiter, end: index, literal };
 }
 
 /**
@@ -979,6 +991,11 @@ function findHeredocOpener(
   const stripTabs = text[operatorStart + 2] === "-";
   const word = readHeredocDelimiter(text, operatorStart + (stripTabs ? 3 : 2));
   if (word === null) return null;
+  // An unquoted delimiter means the shell expands the body: `$(...)`, backticks
+  // and `$VAR` all run or substitute there. Only a quoted or escaped delimiter
+  // makes the body data, so only that kind is stripped; the rest is left in
+  // place and judged as the commands it can become.
+  if (!word.literal) return null;
   return { operatorStart, operatorEnd: word.end, delimiter: word.delimiter, stripTabs };
 }
 
@@ -1022,11 +1039,42 @@ function stripHeredocBodies(text: string): string {
 }
 
 /**
+ * A message to a worker this orchestrator recorded. Correcting a worker is the
+ * orchestrator's own job, so `bb thread tell <worker-id> "..."` counts as
+ * delegation rather than as doing the work; a thread it never delegated to is
+ * somebody else's, and talking to it is ordinary work.
+ *
+ * The message must be literal: one command, quoted or plain words, no expansion,
+ * no chain and no redirect. `bb thread tell <id> "$(rm -rf x)"` is work however
+ * well it is aimed.
+ */
+function isWorkerFollowup(command: string, workerThreadIds: readonly string[]): boolean {
+  if (workerThreadIds.length === 0) return false;
+  const match =
+    /^(?:\S*\/)?bb\s+thread\s+(?:tell|message)\s+(?:'([A-Za-z0-9_-]+)'|"([A-Za-z0-9_-]+)"|([A-Za-z0-9_-]+))([\s\S]*)$/.exec(
+      command.trim(),
+    );
+  if (match === null) return false;
+  const target = match[1] ?? match[2] ?? match[3];
+  if (target === undefined || !workerThreadIds.includes(target)) return false;
+  const { unquoted, live } = scanCommandLine(match[4] ?? "");
+  // A metacharacter outside quotes is its own command, chain or redirect; a
+  // `$` or a backtick expands even inside double quotes. Quoted text alone is
+  // literal, so `"check (a)"` is a message and `$(rm x)` is work.
+  return !/[;&|<>()]/.test(unquoted) && !/[$`]/.test(live);
+}
+
+/**
  * True when every command in a shell line only reads. Any redirect, any
  * unknown program, and any mutating `git`/`bb` subcommand makes it work.
  */
 export function isReadOnlyCommand(command: string): boolean {
-  const trimmed = command.trim();
+  // `ls 2>/dev/null` looks around like `ls`: literal stderr suppression is not a
+  // write. The boundary excludes quotes, so `echo '2>/dev/null'` stays an
+  // argument, and every other redirect keeps the veto below.
+  const trimmed = command
+    .trim()
+    .replace(/(^|[\s;|&])2>[ \t]*\/dev\/null(?=$|[\s;|&])/g, "$1");
   if (trimmed === "") return true;
   const { unquoted, live, segments } = scanCommandLine(stripHeredocBodies(trimmed));
   // A redirect writes, whatever the program is. Only unquoted text counts: `echo 'a > b'` writes nothing.
@@ -1138,7 +1186,7 @@ export function classifyRow(
   row: WorkRowLike & { id: string; turnId?: string | null },
   options: Partial<ClassifierOptions> = {},
 ): Violation | null {
-  const { allowReadCommands } = { ...DEFAULT_CLASSIFIER_OPTIONS, ...options };
+  const { allowReadCommands, workerThreadIds } = { ...DEFAULT_CLASSIFIER_OPTIONS, ...options };
   if (row.kind !== "work") return null;
   const workKind = row.workKind ?? "";
   if (ALWAYS_ALLOWED.has(workKind)) return null;
@@ -1162,6 +1210,8 @@ export function classifyRow(
   if (workKind === "command") {
     // A malformed row must not throw out of the scan loop: a non-string command reads as no command at all.
     const command = typeof row.command === "string" ? row.command.trim() : "";
+    // Correcting a recorded worker is the orchestrator's own job, not work.
+    if (isWorkerFollowup(command, workerThreadIds)) return null;
     if (allowReadCommands && command !== "" && isReadOnlyCommand(command)) {
       return null;
     }
@@ -1317,8 +1367,8 @@ export function buildInstructions(input: InstructionInput): string {
    Re-delegate a failed check; never patch it yourself.`
       : `4. Record a verdict on every worker with the \`${REVIEW_TOOL}\` tool. Pass
    \`verify: true\` for a unit whose result you cannot judge from its report: that
-   adds a check unit. Send a wrong or incomplete result back to a worker; never
-   patch it yourself.`;
+   adds a check unit. Correct a recorded worker with \`bb thread tell <worker-id>
+   "..."\`; that is delegation. Never patch the work yourself.`;
 
   /**
    * What a worktree leaves behind, and how it lands. Only emitted when the scope

@@ -6,6 +6,20 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- Stderr suppression is reading, not writing: `ls 2>/dev/null` and friends no
+  longer trip the watchdog, while every other redirect, `tee`, substitution and
+  `find` action keeps its veto. Ported from upstream `176eadc`.
+- Only a heredoc with a quoted or escaped delimiter has a literal body. An
+  unquoted delimiter expands, so its body is judged as the commands it can
+  become instead of being stripped as data — closing a way to hide a write
+  inside a read. Ported from upstream `46d7fe7`.
+- Correcting a recorded worker counts as delegation. `bb thread tell <worker-id>
+  "..."` is allowed when that id is one this orchestrator delegated to and the
+  message is literal; a thread it never used, or an expansion inside the
+  message, is still work. Ported from upstream `46d7fe7`.
+
 ### Changed
 
 - The settings section is scoped end to end. **Settings → Installed plugins →

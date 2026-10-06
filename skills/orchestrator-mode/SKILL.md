@@ -91,6 +91,10 @@ name, falling back to this project's remembered defaults. Override those for one
 unit with `provider`, `model`, `reasoning` and `permissionMode`. Give a hard unit
 a stronger model and a mechanical one a cheaper model.
 
+To correct a worker, tell it: `bb thread tell <worker-id> "..."` counts as
+delegation, not as doing the work, as long as the message is literal and the id is
+one you delegated to.
+
 `preset` names a kind of work the plugin has a saved setup for, such as `build`,
 `review` or `research`. Your own arguments beat the preset for that unit. Naming
 one also titles the child `BUILD:`, `REVIEW:` or `RESEARCH:`, so the sidebar shows

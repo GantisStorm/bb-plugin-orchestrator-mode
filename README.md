@@ -345,6 +345,17 @@ or `VERDICT: fail`.
 
 ## Enforcement limits
 
+- **Stderr suppression reads.** `ls -la 2>/dev/null` counts as looking around,
+  because discarding stderr changes nothing. Every other redirect, `tee`,
+  command substitution and `find` action (`-delete`, `-exec`, …) keeps the veto,
+  and only a heredoc with a quoted or escaped delimiter has a literal body: an
+  unquoted one is expanded by the shell, so it is judged as the commands it can
+  become.
+- **Correcting a worker is delegation.** `bb thread tell <worker-id> "..."` is
+  allowed when that id is one this orchestrator delegated to and the message is
+  literal; another thread, or an expansion inside the message, is work like any
+  other command. The contract tells the orchestrator to use it instead of patching
+  a worker's output.
 - **A command has to look like one, segment by segment.** A `command` row counts
   as work when it names a program an agent plausibly runs, or carries shell
   evidence (a path, a flag, a pipe, a redirect, an assignment). A provider that

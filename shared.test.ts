@@ -161,11 +161,10 @@ describe("read-only command detection", () => {
     "git config --get-color color.diff auto",
     "git config --get-colorbool color.diff",
     "git config --get-urlmatch user.name https://example.com",
-    // A heredoc body is data, not commands: the body's lines must not read as
-    // unknown programs, and the `<<` must not read as a writing redirect.
-    "cat <<EOF\nbody\nEOF",
+    // A quoted heredoc body is data, not commands: the body's lines must not read
+    // as unknown programs, and the `<<` must not read as a writing redirect.
     "cat <<'EOF'\nbody\nEOF",
-    "cat <<-EOF\n\tbody\n\tEOF",
+    "cat <<-'EOF'\n\tbody\n\tEOF",
     'echo "a << b"',
   ];
   for (const command of readOnly) {
@@ -245,6 +244,10 @@ describe("read-only command detection", () => {
     "date --set=2020-01-01",
     // A heredoc does not launder the rest of the line, the program it feeds, or
     // a write alongside it. An unterminated heredoc stays a refusal.
+    // An unquoted delimiter means the shell expands the body, so it is judged as
+    // the commands it can become rather than stripped as data.
+    "cat <<EOF\nbody\nEOF",
+    "cat <<-EOF\n\tbody\n\tEOF",
     "cat <<EOF; rm x\nbody\nEOF",
     "cat <<EOF > out.txt\nbody\nEOF",
     "bash <<EOF\nrm -rf build\nEOF",
@@ -368,6 +371,72 @@ describe("read-only classifier soundness (oracle-found defects)", () => {
       expect(isReadOnlyCommand(command)).toBe(readOnly);
     });
   }
+});
+
+describe("stderr suppression", () => {
+  // Ported from upstream 176eadc: literal stderr discard reads like the command
+  // it belongs to, while every other redirect still writes.
+  const cases: [string, boolean][] = [
+    ["ls -la 2>/dev/null", true],
+    ["ls -la 2> /dev/null", true],
+    ["rg foo 2>/dev/null", true],
+    ["find . -name '*.ts' 2>/dev/null", true],
+    ["git status 2>/dev/null", true],
+    ["ls -la 2>err.txt", false],
+    ["ls -la > out.txt 2>/dev/null", false],
+    ["ls -la 2>/dev/null; rm -rf build", false],
+    ["ls -la 2>/dev/null && npm install", false],
+    // A quoted mention is an argument, not a redirection: nothing is suppressed,
+    // and nothing is written either.
+    ["echo '2>/dev/null'", true],
+  ];
+  for (const [command, readOnly] of cases) {
+    it(`${readOnly ? "allows" : "refuses"} \`${command}\``, () => {
+      expect(isReadOnlyCommand(command)).toBe(readOnly);
+    });
+  }
+});
+
+describe("worker follow-ups", () => {
+  const worker = "th_worker";
+  const classify = (command: string, workerThreadIds: readonly string[] = [worker], allowReadCommands = true) =>
+    classifyRow({ kind: "work", workKind: "command", command, id: `row_${command.length}` }, {
+      allowReadCommands,
+      workerThreadIds,
+    });
+
+  it("reads a quoted message to a recorded worker as delegation", () => {
+    expect(classify(`bb thread tell ${worker} "check the tests"`)).toBeNull();
+    expect(classify(`bb thread message ${worker} 'check the tests'`)).toBeNull();
+    expect(classify(`bb thread tell ${worker} check the tests`)).toBeNull();
+    // Quoted punctuation is literal text, not a chain.
+    expect(classify(`bb thread tell ${worker} "check (a) and (b)"`)).toBeNull();
+    // The alias path form the CLI accepts.
+    expect(classify(`/usr/local/bin/bb thread tell ${worker} "run it"`)).toBeNull();
+  });
+
+  it("refuses a message to a thread this orchestrator never delegated to", () => {
+    expect(classify(`bb thread tell th_stranger "check the tests"`)).not.toBeNull();
+    expect(classify(`bb thread tell ${worker} "check the tests"`, [])).not.toBeNull();
+  });
+
+  it("refuses a follow-up that could run something", () => {
+    // An expansion inside the message runs whatever it names.
+    expect(classify(`bb thread tell ${worker} "$(rm -rf build)"`)).not.toBeNull();
+    expect(classify(`bb thread tell ${worker} "\`rm -rf build\`"`)).not.toBeNull();
+    expect(classify(`bb thread tell ${worker} "$HOME/.cache"`)).not.toBeNull();
+    // A chain or a redirect after the message is its own command.
+    expect(classify(`bb thread tell ${worker} "hi"; rm -rf build`)).not.toBeNull();
+    expect(classify(`bb thread tell ${worker} "hi" && npm install`)).not.toBeNull();
+    expect(classify(`bb thread tell ${worker} "hi" > out.txt`)).not.toBeNull();
+  });
+
+  it("stays silent when read-only commands are turned off, except for the follow-up", () => {
+    // The allowance is delegation either way: turning off read-only exploration
+    // does not turn off correcting a worker.
+    expect(classify(`bb thread tell ${worker} "check the tests"`, [worker], false)).toBeNull();
+    expect(classify("ls -la", [worker], false)).not.toBeNull();
+  });
 });
 
 describe("direct-work classification", () => {

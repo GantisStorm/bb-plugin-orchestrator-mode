@@ -2220,7 +2220,12 @@ export default async function plugin(bb: BbPluginApi) {
         // Turns that ran before the session could gain the contract are never
         // judged, only recorded.
         if (turnId !== null && graceTurnIds.includes(turnId)) continue;
-        const violation = classifyRow(row, { allowReadCommands: scanSettings.allowReadCommands });
+        const violation = classifyRow(row, {
+          allowReadCommands: scanSettings.allowReadCommands,
+          // The workers this orchestrator handed units to: a message to one of
+          // them is steering, and to any other thread is ordinary work.
+          workerThreadIds: state.delegations.map((delegation) => delegation.threadId),
+        });
         if (violation !== null) {
           fresh.push(violation);
           if (seq >= liveSeq) {
