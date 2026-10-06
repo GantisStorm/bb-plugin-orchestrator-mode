@@ -265,7 +265,7 @@ records so the refusal can name what it hit:
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `maxParallelWorkers` | `6` | Refuses a delegation while this many workers are still running. Every worker counts, including check units and fallbacks. |
+| `maxParallelWorkers` | `8` | Refuses a delegation while this many workers are still running. Every worker counts, including check units and fallbacks, which is why the default fits four units with a check unit each. |
 | `maxDelegationsPerTurn` | `20` | Refuses a delegation once one turn has delegated this many. Check units and fallback retries do not count against it. |
 
 `0` removes either cap. A refusal is returned to the orchestrator as a readable
@@ -437,7 +437,7 @@ CLI, and the composer toggles.
 | `maxNudges` | `3` | Corrective messages per enablement, for direct work and for unjudged workers. It is one budget shared by both gates, whichever spends it first, and `bb orchestrator-mode status` reports the split; non-negative numbers are rounded down. `0` disables nudges. Recording and `block` stops continue after the cap. |
 | `contractPreset` | `standard` | Which [contract level](#the-contract) a session receives. |
 | `workerRetention` | `keep` | What happens to a worker once its result has been read: keep it, archive check units, or archive every read worker. |
-| `maxParallelWorkers` | `6` | Refuse a delegation while this many workers are running. `0` removes the cap. |
+| `maxParallelWorkers` | `8` | Refuse a delegation while this many workers are running. `0` removes the cap. |
 | `maxDelegationsPerTurn` | `20` | Refuse a delegation once a turn has delegated this many. `0` removes the cap. |
 
 Every row except `defaultForNewThreads` is read and written in the selected

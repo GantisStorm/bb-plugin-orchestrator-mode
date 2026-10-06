@@ -316,7 +316,7 @@ describe("the settings section", () => {
       enforcement: "guard",
       allowReadCommands: true,
       maxNudges: 3,
-      maxParallelWorkers: 6,
+      maxParallelWorkers: 8,
       maxDelegationsPerTurn: 20,
       contractPreset: "standard",
       workerRetention: "keep",

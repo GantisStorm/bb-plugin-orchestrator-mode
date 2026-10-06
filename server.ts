@@ -549,13 +549,17 @@ export default async function plugin(bb: BbPluginApi) {
    * What a fresh install starts from, and the value every stored field falls back
    * to: a record missing a field, or carrying an unusable one, keeps the default
    * instead of blanking it.
+   *
+   * The parallel cap is eight, not six: a check unit counts against it, so a
+   * `review-heavy` session needs two slots per unit and the default fits a batch
+   * of four.
    */
   const DEFAULT_SETTINGS: OrchestratorSettings = {
     defaultForNewThreads: false,
     enforcement: DEFAULT_ENFORCEMENT,
     allowReadCommands: true,
     maxNudges: 3,
-    maxParallelWorkers: 6,
+    maxParallelWorkers: 8,
     maxDelegationsPerTurn: 20,
     contractPreset: "standard",
     workerRetention: "keep",

@@ -1822,7 +1822,7 @@ describe("rpc", () => {
       enforcement: "instruct",
       allowReadCommands: true,
       maxNudges: 5,
-      maxParallelWorkers: 6,
+      maxParallelWorkers: 8,
       maxDelegationsPerTurn: 20,
       contractPreset: "standard",
       workerRetention: "keep",
