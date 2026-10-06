@@ -77,6 +77,7 @@ accent while the mode is on.
 The `orchestrator_delegate` tool creates a child thread from a self-contained
 brief and can wait for its result. Workers use the parent's environment and
 appear in the sidebar unless you request a hidden worker.
+Existing sessions without that tool can use `bb orchestrator-mode delegate`.
 
 You choose their provider and model with BB's own picker in the plugin's
 settings, or per delegation in the tool call, and the orchestrator has to record
@@ -163,9 +164,10 @@ flowchart TD
   mutating commands and mutating tool names as work. Reads, searches, plans,
   questions and delegation
   remain available; command leniency is configurable.
-- **Session timing.** Instructions apply when the provider session is next
-  constructed. A live session keeps its existing instructions; the watchdog
-  grants grace turns during that transition.
+- **Session timing.** Running turns receive mode changes as steering messages.
+  Session configuration applies when the provider session is next constructed;
+  resuming can retain its original tools, so CLI delegation remains available.
+  The watchdog grants grace turns during the transition.
 
 The [design notes](docs/DESIGN.md) cover classification, retained state and
 session timing in more detail.
@@ -337,7 +339,7 @@ can produce with an append at the cap and asserts it fits.
 | --- | --- |
 | `standard` (default) | Delegates the work, records a verdict on every worker, and adds a check unit only where a report cannot settle a unit. |
 | `review-heavy` | Puts an independent check unit in front of every unit. Each one runs what the unit claims, and counts against `maxParallelWorkers`, so this roughly doubles the work in flight. |
-| `delegate-only` | Hands the reading over too: no shell commands at all, and finding things out is a unit of work. |
+| `delegate-only` | Hands the reading over too: no exploratory shell commands, and finding things out is a unit of work. CLI delegation remains available. |
 
 The check unit is adversarial, not a reread: it runs what the unit claims (the
 tests, the command, the paths), pastes the raw output, and reports `VERDICT: pass`
@@ -385,6 +387,7 @@ bb orchestrator-mode off
 | Command | Does |
 | --- | --- |
 | `status [--thread <id>] [--json]` | Show mode, enforcement, violations, nudges and delegations. |
+| `delegate --task <brief> [--title <title>] [--no-wait] [--timeout <seconds>] [--hidden] [--thread <id>] [--json]` | Run the same delegation action when the native tool is unavailable. |
 | `on [--thread <id>] [--enforcement instruct\|guard\|block] [--json]` | Enable the thread, with an optional enforcement override. |
 | `off [--thread <id>] [--json]` | Disable the thread and clear its enforcement override. |
 | `scope [--global \| --project <id>] [--enforcement <level>] [--read-commands on\|off] [--max-nudges <n>] [--max-parallel <n>] [--max-per-turn <n>] [--contract-preset <standard\|review-heavy\|delegate-only>] [--retention <policy>] [--worker-workspace <shared\|worktree>] [--worker-provider <id>] [--worker-model <id>] [--clear-worker] [--rules <text>] [--clear-rules] [--inherit <key>] [--inherit-all] [--json]` | With `--global`, read or write the record every project inherits (settings only; the worker execution and rules have their own commands). With `--project`, read or write that project's overrides: settings, worker execution and appended rules. Without either, list every project that has any. |

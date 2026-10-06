@@ -1133,6 +1133,55 @@ function isReadOnlyBbSegment(rest: readonly string[]): boolean {
   return verb !== undefined && verbs.has(verb);
 }
 
+/** CLI delegation is permitted even in sessions without the native tool. */
+function isDelegationCommand(command: string, allowReadCommands: boolean): boolean {
+  // ponytail: ordinary shell quoting only; use a shell parser if expansion forms are needed.
+  const segments: string[] = [];
+  let segment = "";
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]!;
+    if (escaped) {
+      segment += char;
+      escaped = false;
+    } else if (quote === "'") {
+      segment += char;
+      if (char === "'") quote = null;
+    } else if (char === "\\") {
+      segment += char;
+      escaped = true;
+    } else if (char === "`" || (char === "$" && (
+      command[index + 1] === "(" ||
+      (quote === null && (command[index + 1] === "'" || command[index + 1] === '"'))
+    ))) {
+      return false;
+    } else if (quote === '"') {
+      segment += char;
+      if (char === '"') quote = null;
+    } else if (char === "'" || char === '"') {
+      segment += char;
+      quote = char;
+    } else if (/[<>()]/.test(char)) {
+      return false;
+    } else if (char === "&" && command[index + 1] !== "&") {
+      return false;
+    } else if (/[;|&\n\r]/.test(char)) {
+      segments.push(segment.trim());
+      segment = "";
+      if ((char === "&" || char === "|") && command[index + 1] === char) index += 1;
+    } else {
+      segment += char;
+    }
+  }
+  if (quote !== null || escaped) return false;
+  segments.push(segment.trim());
+  const delegates = (part: string) => /^(?:\S*\/)?bb\s+orchestrator-mode\s+delegate(?:\s|$)/.test(part);
+  return segments.some(delegates) && segments.every((part) =>
+    part === "" || delegates(part) || (allowReadCommands && isReadOnlyCommand(part)),
+  );
+}
+
 /**
  * Classify one timeline row. Returns a violation when the row is the
  * orchestrator doing the work itself, or null when it is allowed.
@@ -1165,6 +1214,7 @@ export function classifyRow(
   if (workKind === "command") {
     // A malformed row must not throw out of the scan loop: a non-string command reads as no command at all.
     const command = typeof row.command === "string" ? row.command.trim() : "";
+    if (isDelegationCommand(command, allowReadCommands)) return null;
     if (allowReadCommands && command !== "" && isReadOnlyCommand(command)) {
       return null;
     }
@@ -1336,8 +1386,8 @@ export function buildInstructions(input: InstructionInput): string {
         : "";
 
   const commands = input.allowReadCommands && preset !== "delegate-only"
-    ? "Read-only shell commands (`ls`, `cat`, `rg`, `git status`, `git diff`, `git log`, `find`, `wc`) are allowed for orientation; anything that writes, builds, installs or commits is not."
-    : "Do not run shell commands at all. Reading files and searching is enough to orient yourself.";
+    ? "Read-only shell commands (`ls`, `cat`, `rg`, `git status`, `git diff`, `git log`, `find`, `wc`, `bb status`, `bb provider list`, `bb provider models`) are allowed for orientation; anything that writes, builds, installs or commits is not."
+    : "Only CLI delegation commands may run; read-only shell exploration is disabled.";
 
   const reminderLines = (input.reminders ?? [])
     .slice(-5)
@@ -1372,10 +1422,10 @@ ${workspaceRule}
 2. Decompose it into units of work with self-contained briefs. A worker cannot
    see this conversation, so each brief carries its own goal, context,
    constraints and definition of done.
-3. Delegate every unit with the \`${DELEGATE_TOOL}\` tool. Fan out independent
-   units in parallel; sequence only real dependencies. If the tool is missing,
-   this session predates the mode: say it arrives with the next session, do no
-   work, and stop.
+3. Delegate with \`${DELEGATE_TOOL}\`; if unavailable, use
+   \`bb orchestrator-mode delegate --task 'complete brief'\`.
+   Quote briefs safely; \`--no-wait\` fans out independent units. Resuming a
+   provider session may retain its original tool list.
 ${reviewStep}
 5. Report by synthesizing: what was delegated, what each worker produced, what
    is left. Link worker ids so the user can open them.
@@ -1517,7 +1567,8 @@ export function buildNudge(violations: readonly Violation[], enforcement: Enforc
     enforcement === "block"
       ? " The turn was stopped, so any change you made mid-flight may be incomplete."
       : "";
-  const missingTool = `\n\nIf \`${DELEGATE_TOOL}\` is not among your tools, this session predates the mode and cannot gain tools mid-flight. Do not improvise another delegation mechanism and do not retry the work: say plainly that the tool arrives with the next session, and stop.`;
+  const missingTool =
+    `\n\nIf \`${DELEGATE_TOOL}\` is unavailable, use \`bb orchestrator-mode delegate --task 'complete brief'\` instead. It runs the same delegation action. Resuming a session may retain its original tools; no context reset is needed for this CLI route.`;
   return `Orchestrator mode caught you doing the work yourself:${stopped}
 
 ${acts}

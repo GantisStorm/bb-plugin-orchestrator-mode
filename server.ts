@@ -22,6 +22,7 @@ import {
   defineCli,
   defineRpcContract,
   type BbPluginApi,
+  type PluginCliContext,
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
@@ -1456,16 +1457,16 @@ export default async function plugin(bb: BbPluginApi) {
     // session lag; an idle thread loses only the next one.
     let graceTurnIds: string[] = [];
     let graceSlots = 1;
-    if (enabled) {
-      try {
-        const thread = await bb.sdk.threads.get({ threadId });
-        if (thread.status === "active" && head.turnId !== null) {
-          graceTurnIds = [head.turnId];
-          graceSlots = 2;
-        }
-      } catch (cause) {
-        bb.log.warn(`thread status read failed for ${threadId}: ${String(cause)}`);
+    let active = false;
+    try {
+      const thread = await bb.sdk.threads.get({ threadId });
+      active = thread.status === "active";
+      if (enabled && active && head.turnId !== null) {
+        graceTurnIds = [head.turnId];
+        graceSlots = 2;
       }
+    } catch (cause) {
+      bb.log.warn(`thread status read failed for ${threadId}: ${String(cause)}`);
     }
     const state = await mutateState(threadId, (current) => ({
       ...current,
@@ -1483,6 +1484,20 @@ export default async function plugin(bb: BbPluginApi) {
       lastReviewNudge: enabled ? current.lastReviewNudge : null,
     }));
     await syncMirror(threadId, state?.enabled ?? false, state?.enforcement ?? null);
+    if (active) {
+      try {
+        const text = enabled
+          ? await contractText(threadId)
+          : "Orchestrator mode is now off. The earlier orchestrator contract no longer applies; continue following the user's request.";
+        await bb.sdk.threads.send({
+          threadId,
+          mode: "steer",
+          input: [{ type: "text", mentions: [], text }],
+        });
+      } catch (cause) {
+        bb.log.warn(`mode notification failed for ${threadId}: ${String(cause)}`);
+      }
+    }
     return state ?? emptyState(Date.now());
   }
 
@@ -1512,6 +1527,450 @@ export default async function plugin(bb: BbPluginApi) {
 
   // --- layer 1: the contract ----------------------------------------------
 
+  const delegateParameters = z.object({
+    task: z
+      .string()
+      .min(1)
+      .max(20_000)
+      .describe("Complete, self-contained brief for the worker."),
+    title: z.string().max(200).optional().describe("Worker thread title."),
+    waitForResult: z
+      .boolean()
+      .optional()
+      .describe("Wait for the worker to finish and return its result. Default true."),
+    timeoutSeconds: z
+      .number()
+      .int()
+      .min(10)
+      .max(3600)
+      .optional()
+      .describe("How long to wait. Default 900."),
+    hidden: z
+      .boolean()
+      .optional()
+      .describe("Keep the worker out of the sidebar. Default false."),
+    workspace: z
+      .enum(WORKER_WORKSPACES)
+      .optional()
+      .describe(
+        "Where this unit runs: `shared` (the orchestrator's own checkout) or `worktree` (its own git worktree and branch, which stays out until a merge unit brings it in). Default: the plugin setting, except under `mixed`, where every delegation has to name one.",
+      ),
+    preset: z
+      .enum(WORKER_PRESETS)
+      .optional()
+      .describe(
+        "A named execution preset stored in the plugin settings, applied under this call's own arguments. Ask for one that is stored; the error names the ones that are.",
+      ),
+    verify: z
+      .boolean()
+      .optional()
+      .describe(
+        "Also spawn an independent check unit on the same brief, told to run what the unit claims and report its raw output before a pass or fail verdict. Use it for a unit whose result you cannot judge from its report alone. Default false.",
+      ),
+    model: z
+      .string()
+      .min(1)
+      .max(200)
+      .optional()
+      .describe(
+        "Model id for this worker, taken from the provider catalog (`bb provider models <provider>`). Defaults to the plugin's worker model, then the project's remembered model.",
+      ),
+    provider: z
+      .string()
+      .min(1)
+      .max(120)
+      .optional()
+      .describe(
+        "Provider id for this worker, taken from the provider catalog (`bb provider list`). Defaults to the plugin's worker provider, then the project's remembered provider.",
+      ),
+    reasoning: z
+      .enum(REASONING_LEVELS)
+      .optional()
+      .describe(
+        "Reasoning level for this worker. Defaults to the plugin's worker reasoning level, then the project's remembered level.",
+      ),
+    permissionMode: z
+      .enum(PERMISSION_MODES)
+      .optional()
+      .describe(
+        "Permission mode for this worker. Defaults to the plugin's worker permission mode, then the project's remembered mode.",
+      ),
+  });
+
+  async function delegateTask(
+    {
+      task,
+      title,
+      waitForResult,
+      timeoutSeconds,
+      hidden,
+      workspace,
+      preset,
+      verify,
+      model,
+      provider,
+      reasoning,
+      permissionMode,
+    }: z.infer<typeof delegateParameters>,
+    { threadId, projectId: contextProjectId, signal }: PluginCliContext,
+  ): Promise<string> {
+    if (threadId === undefined) {
+      throw new Error("orchestrator_delegate needs a thread context.");
+    }
+    // A check unit inspects finished work, so it can only start once the
+    // worker has settled. Refusing beats spawning a worker nobody checks.
+    if (verify === true && waitForResult === false) {
+      throw new Error(
+        "verify: true needs waitForResult: true, because a check unit has to inspect finished work. Wait for this worker, or record a verdict yourself and delegate the check as its own unit.",
+      );
+    }
+    /**
+     * Where this unit runs. The call always wins; `mixed` has no default of its
+     * own, so under it every delegation has to say, which is the whole point of
+     * the mode: the orchestrator decides per unit.
+     */
+    const parent = await bb.sdk.threads.get({ threadId });
+    const projectId = contextProjectId ?? parent.projectId;
+    const scopeWorkspace = settingsFor(projectId).workerWorkspace;
+    if (workspace === undefined && scopeWorkspace === "mixed") {
+      throw new Error(
+        "This scope runs workers in both checkouts, so each delegation names where it runs: `workspace: \"shared\"` uses the orchestrator's own checkout, so its edits are visible at once, and `workspace: \"worktree\"` gives the unit its own branch, which stays out until a merge unit brings it in.",
+      );
+    }
+    const unitWorkspace = workspace ?? scopeWorkspace;
+    /**
+     * The machine a new worktree belongs on: the orchestrator's own, so the unit
+     * sees the same host as the thread that handed it the work. An environment
+     * that cannot be read leaves it unset, which asks BB for this machine.
+     */
+    let parentHostId: string | undefined;
+    if (unitWorkspace === "worktree" && parent.environmentId !== null) {
+      try {
+        parentHostId = (await bb.sdk.environments.get({ environmentId: parent.environmentId })).hostId;
+      } catch {
+        parentHostId = undefined;
+      }
+    }
+    /**
+     * The checkout one unit runs in. Without a worktree it is the orchestrator's
+     * own; with one, BB creates a managed worktree off the project's default
+     * branch on the machine the orchestrator runs on. A check unit or a retry
+     * passes the environment its unit was spawned into, so it inspects and
+     * continues the same working tree instead of opening a second one.
+     */
+    function environmentFor(reuseId: string | null | undefined) {
+      if (reuseId !== null && reuseId !== undefined) {
+        return { type: "reuse" as const, environmentId: reuseId };
+      }
+      if (unitWorkspace !== "worktree") {
+        return parent.environmentId === null
+          ? { type: "project-default" as const }
+          : { type: "reuse" as const, environmentId: parent.environmentId };
+      }
+      return {
+        type: "host" as const,
+        ...(parentHostId === undefined ? {} : { hostId: parentHostId }),
+        workspace: { type: "managed-worktree" as const, baseBranch: { kind: "default" as const } },
+      };
+    }
+    /**
+     * The worker's title, carrying the preset it runs under: the sidebar is the
+     * only place a delegation is visible, and `BUILD: …` says what the thread is
+     * doing before the brief does. A title that already names the preset is left
+     * alone, so the prefix is never doubled.
+     */
+    const baseTitle = title?.trim() || task.trim().split("\n")[0]!.slice(0, 120);
+    const presetPrefix = preset === undefined ? null : `${preset.toUpperCase()}:`;
+    const workerTitle =
+      presetPrefix === null || baseTitle.toUpperCase().startsWith(presetPrefix)
+        ? baseTitle
+        : `${presetPrefix} ${baseTitle}`;
+    const orchestratorId = threadId;
+    const targetProjectId = projectId;
+
+    // The mode has to be on: a stale session can keep this tool after the
+    // thread was switched off, and the review gate does not monitor a thread
+    // that is off, so those workers would never be nudged for a verdict.
+    const orchestratorState = await getState(orchestratorId);
+    if (orchestratorState?.enabled !== true) {
+      throw new Error(
+        "This thread is not in orchestrator mode, so delegations are refused. Turn the mode on in the composer first.",
+      );
+    }
+
+    // A named preset must be stored: silently ignoring one would leave the
+    // orchestrator believing it had asked for a different model. The project's
+    // worker configuration is the one that applies, global values under it.
+    const workerConfig = workerFor(projectId);
+    let presetExec: WorkerExecution = {};
+    if (preset !== undefined) {
+      const stored = workerConfig.presets?.[preset];
+      if (stored === undefined) {
+        const available = Object.keys(workerConfig.presets ?? {});
+        throw new Error(
+          `No \`${preset}\` worker preset is stored.${available.length === 0 ? " This plugin has no presets configured." : ` Stored presets: ${available.join(", ")}.`}`,
+        );
+      }
+      presetExec = stored;
+    }
+
+    // Per-delegation arguments win over a preset, which wins over the worker
+    // settings; a field none of them names is left out so the worker resolves
+    // the project default.
+    const workerExec = reconcile({
+      ...executionOf(workerConfig),
+      ...presetExec,
+      ...(provider === undefined ? {} : { providerId: provider }),
+      ...(model === undefined ? {} : { model }),
+      ...(reasoning === undefined ? {} : { reasoningLevel: reasoning }),
+      ...(permissionMode === undefined ? {} : { permissionMode }),
+    });
+    assertInCatalog(workerExec);
+
+    /**
+     * Spawn one worker on `exec`, in `environment`, and record it against this
+     * orchestrator. The spawned thread comes back so a check unit or a retry can
+     * reuse the checkout this unit was given.
+     */
+    async function spawnWorker(
+      exec: WorkerExecution,
+      workerLabel: string,
+      environment: ReturnType<typeof environmentFor>,
+      options: { brief?: string; verifierFor?: string; pluginInitiated?: boolean } = {},
+    ): Promise<{ id: string; environmentId: string | null }> {
+      const countPerTurn = options.pluginInitiated !== true;
+      await assertWithinBudget(orchestratorId, countPerTurn, targetProjectId);
+      try {
+        const spawned = await bb.sdk.threads.spawn({
+          projectId: targetProjectId,
+          environment,
+          prompt: options.brief ?? task,
+          title: workerLabel,
+          parentThreadId: orchestratorId,
+          ...(hidden === true ? { visibility: "hidden" as const } : {}),
+          ...exec,
+          // The server drops a requested provider/model that carries no
+          // provenance source and re-derives it from the project's remembered
+          // defaults, which would silently undo everything above.
+          ...(Object.keys(exec).length === 0
+            ? {}
+            : { executionInputSources: executionSources(exec) }),
+          pluginMetadata: { workerFor: orchestratorId },
+        });
+        await mutateState(orchestratorId, (current) => ({
+          ...current,
+          delegations: trimDelegations([
+            ...current.delegations,
+            {
+              threadId: spawned.id,
+              title: workerLabel,
+              task: (options.brief ?? task).slice(0, 400),
+              createdAt: Date.now(),
+              status: null,
+              ...(options.verifierFor === undefined
+                ? {}
+                : { verifierFor: options.verifierFor, verifiedBy: null, verdict: null }),
+              environmentId: spawned.environmentId ?? null,
+            },
+          ]),
+        }));
+        return { id: spawned.id, environmentId: spawned.environmentId ?? null };
+      } finally {
+        // However the spawn ended, its claim stops counting against the caps.
+        releaseClaim(orchestratorId, countPerTurn);
+      }
+    }
+
+    interface Settled {
+      status: string | null;
+      output: string | null;
+      /** Still working when the deadline passed. */
+      running: boolean;
+    }
+
+    /** Wait for one worker, record how it settled, and read what it said. */
+    async function settle(workerId: string, timeoutMs: number): Promise<Settled> {
+      const deadline = Date.now() + timeoutMs;
+      try {
+        await bb.sdk.threads.wait({ threadId: workerId, status: "idle", timeoutMs, signal });
+      } catch {
+        // `wait` matches one status and polls, so an errored thread never
+        // reaches `idle`: the server rejects the wait immediately with
+        // "will not reach idle by waiting alone" rather than holding until the
+        // timeout. That rejection is what notices a failure promptly, and the
+        // status read below then decides whether to retry. A timeout lands
+        // here too, which is why the status is read either way.
+      }
+      let status: string | null = null;
+      try {
+        status = (await bb.sdk.threads.get({ threadId: workerId })).status;
+      } catch {
+        status = null;
+      }
+      await mutateState(orchestratorId, (current) => ({
+        ...current,
+        delegations: current.delegations.map((delegation) =>
+          delegation.threadId === workerId ? { ...delegation, status } : delegation,
+        ),
+      }));
+      if (Date.now() >= deadline && status !== "idle" && status !== "error") {
+        return { status, output: null, running: true };
+      }
+      let output: string | null = null;
+      try {
+        const result = await bb.sdk.threads.output({ threadId: workerId });
+        output = (result as { output?: string | null }).output ?? null;
+      } catch (cause) {
+        bb.log.warn(`worker output read failed for ${workerId}: ${String(cause)}`);
+      }
+      await maybeArchive(orchestratorId, workerId);
+      return { status, output, running: false };
+    }
+
+    /** The text the orchestrator gets back about one finished worker. */
+    function report(workerId: string, settled: Settled): string {
+      if (settled.running) {
+        return `Worker ${workerId} is still running after ${Math.round(timeoutMs / 1000)}s (status: ${settled.status ?? "unknown"}). Delegate the next unit, or wait and check it again. Do not start doing its work yourself.`;
+      }
+      const trimmed = (settled.output ?? "").trim();
+      const body =
+        trimmed === ""
+          ? "(the worker produced no final text. Open the thread to see what it did.)"
+          : trimmed.length > 12_000
+            ? `${trimmed.slice(0, 12_000)}\n\n[truncated]`
+            : trimmed;
+      return `Worker ${workerId} finished with status "${settled.status ?? "unknown"}".\n\n${body}\n\nReview it. If it is wrong or incomplete, send a follow-up to a worker. Do not fix it yourself.`;
+    }
+
+    /**
+     * Re-delegate the same brief on the fallback, which inherits every field
+     * it does not name from the execution the first attempt used.
+     */
+    async function retryOnFallback(fallback: WorkerExecution, reason: string): Promise<string> {
+      const retryExec = reconcile({ ...workerExec, ...fallback });
+      const target = retryExec.model ?? "the project default";
+      bb.log.warn(`${reason} Retrying on ${target}.`);
+      const retry = await spawnWorker(
+        retryExec,
+        `${workerTitle} (fallback)`,
+        environmentFor(workerEnvironmentId),
+        { pluginInitiated: true },
+      );
+      const retryId = retry.id;
+      const settled = await settle(retryId, timeoutMs);
+      return `${reason} Re-delegated the same brief on \`${target}\` as worker ${retryId}.\n\n${await finish(retryId, `${workerTitle} (fallback)`, settled)}`;
+    }
+
+    /**
+     * Spawn a second worker to check the first one's work, on the same
+     * execution, and hand its report back with the worker's. The check unit
+     * is recorded as evidence for `workerId` and is not itself a unit the
+     * orchestrator has to judge.
+     */
+    async function runVerifier(
+      workerId: string,
+      workerLabel: string,
+      workerOutput: string | null,
+    ): Promise<string> {
+      const brief = buildVerifierBrief({ task, workerTitle: workerLabel, workerOutput });
+      const verifierExec = reconcile({ ...workerExec });
+      let verifierId: string;
+      try {
+        verifierId = (
+          await spawnWorker(verifierExec, `${workerLabel} (check)`, environmentFor(workerEnvironmentId), {
+            brief,
+            verifierFor: workerId,
+            pluginInitiated: true,
+          })
+        ).id;
+      } catch (cause) {
+        bb.log.warn(`check unit for ${workerId} could not start: ${String(cause)}`);
+        return `\n\nNo check unit ran: ${String(cause)}`;
+      }
+      await mutateState(orchestratorId, (current) => ({
+        ...current,
+        delegations: current.delegations.map((delegation) =>
+          delegation.threadId === workerId ? { ...delegation, verifiedBy: verifierId } : delegation,
+        ),
+      }));
+      const checked = await settle(verifierId, timeoutMs);
+      const verdict = (checked.output ?? "").trim();
+      return `\n\nCheck unit ${verifierId} ran the same brief.${
+        checked.running
+          ? " It is still running, so check it before you accept the work."
+          : verdict === ""
+            ? " It produced no final text, so open it before you accept the work."
+            : `\n\n${verdict.length > 8_000 ? `${verdict.slice(0, 8_000)}\n\n[truncated]` : verdict}`
+      }`;
+    }
+
+    /**
+     * What a worktree unit leaves behind, named so it can be reviewed or merged.
+     * An environment that cannot be read still names the id, because that is the
+     * handle every `bb environment` command takes.
+     */
+    async function worktreeNote(environmentId: string | null): Promise<string> {
+      if (unitWorkspace !== "worktree" || environmentId === null) return "";
+      try {
+        const environment = await bb.sdk.environments.get({ environmentId });
+        const branch = environment.branchName;
+        const where = branch === null ? `environment ${environmentId}` : `branch \`${branch}\``;
+        // The merge brief is written out, because the orchestrator cannot merge by
+        // hand: the watchdog counts that as doing the work.
+        const land = `delegate a merge unit with \`workspace: "shared"\`: "Merge ${where} into this checkout and report what conflicts instead of resolving them."`;
+        return `\n\nThis unit ran in its own worktree on ${where}. Nothing is merged from it: \`bb environment diff ${environmentId}\` shows what it changed. To land it, ${land}`;
+      } catch {
+        return `\n\nThis unit ran in its own worktree (environment ${environmentId}). Nothing is merged from it. To land it, delegate a merge unit with \`workspace: "shared"\` naming that environment.`;
+      }
+    }
+
+    /** The worker's report, plus an independent check when one was asked for. */
+    async function finish(
+      workerId: string,
+      workerLabel: string,
+      settled: Settled,
+    ): Promise<string> {
+      const reported = `${report(workerId, settled)}${await worktreeNote(workerEnvironmentId)}`;
+      // Checking a worker that never ran is pointless: there is nothing to
+      // inspect, and the orchestrator has to re-delegate that unit anyway.
+      if (verify !== true || settled.running || settled.status === "error") return reported;
+      return `${reported}${await runVerifier(workerId, workerLabel, settled.output)}`;
+    }
+
+    const timeoutMs = Math.min(Math.max(timeoutSeconds ?? 900, 10), 3600) * 1000;
+    const fallback = workerConfig.fallback;
+    let workerId: string;
+    /** The checkout the unit's workers run in, reused by its check unit and retry. */
+    let workerEnvironmentId: string | null = null;
+    try {
+      const spawned = await spawnWorker(workerExec, workerTitle, environmentFor(null));
+      workerId = spawned.id;
+      workerEnvironmentId = spawned.environmentId;
+    } catch (cause) {
+      // A cap is our own refusal, not a provider that could not start: send
+      // it straight back so the orchestrator changes what it is doing.
+      if (cause instanceof WorkerBudgetError) throw cause;
+      // A spawn that never started a worker is the clearest case for the
+      // fallback: the provider could not serve the requested execution at all.
+      if (fallback === undefined) throw cause;
+      return await retryOnFallback(
+        fallback,
+        `Worker could not start on \`${workerExec.model ?? "the project default"}\`: ${String(cause)}`,
+      );
+    }
+
+    if (waitForResult === false) {
+      const retry = fallback === undefined ? "" : " If it fails, re-delegate it on the configured fallback.";
+      return `Delegated without waiting.\nWorker thread ${workerId}, titled "${workerTitle}"\nCheck on it later and fold its result into your report.${retry}${await worktreeNote(workerEnvironmentId)}`;
+    }
+
+    const first = await settle(workerId, timeoutMs);
+    if (first.running || first.status !== "error" || fallback === undefined) {
+      return await finish(workerId, workerTitle, first);
+    }
+    return await retryOnFallback(fallback, `Worker ${workerId} failed.`);
+  }
+
   bb.agents.registerTool({
     name: DELEGATE_TOOL,
     description:
@@ -1524,447 +1983,8 @@ export default async function plugin(bb: BbPluginApi) {
         completed: "Delegated to a worker thread",
       },
     },
-    parameters: z.object({
-      task: z
-        .string()
-        .min(1)
-        .max(20_000)
-        .describe("Complete, self-contained brief for the worker."),
-      title: z.string().max(200).optional().describe("Worker thread title."),
-      waitForResult: z
-        .boolean()
-        .optional()
-        .describe("Wait for the worker to finish and return its result. Default true."),
-      timeoutSeconds: z
-        .number()
-        .int()
-        .min(10)
-        .max(3600)
-        .optional()
-        .describe("How long to wait. Default 900."),
-      hidden: z
-        .boolean()
-        .optional()
-        .describe("Keep the worker out of the sidebar. Default false."),
-      workspace: z
-        .enum(WORKER_WORKSPACES)
-        .optional()
-        .describe(
-          "Where this unit runs: `shared` (the orchestrator's own checkout) or `worktree` (its own git worktree and branch, which stays out until a merge unit brings it in). Default: the plugin setting, except under `mixed`, where every delegation has to name one.",
-        ),
-      preset: z
-        .enum(WORKER_PRESETS)
-        .optional()
-        .describe(
-          "A named execution preset stored in the plugin settings, applied under this call's own arguments. Ask for one that is stored; the error names the ones that are.",
-        ),
-      verify: z
-        .boolean()
-        .optional()
-        .describe(
-          "Also spawn an independent check unit on the same brief, told to run what the unit claims and report its raw output before a pass or fail verdict. Use it for a unit whose result you cannot judge from its report alone. Default false.",
-        ),
-      model: z
-        .string()
-        .min(1)
-        .max(200)
-        .optional()
-        .describe(
-          "Model id for this worker, taken from the provider catalog (`bb provider models <provider>`). Defaults to the plugin's worker model, then the project's remembered model.",
-        ),
-      provider: z
-        .string()
-        .min(1)
-        .max(120)
-        .optional()
-        .describe(
-          "Provider id for this worker, taken from the provider catalog (`bb provider list`). Defaults to the plugin's worker provider, then the project's remembered provider.",
-        ),
-      reasoning: z
-        .enum(REASONING_LEVELS)
-        .optional()
-        .describe(
-          "Reasoning level for this worker. Defaults to the plugin's worker reasoning level, then the project's remembered level.",
-        ),
-      permissionMode: z
-        .enum(PERMISSION_MODES)
-        .optional()
-        .describe(
-          "Permission mode for this worker. Defaults to the plugin's worker permission mode, then the project's remembered mode.",
-        ),
-    }),
-    async execute(
-      {
-        task,
-        title,
-        waitForResult,
-        timeoutSeconds,
-        hidden,
-        workspace,
-        preset,
-        verify,
-        model,
-        provider,
-        reasoning,
-        permissionMode,
-      },
-      { threadId, projectId, signal },
-    ) {
-      if (threadId === undefined || projectId === undefined) {
-        throw new Error("orchestrator_delegate needs a thread context.");
-      }
-      // A check unit inspects finished work, so it can only start once the
-      // worker has settled. Refusing beats spawning a worker nobody checks.
-      if (verify === true && waitForResult === false) {
-        throw new Error(
-          "verify: true needs waitForResult: true, because a check unit has to inspect finished work. Wait for this worker, or record a verdict yourself and delegate the check as its own unit.",
-        );
-      }
-      /**
-       * Where this unit runs. The call always wins; `mixed` has no default of its
-       * own, so under it every delegation has to say, which is the whole point of
-       * the mode: the orchestrator decides per unit.
-       */
-      const scopeWorkspace = settingsFor(projectId).workerWorkspace;
-      if (workspace === undefined && scopeWorkspace === "mixed") {
-        throw new Error(
-          "This scope runs workers in both checkouts, so each delegation names where it runs: `workspace: \"shared\"` uses the orchestrator's own checkout, so its edits are visible at once, and `workspace: \"worktree\"` gives the unit its own branch, which stays out until a merge unit brings it in.",
-        );
-      }
-      const unitWorkspace = workspace ?? scopeWorkspace;
-      const parent = await bb.sdk.threads.get({ threadId });
-      /**
-       * The machine a new worktree belongs on: the orchestrator's own, so the unit
-       * sees the same host as the thread that handed it the work. An environment
-       * that cannot be read leaves it unset, which asks BB for this machine.
-       */
-      let parentHostId: string | undefined;
-      if (unitWorkspace === "worktree" && parent.environmentId !== null) {
-        try {
-          parentHostId = (await bb.sdk.environments.get({ environmentId: parent.environmentId })).hostId;
-        } catch {
-          parentHostId = undefined;
-        }
-      }
-      /**
-       * The checkout one unit runs in. Without a worktree it is the orchestrator's
-       * own; with one, BB creates a managed worktree off the project's default
-       * branch on the machine the orchestrator runs on. A check unit or a retry
-       * passes the environment its unit was spawned into, so it inspects and
-       * continues the same working tree instead of opening a second one.
-       */
-      function environmentFor(reuseId: string | null | undefined) {
-        if (reuseId !== null && reuseId !== undefined) {
-          return { type: "reuse" as const, environmentId: reuseId };
-        }
-        if (unitWorkspace !== "worktree") {
-          return parent.environmentId === null
-            ? { type: "project-default" as const }
-            : { type: "reuse" as const, environmentId: parent.environmentId };
-        }
-        return {
-          type: "host" as const,
-          ...(parentHostId === undefined ? {} : { hostId: parentHostId }),
-          workspace: { type: "managed-worktree" as const, baseBranch: { kind: "default" as const } },
-        };
-      }
-      /**
-       * The worker's title, carrying the preset it runs under: the sidebar is the
-       * only place a delegation is visible, and `BUILD: …` says what the thread is
-       * doing before the brief does. A title that already names the preset is left
-       * alone, so the prefix is never doubled.
-       */
-      const baseTitle = title?.trim() || task.trim().split("\n")[0]!.slice(0, 120);
-      const presetPrefix = preset === undefined ? null : `${preset.toUpperCase()}:`;
-      const workerTitle =
-        presetPrefix === null || baseTitle.toUpperCase().startsWith(presetPrefix)
-          ? baseTitle
-          : `${presetPrefix} ${baseTitle}`;
-      const orchestratorId = threadId;
-      const targetProjectId = projectId;
-
-      // The mode has to be on: a stale session can keep this tool after the
-      // thread was switched off, and the review gate does not monitor a thread
-      // that is off, so those workers would never be nudged for a verdict.
-      const orchestratorState = await getState(orchestratorId);
-      if (orchestratorState?.enabled !== true) {
-        throw new Error(
-          "This thread is not in orchestrator mode, so delegations are refused. Turn the mode on in the composer first.",
-        );
-      }
-
-      // A named preset must be stored: silently ignoring one would leave the
-      // orchestrator believing it had asked for a different model. The project's
-      // worker configuration is the one that applies, global values under it.
-      const workerConfig = workerFor(projectId);
-      let presetExec: WorkerExecution = {};
-      if (preset !== undefined) {
-        const stored = workerConfig.presets?.[preset];
-        if (stored === undefined) {
-          const available = Object.keys(workerConfig.presets ?? {});
-          throw new Error(
-            `No \`${preset}\` worker preset is stored.${available.length === 0 ? " This plugin has no presets configured." : ` Stored presets: ${available.join(", ")}.`}`,
-          );
-        }
-        presetExec = stored;
-      }
-
-      // Per-delegation arguments win over a preset, which wins over the worker
-      // settings; a field none of them names is left out so the worker resolves
-      // the project default.
-      const workerExec = reconcile({
-        ...workerDefaults(),
-        ...presetExec,
-        ...(provider === undefined ? {} : { providerId: provider }),
-        ...(model === undefined ? {} : { model }),
-        ...(reasoning === undefined ? {} : { reasoningLevel: reasoning }),
-        ...(permissionMode === undefined ? {} : { permissionMode }),
-      });
-      assertInCatalog(workerExec);
-
-      /**
-       * Spawn one worker on `exec`, in `environment`, and record it against this
-       * orchestrator. The spawned thread comes back so a check unit or a retry can
-       * reuse the checkout this unit was given.
-       */
-      async function spawnWorker(
-        exec: WorkerExecution,
-        workerLabel: string,
-        environment: ReturnType<typeof environmentFor>,
-        options: { brief?: string; verifierFor?: string; pluginInitiated?: boolean } = {},
-      ): Promise<{ id: string; environmentId: string | null }> {
-        const countPerTurn = options.pluginInitiated !== true;
-        await assertWithinBudget(orchestratorId, countPerTurn, targetProjectId);
-        try {
-          const spawned = await bb.sdk.threads.spawn({
-            projectId: targetProjectId,
-            environment,
-            prompt: options.brief ?? task,
-            title: workerLabel,
-            parentThreadId: orchestratorId,
-            ...(hidden === true ? { visibility: "hidden" as const } : {}),
-            ...exec,
-            // The server drops a requested provider/model that carries no
-            // provenance source and re-derives it from the project's remembered
-            // defaults, which would silently undo everything above.
-            ...(Object.keys(exec).length === 0
-              ? {}
-              : { executionInputSources: executionSources(exec) }),
-            pluginMetadata: { workerFor: orchestratorId },
-          });
-          await mutateState(orchestratorId, (current) => ({
-            ...current,
-            delegations: trimDelegations([
-              ...current.delegations,
-              {
-                threadId: spawned.id,
-                title: workerLabel,
-                task: (options.brief ?? task).slice(0, 400),
-                createdAt: Date.now(),
-                status: null,
-                ...(options.verifierFor === undefined
-                  ? {}
-                  : { verifierFor: options.verifierFor, verifiedBy: null, verdict: null }),
-                environmentId: spawned.environmentId ?? null,
-              },
-            ]),
-          }));
-          return { id: spawned.id, environmentId: spawned.environmentId ?? null };
-        } finally {
-          // However the spawn ended, its claim stops counting against the caps.
-          releaseClaim(orchestratorId, countPerTurn);
-        }
-      }
-
-      interface Settled {
-        status: string | null;
-        output: string | null;
-        /** Still working when the deadline passed. */
-        running: boolean;
-      }
-
-      /** Wait for one worker, record how it settled, and read what it said. */
-      async function settle(workerId: string, timeoutMs: number): Promise<Settled> {
-        const deadline = Date.now() + timeoutMs;
-        try {
-          await bb.sdk.threads.wait({ threadId: workerId, status: "idle", timeoutMs, signal });
-        } catch {
-          // `wait` matches one status and polls, so an errored thread never
-          // reaches `idle`: the server rejects the wait immediately with
-          // "will not reach idle by waiting alone" rather than holding until the
-          // timeout. That rejection is what notices a failure promptly, and the
-          // status read below then decides whether to retry. A timeout lands
-          // here too, which is why the status is read either way.
-        }
-        let status: string | null = null;
-        try {
-          status = (await bb.sdk.threads.get({ threadId: workerId })).status;
-        } catch {
-          status = null;
-        }
-        await mutateState(orchestratorId, (current) => ({
-          ...current,
-          delegations: current.delegations.map((delegation) =>
-            delegation.threadId === workerId ? { ...delegation, status } : delegation,
-          ),
-        }));
-        if (Date.now() >= deadline && status !== "idle" && status !== "error") {
-          return { status, output: null, running: true };
-        }
-        let output: string | null = null;
-        try {
-          const result = await bb.sdk.threads.output({ threadId: workerId });
-          output = (result as { output?: string | null }).output ?? null;
-        } catch (cause) {
-          bb.log.warn(`worker output read failed for ${workerId}: ${String(cause)}`);
-        }
-        await maybeArchive(orchestratorId, workerId);
-        return { status, output, running: false };
-      }
-
-      /** The text the orchestrator gets back about one finished worker. */
-      function report(workerId: string, settled: Settled): string {
-        if (settled.running) {
-          return `Worker ${workerId} is still running after ${Math.round(timeoutMs / 1000)}s (status: ${settled.status ?? "unknown"}). Delegate the next unit, or wait and check it again. Do not start doing its work yourself.`;
-        }
-        const trimmed = (settled.output ?? "").trim();
-        const body =
-          trimmed === ""
-            ? "(the worker produced no final text. Open the thread to see what it did.)"
-            : trimmed.length > 12_000
-              ? `${trimmed.slice(0, 12_000)}\n\n[truncated]`
-              : trimmed;
-        return `Worker ${workerId} finished with status "${settled.status ?? "unknown"}".\n\n${body}\n\nReview it. If it is wrong or incomplete, send a follow-up to a worker. Do not fix it yourself.`;
-      }
-
-      /**
-       * Re-delegate the same brief on the fallback, which inherits every field
-       * it does not name from the execution the first attempt used.
-       */
-      async function retryOnFallback(fallback: WorkerExecution, reason: string): Promise<string> {
-        const retryExec = reconcile({ ...workerExec, ...fallback });
-        const target = retryExec.model ?? "the project default";
-        bb.log.warn(`${reason} Retrying on ${target}.`);
-        const retry = await spawnWorker(
-          retryExec,
-          `${workerTitle} (fallback)`,
-          environmentFor(workerEnvironmentId),
-          { pluginInitiated: true },
-        );
-        const retryId = retry.id;
-        const settled = await settle(retryId, timeoutMs);
-        return `${reason} Re-delegated the same brief on \`${target}\` as worker ${retryId}.\n\n${await finish(retryId, `${workerTitle} (fallback)`, settled)}`;
-      }
-
-      /**
-       * Spawn a second worker to check the first one's work, on the same
-       * execution, and hand its report back with the worker's. The check unit
-       * is recorded as evidence for `workerId` and is not itself a unit the
-       * orchestrator has to judge.
-       */
-      async function runVerifier(
-        workerId: string,
-        workerLabel: string,
-        workerOutput: string | null,
-      ): Promise<string> {
-        const brief = buildVerifierBrief({ task, workerTitle: workerLabel, workerOutput });
-        const verifierExec = reconcile({ ...workerExec });
-        let verifierId: string;
-        try {
-          verifierId = (
-            await spawnWorker(verifierExec, `${workerLabel} (check)`, environmentFor(workerEnvironmentId), {
-              brief,
-              verifierFor: workerId,
-              pluginInitiated: true,
-            })
-          ).id;
-        } catch (cause) {
-          bb.log.warn(`check unit for ${workerId} could not start: ${String(cause)}`);
-          return `\n\nNo check unit ran: ${String(cause)}`;
-        }
-        await mutateState(orchestratorId, (current) => ({
-          ...current,
-          delegations: current.delegations.map((delegation) =>
-            delegation.threadId === workerId ? { ...delegation, verifiedBy: verifierId } : delegation,
-          ),
-        }));
-        const checked = await settle(verifierId, timeoutMs);
-        const verdict = (checked.output ?? "").trim();
-        return `\n\nCheck unit ${verifierId} ran the same brief.${
-          checked.running
-            ? " It is still running, so check it before you accept the work."
-            : verdict === ""
-              ? " It produced no final text, so open it before you accept the work."
-              : `\n\n${verdict.length > 8_000 ? `${verdict.slice(0, 8_000)}\n\n[truncated]` : verdict}`
-        }`;
-      }
-
-      /**
-       * What a worktree unit leaves behind, named so it can be reviewed or merged.
-       * An environment that cannot be read still names the id, because that is the
-       * handle every `bb environment` command takes.
-       */
-      async function worktreeNote(environmentId: string | null): Promise<string> {
-        if (unitWorkspace !== "worktree" || environmentId === null) return "";
-        try {
-          const environment = await bb.sdk.environments.get({ environmentId });
-          const branch = environment.branchName;
-          const where = branch === null ? `environment ${environmentId}` : `branch \`${branch}\``;
-          // The merge brief is written out, because the orchestrator cannot merge by
-          // hand: the watchdog counts that as doing the work.
-          const land = `delegate a merge unit with \`workspace: "shared"\`: "Merge ${where} into this checkout and report what conflicts instead of resolving them."`;
-          return `\n\nThis unit ran in its own worktree on ${where}. Nothing is merged from it: \`bb environment diff ${environmentId}\` shows what it changed. To land it, ${land}`;
-        } catch {
-          return `\n\nThis unit ran in its own worktree (environment ${environmentId}). Nothing is merged from it. To land it, delegate a merge unit with \`workspace: "shared"\` naming that environment.`;
-        }
-      }
-
-      /** The worker's report, plus an independent check when one was asked for. */
-      async function finish(
-        workerId: string,
-        workerLabel: string,
-        settled: Settled,
-      ): Promise<string> {
-        const reported = `${report(workerId, settled)}${await worktreeNote(workerEnvironmentId)}`;
-        // Checking a worker that never ran is pointless: there is nothing to
-        // inspect, and the orchestrator has to re-delegate that unit anyway.
-        if (verify !== true || settled.running || settled.status === "error") return reported;
-        return `${reported}${await runVerifier(workerId, workerLabel, settled.output)}`;
-      }
-
-      const timeoutMs = Math.min(Math.max(timeoutSeconds ?? 900, 10), 3600) * 1000;
-      const fallback = workerConfig.fallback;
-      let workerId: string;
-      /** The checkout the unit's workers run in, reused by its check unit and retry. */
-      let workerEnvironmentId: string | null = null;
-      try {
-        const spawned = await spawnWorker(workerExec, workerTitle, environmentFor(null));
-        workerId = spawned.id;
-        workerEnvironmentId = spawned.environmentId;
-      } catch (cause) {
-        // A cap is our own refusal, not a provider that could not start: send
-        // it straight back so the orchestrator changes what it is doing.
-        if (cause instanceof WorkerBudgetError) throw cause;
-        // A spawn that never started a worker is the clearest case for the
-        // fallback: the provider could not serve the requested execution at all.
-        if (fallback === undefined) throw cause;
-        return await retryOnFallback(
-          fallback,
-          `Worker could not start on \`${workerExec.model ?? "the project default"}\`: ${String(cause)}`,
-        );
-      }
-
-      if (waitForResult === false) {
-        const retry = fallback === undefined ? "" : " If it fails, re-delegate it on the configured fallback.";
-        return `Delegated without waiting.\nWorker thread ${workerId}, titled "${workerTitle}"\nCheck on it later and fold its result into your report.${retry}${await worktreeNote(workerEnvironmentId)}`;
-      }
-
-      const first = await settle(workerId, timeoutMs);
-      if (first.running || first.status !== "error" || fallback === undefined) {
-        return await finish(workerId, workerTitle, first);
-      }
-      return await retryOnFallback(fallback, `Worker ${workerId} failed.`);
-    },
+    parameters: delegateParameters,
+    execute: delegateTask,
   });
 
   bb.agents.registerTool({
@@ -2740,6 +2760,38 @@ export default async function plugin(bb: BbPluginApi) {
             return render(input.options.json, state, describeState(threadId, state, scope));
           },
         }),
+        delegate: cliCommand({
+          summary: "Delegate to a worker when the native tool is unavailable",
+          options: {
+            ...threadOption,
+            task: { type: "string", required: true, description: "Complete, self-contained worker brief (1–20,000 characters)" },
+            title: { type: "string", description: "Worker title (at most 200 characters)" },
+            "no-wait": { type: "boolean", description: "Return immediately so other units can be delegated" },
+            timeout: { type: "integer", min: 10, max: 3600, description: "Wait timeout in seconds (default 900)" },
+            hidden: { type: "boolean", description: "Keep the worker out of the sidebar" },
+          },
+          async run(input, ctx) {
+            const threadId = resolveThreadId(input.options.thread, ctx);
+            const parsed = delegateParameters.safeParse({
+              task: input.options.task,
+              title: input.options.title,
+              waitForResult: input.options["no-wait"] !== true,
+              timeoutSeconds: input.options.timeout,
+              hidden: input.options.hidden,
+            });
+            if (!parsed.success) {
+              throw new PluginCliError("invalid delegation arguments", {
+                code: "invalid_arguments",
+                hint: parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; "),
+              });
+            }
+            const output = await delegateTask(parsed.data, {
+              ...ctx, threadId,
+              projectId: input.options.thread === undefined ? ctx.projectId : undefined,
+            });
+            return render(input.options.json, { output }, output);
+          },
+        }),
         on: cliCommand({
           summary: "Turn orchestrator mode on for a thread",
           options: {
@@ -2763,7 +2815,7 @@ export default async function plugin(bb: BbPluginApi) {
               input.options.json,
               dto,
               `Orchestrator mode ON for ${threadId} (${dto.effectiveEnforcement}).\n` +
-                "Applies when the provider session is next constructed. A live session keeps the instructions it started with.",
+                "Running turns are notified now. If the native tool is unavailable, use bb orchestrator-mode delegate.",
             );
           },
         }),

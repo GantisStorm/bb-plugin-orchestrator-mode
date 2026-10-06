@@ -242,6 +242,27 @@ async function arm(harness: FakePluginHarness): Promise<void> {
 }
 
 describe("agent configuration", () => {
+  it("does not start a turn just to notify an idle thread", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    await harness.behavior.callRpc("set_enabled", { threadId: THREAD, enabled: false });
+    expect(sentTexts).toEqual([]);
+  });
+
+  it("notifies an active session when its mode changes", async () => {
+    const { harness } = await load();
+    harness.inspection.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: THREAD, status: "active" }),
+    );
+    await enable(harness);
+    expect(sentTexts).toHaveLength(1);
+    expect(sentTexts[0]).toContain("ORCHESTRATOR MODE IS ON");
+    expect(sentTexts[0]).toContain("bb orchestrator-mode delegate");
+    await harness.behavior.callRpc("set_enabled", { threadId: THREAD, enabled: false });
+    expect(sentTexts).toHaveLength(2);
+    expect(sentTexts[1]).toContain("Orchestrator mode is now off");
+  });
+
   it("hands an enabled thread the contract and the delegation tool", async () => {
     const { harness } = await load();
     await enable(harness);
@@ -583,16 +604,23 @@ describe("the watchdog", () => {
     expect(stoppedThreads).toEqual([]);
   });
 
-  it("lets read-only commands through", async () => {
+  it.each([
+    "git status",
+    "bb status --json; bb provider models codex --environment env_bucd4j3r9b --json",
+  ])("lets read-only command `%s` through", async (command) => {
     const { harness } = await load({ enforcement: "block", allowReadCommands: true });
     await arm(harness);
     timelineRows = [
       ...timelineRows,
-      workRow({ id: "row_ls", workKind: "command", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, command: "git status" }),
+      workRow({ id: "row_ls", workKind: "command", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, command }),
     ];
     timelineMaxSeq = 4;
     await idle(harness);
     await new Promise((resolve) => setTimeout(resolve, 350));
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      violations: unknown[];
+    };
+    expect(state.violations).toEqual([]);
     expect(stoppedThreads).toEqual([]);
     expect(sentTexts).toEqual([]);
   });
@@ -2350,6 +2378,105 @@ describe("cli", () => {
     expect(state.unreviewed).toBe(250);
     expect(state.delegations.map((delegation) => delegation.threadId)).toContain("th_w260");
     expect(state.delegations.map((delegation) => delegation.threadId)).not.toContain("th_w1");
+  });
+
+  it("delegates after enabling a session that started without the native tool", async () => {
+    const { harness } = await load();
+    const originalSession = await harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({ thread: { id: THREAD } }),
+    );
+    expect(originalSession.tools).toEqual([]);
+    await enable(harness);
+    const result = await harness.behavior.runCli([
+      "delegate", "--task", "Implement the retry policy; add tests", "--title", "Retry policy",
+    ], { threadId: THREAD, projectId: "proj_1" });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain(WORKER);
+    expect(result.stdout).toContain("the worker finished the task");
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toMatchObject({
+      projectId: "proj_1", parentThreadId: THREAD,
+      prompt: "Implement the retry policy; add tests", title: "Retry policy",
+      environment: { type: "reuse", environmentId: "env_1" },
+    });
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      delegations: [{ threadId: WORKER, status: "idle" }],
+    });
+  });
+
+  it("supports CLI fan-out and derives an explicit parent's project", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    harness.inspection.sdk.stub("threads.get", async () =>
+      makeThreadResponse({ id: THREAD, projectId: "proj_parent", environmentId: "env_1" }),
+    );
+    const result = await harness.behavior.runCli([
+      "delegate", "--thread", THREAD, "--task", "Implement retries", "--no-wait", "--hidden", "--json",
+    ], { projectId: "proj_elsewhere" });
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout!).output).toContain("without waiting");
+    expect(spawned[0]).toMatchObject({
+      projectId: "proj_parent", parentThreadId: THREAD, visibility: "hidden",
+    });
+    expect(harness.inspection.sdk.callsTo("threads.wait")).toEqual([]);
+  });
+
+  it.each(["tool", "cli"])("preserves project worker execution through %s delegation", async (route) => {
+    const { harness } = await load();
+    await enable(harness);
+    await harness.behavior.callRpc("set_project_worker", {
+      projectId: "proj_1",
+      config: { providerId: "acp-omp", model: "command-code/deepseek/deepseek-v4.1-flash-fast", reasoningLevel: "high" },
+    });
+    const context = { threadId: THREAD, projectId: "proj_1" };
+    if (route === "tool") {
+      await harness.behavior.callAgentTool(DELEGATE_TOOL, { task: "Review scoped execution", waitForResult: false }, context);
+    } else {
+      const result = await harness.behavior.runCli(["delegate", "--task", "Review scoped execution", "--no-wait"], context);
+      expect(result.exitCode).toBe(0);
+    }
+    expect(spawned[0]).toMatchObject({
+      projectId: "proj_1", providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast", reasoningLevel: "high",
+    });
+    expect(spawned[0]).not.toHaveProperty("fallback");
+    expect(spawned[0]).not.toHaveProperty("presets");
+  });
+
+  it("keeps the worker cap on CLI delegation", async () => {
+    const { harness } = await load({ maxParallelWorkers: 1 });
+    await enable(harness);
+    const context = { threadId: THREAD, projectId: "proj_1" };
+    const first = await harness.behavior.runCli(["delegate", "--task", "First unit", "--no-wait"], context);
+    expect(first.exitCode).toBe(0);
+    const second = await harness.behavior.runCli(["delegate", "--task", "Second unit", "--no-wait", "--json"], context);
+    expect(second.exitCode).toBe(1);
+    expect(spawned).toHaveLength(1);
+  });
+
+  it("refuses CLI delegation after the mode is switched off", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    await harness.behavior.callRpc("set_enabled", { threadId: THREAD, enabled: false });
+    const result = await harness.behavior.runCli(["delegate", "--task", "Stale session unit", "--json"], {
+      threadId: THREAD, projectId: "proj_1",
+    });
+    expect(result.exitCode).toBe(1);
+    expect(spawned).toEqual([]);
+  });
+
+  it("rejects invalid CLI delegation arguments before spawning", async () => {
+    const { harness } = await load();
+    for (const args of [
+      ["--task", ""],
+      ["--task", "x".repeat(20_001)],
+      ["--task", "x", "--timeout", "9"],
+    ]) {
+      const result = await harness.behavior.runCli(["delegate", ...args, "--json"], { threadId: THREAD });
+      expect(result.exitCode).toBe(1);
+      expect(JSON.parse(result.stdout!).ok).toBe(false);
+    }
+    expect(spawned).toEqual([]);
   });
 
   it("turns the mode on and reports it", async () => {
