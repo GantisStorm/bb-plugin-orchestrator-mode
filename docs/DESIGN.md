@@ -54,7 +54,8 @@ and tags, changing remotes and rewriting reflogs count as work.
 
 In `instruct`, no watchdog classification runs. In `guard`, new violations are
 recorded and the thread receives corrective messages up to the nudge cap, with
-at most one nudge per offending turn. In `block`, the plugin also asks BB to
+at most one nudge per offending turn. The review gate draws on the same cap, so
+one budget covers both kinds of correction; `status` reports the split. In `block`, the plugin also asks BB to
 stop the offending turn, at most once per turn, even after the nudge cap.
 
 Thread events coalesce scans with a 750 ms delay; idle events use 250 ms. These
@@ -123,5 +124,8 @@ wrong; presets swap sections and project rules append one.
 
 `configure` truncates dynamic instructions at 4096 characters, so the budget is
 an invariant rather than a hope: the budget test builds the largest contract
-every preset can produce with an appended section at the cap, and asserts it
-fits. That test is what sets the append cap.
+every preset can produce — the longest model id the catalog accepts, presets in
+every kind, five reminders, an appended section at the cap — and asserts it fits
+and that the tail survives. That test is what sets the append cap, and the
+render clamps the append as its last resort rather than handing BB a block it
+would cut.

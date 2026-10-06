@@ -337,6 +337,18 @@ describe("read-only classifier soundness (oracle-found defects)", () => {
     ["PATH=/nonexistent ls", false],
     ["PAGER='rm canary.txt' git log", false],
     ["GIT_EXTERNAL_DIFF='touch CANARY' git diff", false],
+    // The `-c` spelling of the same variables the environment spelling above covers:
+    // `core.fsmonitor` runs during `git status`, with no TTY to notice.
+    ["git -c core.fsmonitor=/tmp/evil.sh status", false],
+    ["git -c core.pager='touch /tmp/pwned' log", false],
+    ["git -c core.editor=/tmp/evil.sh log", false],
+    ["git --exec-path=/tmp/evil status", false],
+    ["git --config-env=core.pager=EVIL log", false],
+    // The read-only global option stays a read: only the program-naming ones are work.
+    ["git -C repo status", true],
+    // `bb plugin rpc call` runs a plugin's own operation, whatever it does.
+    ["bb plugin rpc call harness-parity execute --input-file request.json", false],
+    ["bb plugin list", true],
     ["LD_PRELOAD=./evil.so ls", false],
     ["GIT_DIR=/nonexistent git status", false],
     ["FOO=bar ls", true],
@@ -491,6 +503,22 @@ describe("telling a command from a tool call's title", () => {
     }
   });
 
+  it("does not let a prose prefix exempt what follows a separator", () => {
+    for (const command of [
+      "Review the changes; rm -rf build",
+      "Check the build && git push origin main --force",
+      "Deploy | rm -rf dist",
+    ]) {
+      for (const allowReadCommands of [true, false]) {
+        expect(
+          classifyRow(row({ id: `probe_6b_${command}`, workKind: "command", command }), {
+            allowReadCommands,
+          }),
+        ).not.toBeNull();
+      }
+    }
+  });
+
   it("reads an unknown program as work, in both read modes", () => {
     for (const command of ["gradlew build", "just test", "flutter build apk"]) {
       for (const allowReadCommands of [true, false]) {
@@ -546,7 +574,7 @@ describe("the contract", () => {
           reminders: Array.from({ length: 5 }, (_, index) => `ran \`${"npm test " + index}\``),
           workerConfig: {
             providerId: "command-code",
-            model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+            model: `command-code/${"m".repeat(187)}`,
             reasoningLevel: "high",
             serviceTier: "fast",
             permissionMode: "accept-edits",
@@ -560,7 +588,10 @@ describe("the contract", () => {
           extra: "x".repeat(EXTRA_INSTRUCTION_LIMIT),
           preset,
         });
-        expect(text.length).toBeLessThanOrEqual(4096);
+        expect(text.length).toBeLessThanOrEqual(INSTRUCTION_LIMIT);
+        // The clamp exists so the tail — what to do when delegation is impossible —
+        // is never the part BB silently cuts.
+        expect(text).toContain("If you cannot delegate");
        }
       }
     }

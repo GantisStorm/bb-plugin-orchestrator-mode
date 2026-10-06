@@ -2090,6 +2090,58 @@ describe("state persistence", () => {
 });
 
 describe("cli", () => {
+  it("reports the reminder budget split by the gate that spent it", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    harness.inspection.sdk.stub("threads.timeline", async () => ({
+      rows: [],
+      maxSeq: 4,
+      delta: {
+        upsertRows: [
+          workRow({
+            id: "row_split", workKind: "file-change", turnId: "turn_2",
+            sourceSeqStart: 3, sourceSeqEnd: 4, change: { path: "split.ts" },
+          }),
+        ],
+      },
+    }));
+    await idle(harness);
+    await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
+
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as OrchestratorStateDto;
+    expect(state).toMatchObject({ nudgeCount: 1, violationNudges: 1, reviewNudges: 0 });
+
+    const status = await harness.behavior.runCli(["status", "--thread", THREAD]);
+    expect(status.stdout).toContain("1 direct work, 0 unjudged workers");
+  });
+
+  it("bounds the verdict-owed records that outlive the newest window", async () => {
+    const { harness } = await load({ enforcement: "instruct", maxParallelWorkers: 0, maxDelegationsPerTurn: 0 });
+    await enable(harness, THREAD, "instruct");
+    let workerNumber = 0;
+    harness.inspection.sdk.stub("threads.spawn", async () =>
+      makeThreadResponse({ id: `th_w${++workerNumber}`, parentThreadId: THREAD }),
+    );
+    // Past both the record window (50) and the verdict-owed ceiling (200): the array is
+    // re-serialized on every mutation, so "never drop an owed record" needs a bound of its
+    // own. The newest owed records survive.
+    for (let index = 0; index < 260; index += 1) {
+      await harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task: `Task ${index}` },
+        { threadId: THREAD, projectId: "proj_1" },
+      );
+    }
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      delegations: { threadId: string }[];
+      unreviewed: number;
+    };
+    expect(state.delegations.length).toBe(250);
+    expect(state.unreviewed).toBe(250);
+    expect(state.delegations.map((delegation) => delegation.threadId)).toContain("th_w260");
+    expect(state.delegations.map((delegation) => delegation.threadId)).not.toContain("th_w1");
+  });
+
   it("turns the mode on and reports it", async () => {
     const { harness } = await load();
     const on = await harness.behavior.runCli(["on", "--thread", THREAD]);

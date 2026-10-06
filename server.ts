@@ -39,6 +39,7 @@ import {
   WORKER_PRESETS,
   SERVICE_TIERS,
   EXTRA_INSTRUCTION_LIMIT,
+  INSTRUCTION_LIMIT,
   buildInstructions,
   buildNudge,
   buildReviewNudge,
@@ -76,6 +77,14 @@ const DEFAULT_KEY = "default";
 const WORKER_KEY = "worker";
 /** The stored project rules appended to the contract. */
 const CONTRACT_KEY = "contract";
+/**
+ * Verdict-owed records kept outside the newest window. They are exempt from the
+ * window itself so a late verdict is never refused, which is exactly why they need
+ * a cap: an orchestrator that never records verdicts would otherwise grow the
+ * array, and the whole state is re-serialized into KV on every mutation.
+ */
+const MAX_UNJUDGED_RETAINED = 200;
+
 /** Threads kept in the KV map before the least recently touched is dropped. */
 const MAX_THREADS = 300;
 /**
@@ -136,6 +145,9 @@ export interface ThreadState {
   /** How many grace turns this enablement gets: two mid-turn, one when idle. */
   graceSlots: number;
   nudgeCount: number;
+  /** How much of `nudgeCount` the watchdog spent, and how much the review gate spent. */
+  violationNudges: number;
+  reviewNudges: number;
   lastNudgeTurnId: string | null;
   lastStopTurnId: string | null;
   delegations: Delegation[];
@@ -219,6 +231,8 @@ const stateSchema = z.object({
   violations: z.array(violationSchema),
   delegations: z.array(delegationSchema),
   nudgeCount: z.number(),
+  violationNudges: z.number(),
+  reviewNudges: z.number(),
   /** The plugin-wide default, so the new-thread composer can render it. */
   defaultForNewThreads: z.boolean(),
   allowReadCommands: z.boolean(),
@@ -419,7 +433,7 @@ export default async function plugin(bb: BbPluginApi) {
       type: "number",
       label: "Reminders per thread",
       description:
-        "How many times this plugin may prod one thread, once for doing work itself and once for leaving a worker unjudged. Violations keep being recorded after the cap; only the reminders stop. 0 turns reminders off.",
+        "How many times this plugin may prod one thread for either reason, doing work itself or leaving a worker unjudged. It is one budget shared by both gates, whichever spends it first; `bb orchestrator-mode status` reports the split. Violations keep being recorded after the cap, and only the reminders stop. 0 turns reminders off.",
       default: 3,
     },
     maxParallelWorkers: {
@@ -743,7 +757,7 @@ export default async function plugin(bb: BbPluginApi) {
     const text = next.trim();
     if (text.length > EXTRA_INSTRUCTION_LIMIT) {
       throw new Error(
-        `Project rules are capped at ${EXTRA_INSTRUCTION_LIMIT} characters so the contract stays inside the 4096-character limit; that text is ${text.length}.`,
+        `Project rules are capped at ${EXTRA_INSTRUCTION_LIMIT} characters so the contract stays inside the ${INSTRUCTION_LIMIT}-character limit; that text is ${text.length}.`,
       );
     }
     await bb.storage.kv.set(CONTRACT_KEY, { extra: text });
@@ -925,6 +939,8 @@ export default async function plugin(bb: BbPluginApi) {
       graceSlots: typeof state.graceSlots === "number" ? state.graceSlots : 1,
       lastSeq: typeof state.lastSeq === "number" ? state.lastSeq : 0,
       nudgeCount: typeof state.nudgeCount === "number" ? state.nudgeCount : 0,
+      violationNudges: typeof state.violationNudges === "number" ? state.violationNudges : 0,
+      reviewNudges: typeof state.reviewNudges === "number" ? state.reviewNudges : 0,
     };
   }
 
@@ -946,6 +962,8 @@ export default async function plugin(bb: BbPluginApi) {
       graceTurnIds: [],
       graceSlots: 1,
       nudgeCount: 0,
+      violationNudges: 0,
+      reviewNudges: 0,
       lastNudgeTurnId: null,
       lastStopTurnId: null,
       delegations: [],
@@ -988,6 +1006,8 @@ export default async function plugin(bb: BbPluginApi) {
       ...current,
       violations: [],
       nudgeCount: 0,
+      violationNudges: 0,
+      reviewNudges: 0,
       lastNudgeTurnId: null,
       lastStopTurnId: null,
       // The review reminder is a correction counter too. Leaving its marker here
@@ -1078,6 +1098,8 @@ export default async function plugin(bb: BbPluginApi) {
       violations: base.violations.slice(-MAX_VIOLATIONS),
       delegations: trimDelegations(base.delegations),
       nudgeCount: base.nudgeCount,
+      violationNudges: base.violationNudges,
+      reviewNudges: base.reviewNudges,
       defaultForNewThreads: live.defaultForNewThreads,
       allowReadCommands: live.allowReadCommands,
       maxNudges: live.maxNudges,
@@ -1089,10 +1111,6 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  /**
-   * Settled workers whose result nobody has judged. A worker still running has
-   * nothing to review yet, so it is not counted.
-   */
   /** Settled, unjudged, and not a check unit: a delegation the orchestrator still owes a verdict. */
   function needsVerdict(delegation: Delegation): boolean {
     return (
@@ -1112,10 +1130,17 @@ export default async function plugin(bb: BbPluginApi) {
     if (delegations.length <= MAX_DELEGATIONS) return [...delegations];
     const recent = delegations.slice(-MAX_DELEGATIONS);
     const kept = new Set(recent.map((delegation) => delegation.threadId));
-    return [
-      ...delegations.filter((delegation) => !kept.has(delegation.threadId) && needsVerdict(delegation)),
-      ...recent,
-    ];
+    const owed = delegations.filter((delegation) => !kept.has(delegation.threadId) && needsVerdict(delegation));
+    // The newest owed records are the ones a verdict is still plausible for; the
+    // oldest fall away once the cap is reached, and the drop is named rather than
+    // silent, the way a pruned thread is.
+    const retained = owed.slice(-MAX_UNJUDGED_RETAINED);
+    if (retained.length < owed.length) {
+      bb.log.warn(
+        `delegation records over cap: dropped ${owed.length - retained.length} oldest verdict-owed record(s)`,
+      );
+    }
+    return [...retained, ...recent];
   }
 
   function unreviewedOf(delegations: readonly Delegation[]): Delegation[] {
@@ -1185,6 +1210,8 @@ export default async function plugin(bb: BbPluginApi) {
       graceTurnIds: enabled ? graceTurnIds : current.graceTurnIds,
       graceSlots: enabled ? graceSlots : current.graceSlots,
       nudgeCount: enabled ? current.nudgeCount : 0,
+      violationNudges: enabled ? current.violationNudges : 0,
+      reviewNudges: enabled ? current.reviewNudges : 0,
       lastNudgeTurnId: enabled ? current.lastNudgeTurnId : null,
       lastStopTurnId: enabled ? current.lastStopTurnId : null,
       lastReviewNudge: enabled ? current.lastReviewNudge : null,
@@ -1891,6 +1918,7 @@ export default async function plugin(bb: BbPluginApi) {
       await mutateState(threadId, (current) => ({
         ...current,
         nudgeCount: current.nudgeCount + 1,
+        violationNudges: current.violationNudges + 1,
         lastNudgeTurnId: liveTurnKey,
       }));
     } catch (cause) {
@@ -1968,14 +1996,6 @@ export default async function plugin(bb: BbPluginApi) {
     await checkReviews(owner);
   }
 
-  /**
-   * The review gate: a turn that ended with workers nobody judged gets one
-   * reminder, and only while its orchestrator is idle, since a nudge sent mid-turn
-   * would queue behind the very work it is asking about.
-   *
-   * A finished turn cannot be stopped after the fact, so `block` behaves as
-   * `guard` here. That limit is documented rather than papered over.
-   */
   /**
    * Archive a worker the retention policy covers. Called where the plugin learns
    * the orchestrator has read a result: when it settles a worker it was waiting
@@ -2063,6 +2083,18 @@ export default async function plugin(bb: BbPluginApi) {
     return marker;
   }
 
+  /**
+   * The review gate: a turn that ended with workers nobody judged gets one
+   * reminder, and only while its orchestrator is idle, since a nudge sent mid-turn
+   * would queue behind the very work it is asking about.
+   *
+   * A finished turn cannot be stopped after the fact, so `block` behaves as
+   * `guard` here. That limit is documented rather than papered over.
+   *
+   * It draws on the same per-thread reminder budget as the watchdog: one budget for
+   * corrections, whichever gate spends it, which `describeState` now reports split
+   * by gate.
+   */
   async function checkReviews(threadId: string): Promise<void> {
     // Cheap guard first: an unrelated idle event should not cost a thread read.
     const before = await getState(threadId);
@@ -2087,7 +2119,12 @@ export default async function plugin(bb: BbPluginApi) {
         marker,
         enforcement: effectiveEnforcement(current),
       };
-      return { ...current, nudgeCount: current.nudgeCount + 1, lastReviewNudge: marker };
+      return {
+        ...current,
+        nudgeCount: current.nudgeCount + 1,
+        reviewNudges: current.reviewNudges + 1,
+        lastReviewNudge: marker,
+      };
     });
     if (claimed === undefined) return;
     const { titles, count, marker, enforcement } = claimed;
@@ -2109,7 +2146,12 @@ export default async function plugin(bb: BbPluginApi) {
       // Give the reminder back: the marker would otherwise mute the gate for this set.
       await mutateState(threadId, (current) =>
         current.lastReviewNudge === marker
-          ? { ...current, nudgeCount: Math.max(0, current.nudgeCount - 1), lastReviewNudge: null }
+          ? {
+              ...current,
+              nudgeCount: Math.max(0, current.nudgeCount - 1),
+              reviewNudges: Math.max(0, current.reviewNudges - 1),
+              lastReviewNudge: null,
+            }
           : current,
       ).catch(() => undefined);
     }
@@ -2211,7 +2253,7 @@ export default async function plugin(bb: BbPluginApi) {
         state.enforcement === null ? " (plugin default)" : " (thread override)"
       }`,
       `  violations:        ${state.violations.length}`,
-      `  nudges sent:       ${state.nudgeCount} of ${state.maxNudges}`,
+      `  nudges sent:       ${state.nudgeCount} of ${state.maxNudges} (${state.violationNudges} direct work, ${state.reviewNudges} unjudged workers)`,
       `  delegations:       ${state.delegations.length}`,
       `  workers run as:    ${describeWorkerExecution(state.workerExecution)}`,
       `  reviews:           ${state.reviewed} judged, ${state.unreviewed} waiting`,
@@ -2312,7 +2354,7 @@ export default async function plugin(bb: BbPluginApi) {
               {
                 threadId,
                 chars: text.length,
-                ceiling: 4096,
+                ceiling: INSTRUCTION_LIMIT,
                 extra: extraInstructions,
                 extraLimit: EXTRA_INSTRUCTION_LIMIT,
                 text,
