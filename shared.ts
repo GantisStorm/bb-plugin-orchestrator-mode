@@ -683,10 +683,14 @@ const SENTENCE_WORD = /^[a-z][a-z'-]*$/;
  * program settles it either way; otherwise a lone capitalised token — a
  * capitalised program with no lowercase word after it — reads as a program.
  *
- * The known residual: a detached capitalised program followed by a lowercase
- * argument (`Gradlew build`, `Just test`) is read as a title and missed,
- * because nothing outside the program list distinguishes it from prose. The
- * lowercase form (`gradlew build`) and the path form (`./Gradlew build`) are
+ * It is asked about one command segment at a time, never the whole row: a
+ * provider's title never contains an unquoted separator, so `Review the
+ * changes; rm -rf build` is a command line whose second segment is not a title.
+ *
+ * The known residual, per segment: a detached capitalised program followed by a
+ * lowercase argument (`Gradlew build`, `Just test`) is read as a title and
+ * missed, because nothing outside the program list distinguishes it from prose.
+ * The lowercase form (`gradlew build`) and the path form (`./Gradlew build`) are
  * both caught.
  */
 function looksLikeShellCommand(command: string): boolean {
@@ -702,6 +706,17 @@ function looksLikeShellCommand(command: string): boolean {
   // A sentence needs a lowercase word after its first token; without one the
   // text is a bare capitalised token, which reads as a program, not prose.
   return !tokens.slice(1).some((token) => SENTENCE_WORD.test(token));
+}
+
+/**
+ * Whether a whole `command` row reads as a provider title: every segment has to.
+ * One segment that looks like a command makes the row a command line, because a
+ * title never carries an unquoted separator.
+ */
+function looksLikeTitleRow(command: string): boolean {
+  const segments = scanCommandLine(command).segments.filter((segment) => segment.trim() !== "");
+  if (segments.length === 0) return false;
+  return segments.every((segment) => !looksLikeShellCommand(segment));
 }
 
 const READ_ONLY_GIT_SUBCOMMANDS: ReadonlySet<string> = new Set([
@@ -752,6 +767,25 @@ const GIT_GLOBAL_VALUE_FLAGS: Record<string, true> = {
   "--exec-path": true,
   "--config-env": true,
 };
+
+/**
+ * Global `git` options that hand git a program to run: `-c core.pager=…`,
+ * `-c core.fsmonitor=…`, `--config-env=core.editor=…`, `--exec-path=…`. They sit
+ * before the subcommand, so skipping them as ordinary global options is what let
+ * `git -c core.fsmonitor=/tmp/evil.sh status` read as read-only. None of them
+ * can make a read a read; treating every one as work is the trade this module
+ * makes everywhere else.
+ */
+function gitRunsAProgram(rest: readonly string[]): boolean {
+  for (const token of rest) {
+    if (!token.startsWith("-")) return false;
+    if (token === "-C") continue;
+    if (token === "-c" || (token.startsWith("-c") && token.length > 2)) return true;
+    if (token === "--config-env" || token.startsWith("--config-env=")) return true;
+    if (token === "--exec-path" || token.startsWith("--exec-path=")) return true;
+  }
+  return false;
+}
 
 /** The subcommand after any leading global options: `git -C repo status` reads `status`, not `-C`. */
 function gitSubcommandAndArgs(rest: readonly string[]): { subcommand: string | undefined; args: string[] } {
@@ -837,7 +871,10 @@ const READ_ONLY_BB_SUBCOMMANDS: ReadonlySet<string> = new Set(["status", "guide"
  * let a thread switch off its own leash, so only `status` is listed.
  */
 const READ_ONLY_BB_VERBS: Record<string, ReadonlySet<string>> = {
-  plugin: new Set(["list", "logs", "source", "search", "rpc", "outdated"]),
+  // `rpc` is deliberately absent: `bb plugin rpc call <plugin> <operation>` runs a
+  // plugin's own operation, which this module cannot model and which is how a
+  // mutating call reads as a read.
+  plugin: new Set(["list", "logs", "source", "search", "outdated"]),
   // The orchestrator needs these to pick worker models the catalog can serve.
   provider: new Set(["list", "models"]),
   thread: new Set([
@@ -1037,6 +1074,9 @@ function isReadOnlySegment(segment: string): boolean {
   const name = program.replace(/^.*\//, "");
   const args = tokens.slice(index + 1).filter((token) => !FD_REDIRECT.test(token));
   if (name === "git") {
+    // A global option that names a program to run is work, whatever the
+    // subcommand reads: `git -c core.pager='touch /tmp/pwned' log` runs it.
+    if (gitRunsAProgram(args)) return false;
     // Git answers `--help` before running a plain subcommand, but not before a
     // mixed one: `git config --global user.email x --help` still writes.
     if (!gitHelpIsSafe(args)) return isReadOnlyGitSegment(args);
@@ -1129,7 +1169,7 @@ export function classifyRow(
     // the call's title. That is not the orchestrator running anything, and
     // flagging it tells the orchestrator off for using the tools this plugin
     // gave it, which is the fastest way for a watchdog to lose its authority.
-    if (command !== "" && !looksLikeShellCommand(command)) {
+    if (command !== "" && looksLikeTitleRow(command)) {
       return null;
     }
     const shown = command.length > 80 ? `${command.slice(0, 77)}...` : command;
@@ -1285,7 +1325,7 @@ export function buildInstructions(input: InstructionInput): string {
       ? ""
       : `\n\nYou have already broken this contract in this thread:\n${lines.map((line) => `- ${line}`).join("\n")}`;
 
-  const render = (lines: readonly string[]): string => `# ORCHESTRATOR MODE IS ON FOR THIS THREAD
+  const render = (lines: readonly string[], extra = input.extra): string => `# ORCHESTRATOR MODE IS ON FOR THIS THREAD
 
 You are an orchestrator. You do not do the work. Every unit of actual work is
 handed to a worker thread, and your own output is the plan, the delegation, and
@@ -1335,7 +1375,7 @@ ${workerBudget(input.workerConfig)} Override it per delegation with the
 cheaper one.${savedPresets} Valid ids come from the catalog: \`bb provider list\`,
 then \`bb provider models <provider>\`. Both are read-only.
 
-${extraBudget(input.extra)}## If you cannot delegate
+${extraBudget(extra)}## If you cannot delegate
 
 Say so plainly and stop. "I cannot do this without doing the work myself" is a
 correct answer; doing the work yourself is not. Do not disable or argue with
@@ -1349,7 +1389,17 @@ this mode. Ask the user to turn it off in the composer if it is wrong.${reminder
     const candidate = render(reminderLines.slice(reminderLines.length - keep));
     if (candidate.length <= INSTRUCTION_LIMIT) return candidate;
   }
-  return render([]);
+  // Nothing left to give up but the project-rules append, so it is clamped by what the
+  // fixed sections left behind. Returning the unclamped block would hand BB more than it
+  // keeps, and it cuts the tail — which is the part that says what to do when delegation
+  // is impossible. A slicing fallback survives only if the fixed sections alone exceed the
+  // ceiling, which the budget test measures with the longest model id the catalog holds.
+  const base = render([]);
+  if (base.length <= INSTRUCTION_LIMIT) return base;
+  const excess = base.length - INSTRUCTION_LIMIT;
+  const extra = (input.extra ?? "").slice(0, Math.max(0, (input.extra ?? "").length - excess));
+  const clamped = render([], extra);
+  return clamped.length <= INSTRUCTION_LIMIT ? clamped : clamped.slice(0, INSTRUCTION_LIMIT);
 }
 
 /**

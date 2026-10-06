@@ -34,6 +34,7 @@ import { toast } from "sonner";
 import type { ContractDto, OrchestratorStateDto, rpcContract } from "./server";
 import {
   ENFORCEMENT_DESCRIPTIONS,
+  INSTRUCTION_LIMIT,
   type WorkerConfig,
   type WorkerExecution,
   type WorkerPresetName,
@@ -371,10 +372,7 @@ function WorkerExecutionSettings() {
 
   /** The stored execution, only when it names the provider and model the
    * pickers need; null while the workers inherit the project's own. */
-  const execution =
-    stored === null || stored.providerId === undefined || stored.model === undefined
-      ? null
-      : stored;
+  const execution = completeExecution(stored);
   const saveRules = useCallback(async () => {
     if (draft === null) return;
     setBusy(true);
@@ -388,7 +386,9 @@ function WorkerExecutionSettings() {
     }
   }, [draft, rpc]);
 
-  const fallback = stored?.fallback ?? null;
+  // A fallback that lost the ids an uninstalled provider can take with it is kept as
+  // none, the way the server drops half a retry target instead of retrying on it.
+  const fallback = completeExecution(stored?.fallback ?? null);
 
   return (
     <div className="rounded-md border border-border bg-surface-recessed/70 p-3">
@@ -505,7 +505,7 @@ function WorkerExecutionSettings() {
             }
           />
           <PermissionModePicker
-            providerId={fallback.providerId!}
+            providerId={fallback.providerId}
             value={fallback.permissionMode ?? execution?.permissionMode ?? "full"}
             disabled={busy}
             className="h-8 shrink-0"
@@ -523,6 +523,10 @@ function WorkerExecutionSettings() {
         <div className="mt-2 flex flex-col gap-2">
           {PRESET_ROWS.map(({ name, label, hint }) => {
             const preset = stored?.presets?.[name] ?? null;
+            // Partial presets are a stored shape the CLI can write and an uninstalled
+            // provider can cause, so the pickers only render when both ids they need are
+            // there; otherwise the row explains itself and keeps Set/Default usable.
+            const complete = completeExecution(preset);
             return (
               <div key={name} className="flex flex-wrap items-center gap-2">
                 <span className="w-16 shrink-0 text-xs font-medium">{label}</span>
@@ -558,12 +562,14 @@ function WorkerExecutionSettings() {
                 >
                   Set
                 </Button>
-                {preset === null ? (
-                  <span className="text-xs text-subtle-foreground/75">{hint}</span>
+                {complete === null ? (
+                  <span className="text-xs text-subtle-foreground/75">
+                    {preset === null ? hint : "Saved without a provider and model; press Set to choose them, or Default to clear it."}
+                  </span>
                 ) : (
                   <>
                     <ProviderModelPicker
-                      value={selectionOf(preset)}
+                      value={selectionOf(complete)}
                       disabled={busy}
                       className="h-8 max-w-full"
                       onChange={(next) =>
@@ -571,14 +577,14 @@ function WorkerExecutionSettings() {
                       }
                     />
                     <PermissionModePicker
-                      providerId={preset.providerId!}
-                      value={preset.permissionMode ?? execution?.permissionMode ?? "full"}
+                      providerId={complete.providerId}
+                      value={complete.permissionMode ?? execution?.permissionMode ?? "full"}
                       disabled={busy}
                       className="h-8 shrink-0"
                       onChange={(permissionMode) =>
                         void save({
                           ...stored,
-                          presets: { ...(stored?.presets ?? {}), [name]: { ...preset, permissionMode } },
+                          presets: { ...(stored?.presets ?? {}), [name]: { ...complete, permissionMode } },
                         })
                       }
                     />
@@ -626,7 +632,7 @@ function WorkerExecutionSettings() {
         <summary className="cursor-pointer text-sm font-medium">
           The contract: the exact instructions this plugin adds
           <span className="ml-2 font-normal text-subtle-foreground/75">
-            {contract === null ? "" : `${contract.text.length} of 4096 characters`}
+            {contract === null ? "" : `${contract.text.length} of ${INSTRUCTION_LIMIT} characters`}
           </span>
         </summary>
         <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap rounded-md border border-border/60 bg-card p-2 font-mono text-xs leading-snug text-foreground/90">
@@ -638,11 +644,25 @@ function WorkerExecutionSettings() {
   );
 }
 
+/** The execution shape that can be rendered: both ids the pickers need are present. */
+type CompleteExecution = WorkerConfig & { providerId: string; model: string };
+
+/**
+ * The stored execution as the pickers can render it, or null when the provider or model
+ * is missing. A partial value is a real stored shape (the CLI can write one, and
+ * uninstalling a provider creates one), so it is never handed to a picker that needs both.
+ */
+function completeExecution(stored: WorkerConfig | null | undefined): CompleteExecution | null {
+  return stored === null || stored === undefined || stored.providerId === undefined || stored.model === undefined
+    ? null
+    : { ...stored, providerId: stored.providerId, model: stored.model };
+}
+
 /** The picker's own value shape, filled from what is stored. */
-function selectionOf(stored: WorkerExecution): ExperimentalProviderModelPickerValue {
+function selectionOf(stored: CompleteExecution): ExperimentalProviderModelPickerValue {
   return {
-    providerId: stored.providerId!,
-    model: stored.model!,
+    providerId: stored.providerId,
+    model: stored.model,
     reasoningLevel: stored.reasoningLevel ?? "medium",
     ...(stored.serviceTier === undefined ? {} : { serviceTier: stored.serviceTier }),
   };

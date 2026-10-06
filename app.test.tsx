@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { act, cleanup, fireEvent, within } from "@testing-library/react";
 import { loadPluginApp, renderSlot, type RenderedSlot } from "@get-bb/plugin-sdk/testing/app";
 import type { rpcContract } from "./server";
-import type { EnforcementLevel, Violation } from "./shared";
+import type { EnforcementLevel, Violation, WorkerConfig } from "./shared";
 
 const app = await loadPluginApp(() => import("./app"));
 const customization = app.composerCustomizations[0]!;
@@ -302,5 +302,115 @@ describe("new-thread composer", () => {
     const host = mount(Host, rpc, composeOptions());
     await flush();
     expect(host.container.textContent).toBe("");
+  });
+});
+
+describe("the workers settings section", () => {
+  /** The section's own RPC surface: the worker configuration and the rules append. */
+  function makeSettingsRpc(initial: WorkerConfig = {}) {
+    let worker: WorkerConfig = initial;
+    let extra = "";
+    const calls: { method: string; input: unknown }[] = [];
+    const handlers = {
+      get_worker_execution: async () => {
+        calls.push({ method: "get_worker_execution", input: null });
+        return worker;
+      },
+      set_worker_execution: async (next: WorkerConfig | null) => {
+        calls.push({ method: "set_worker_execution", input: next });
+        worker = next ?? {};
+        return worker;
+      },
+      get_contract: async () => {
+        calls.push({ method: "get_contract", input: { threadId: null } });
+        return { text: "contract text", extra, limit: 370 };
+      },
+      set_contract: async (input: { extra: string }) => {
+        calls.push({ method: "set_contract", input });
+        extra = input.extra;
+        return { text: "contract text", extra, limit: 370 };
+      },
+    };
+    return { handlers, calls, worker: () => worker };
+  }
+
+  /** A catalog stand-in: one available provider, one default model. */
+  const settingsSdk = {
+    providers: {
+      models: async (input?: { providerId?: string }) =>
+        input?.providerId === undefined
+          ? { providers: [{ id: "command-code", name: "Command Code", available: true }], permissionCeiling: "accept-edits" }
+          : { models: [{ id: "model-a", name: "Model A", isDefault: true, defaultReasoningEffort: "high" }] },
+    },
+  };
+
+  const section = app.settingsSections[0]!;
+
+  function mountSettings(rpc: ReturnType<typeof makeSettingsRpc>) {
+    const slot = renderSlot({ component: section.component }, {}, {
+      rpc: rpc.handlers as never,
+      sdk: settingsSdk as never,
+    });
+    slots.push(slot);
+    return slot;
+  }
+
+  const lastWrite = (rpc: ReturnType<typeof makeSettingsRpc>) =>
+    [...rpc.calls].reverse().find((call) => call.method === "set_worker_execution")?.input as WorkerConfig | undefined;
+
+  it("writes a seeded execution on Custom and clears it on Inherit", async () => {
+    const rpc = makeSettingsRpc();
+    const slot = mountSettings(rpc);
+    await flush();
+
+    await click(within(slot.container).getByRole("button", { name: "Custom" }));
+    expect(lastWrite(rpc)).toMatchObject({ providerId: "command-code", model: "model-a", reasoningLevel: "high" });
+
+    await click(within(slot.container).getByRole("button", { name: "Inherit" }));
+    expect(lastWrite(rpc)).toEqual({});
+  });
+
+  it("sets a retry target on Retry and drops it on Report", async () => {
+    const rpc = makeSettingsRpc({ providerId: "command-code", model: "model-a" });
+    const slot = mountSettings(rpc);
+    await flush();
+
+    await click(within(slot.container).getByRole("button", { name: "Retry" }));
+    expect(lastWrite(rpc)).toMatchObject({ fallback: { providerId: "command-code", model: "model-a" } });
+
+    await click(within(slot.container).getByRole("button", { name: "Report" }));
+    expect(lastWrite(rpc)).toEqual({ providerId: "command-code", model: "model-a" });
+  });
+
+  it("shows a partial preset as repairable instead of Unsupported", async () => {
+    const rpc = makeSettingsRpc({ providerId: "command-code", model: "model-a", presets: { research: { reasoningLevel: "high" } } });
+    const slot = mountSettings(rpc);
+    await flush();
+
+    // Scoped to the Research row: the provider pickers elsewhere on the page render the
+    // SDK's own "Unsupported" for a model their catalog does not list, which is not this.
+    const researchRow = within(slot.container).getByText("Research").closest("div")!;
+    expect(researchRow.textContent).not.toContain("Unsupported");
+    expect(researchRow.textContent).toContain("Saved without a provider and model");
+
+    // The Set button repairs it into a complete preset, which is what fills the row.
+    const setButtons = within(slot.container).getAllByRole("button", { name: "Set" });
+    await click(setButtons[2]!);
+    expect(lastWrite(rpc)).toMatchObject({ presets: { research: { providerId: "command-code", model: "model-a" } } });
+  });
+
+  it("writes the project rules through", async () => {
+    const rpc = makeSettingsRpc();
+    const slot = mountSettings(rpc);
+    await flush();
+
+    const textarea = within(slot.container).getByRole("textbox");
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "Never touch files under generated/." } });
+    });
+    await click(within(slot.container).getByRole("button", { name: "Save rules" }));
+    expect(rpc.calls.filter((call) => call.method === "set_contract").at(-1)?.input).toEqual({
+      extra: "Never touch files under generated/.",
+    });
   });
 });
