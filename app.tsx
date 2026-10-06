@@ -16,7 +16,7 @@
 // thread's state; in the root compose screen it writes the plugin's "new
 // threads start as orchestrators" default, which the backend applies to the
 // thread's first dispatch.
-import { useCallback, useEffect, useReducer, useState } from "react";
+import { useCallback, useEffect, useReducer, useState, type ReactNode } from "react";
 import {
   definePluginApp,
   experimental_PermissionModePicker as PermissionModePicker,
@@ -31,8 +31,9 @@ import {
   type PluginComposerScope,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
-import { WORKER_RETENTION, type ContractDto, type OrchestratorStateDto, type SettingsViewDto, type rpcContract } from "./server";
+import { WORKER_RETENTION, WORKER_RETENTION_DESCRIPTIONS, type ContractDto, type OrchestratorStateDto, type ScopeSettingsDto, type SettingsViewDto, type rpcContract } from "./server";
 import {
+  CONTRACT_PRESET_DESCRIPTIONS,
   CONTRACT_PRESETS,
   ENFORCEMENT_DESCRIPTIONS,
   ENFORCEMENT_LEVELS,
@@ -301,20 +302,27 @@ function OrchestratorToggle() {
 /**
  * The Settings → Installed plugins → Orchestrator Mode surface.
  *
- * Worker execution is not a plugin setting: the model list has to follow the
- * chosen provider, and a `select` cannot depend on another `select`. BB's own
- * provider/model picker resolves provider, model, reasoning level and service
- * tier against the live catalog as one coherent value, the same value
- * `threads.spawn` takes. That is why the choice is stored through this plugin's
- * RPC and
- * rendered with that picker. Each choice is a pressed pair, so `Inherit` is a
- * visible option rather than only the absence of one.
+ * One section, one scope: **Scope** at the top decides whose values everything
+ * below reads and writes. Global is the record every project inherits, and a
+ * project stores only the fields it changes — a cleared field inherits again.
+ * The section renders the editor itself because BB's settings form has one value
+ * per install, and these resolve per project.
+ *
+ * Worker execution still uses BB's provider/model picker: the model list has to
+ * follow the chosen provider, and a `select` cannot depend on another `select`.
+ * That picker resolves provider, model, reasoning level and service tier against
+ * the live catalog as one coherent value, the same value `threads.spawn` takes.
+ * That is why the choice is stored through this plugin's RPC. Each choice is a
+ * pressed pair, so `Inherit` is a visible option rather than only the absence of
+ * one.
  */
-function WorkerExecutionSettings() {
+function ScopeSettings() {
   const rpc = useRpc<typeof rpcContract>();
   const sdk = useSdk();
   const [scope, setScope] = useState<string | null>(null);
   const [projects, setProjects] = useState<{ id: string; name: string }[]>([]);
+  const [settings, setSettings] = useState<ScopeSettingsDto | null>(null);
+  const [newThreads, setNewThreads] = useState(false);
   const [stored, setStored] = useState<WorkerConfig | null>(null);
   const [contract, setContract] = useState<ContractDto | null>(null);
   const [draft, setDraft] = useState<string | null>(null);
@@ -326,9 +334,11 @@ function WorkerExecutionSettings() {
       const listed = await sdk.projects.list({ includePersonal: true });
       setProjects(listed.map((project) => ({ id: project.id, name: project.name ?? project.id })));
     } catch {
-      // Without the list the selector stays on Global; the plugin settings above still apply.
+      // Without the list the selector stays on Global; the rows below still apply.
     }
     try {
+      setSettings(await rpc.call("get_scope_settings", { projectId: scope }));
+      setNewThreads((await rpc.call("get_default")).enabled);
       if (scope === null) {
         setStored(await rpc.call("get_worker_execution"));
         setContract(await rpc.call("get_contract", { threadId: null }));
@@ -350,7 +360,41 @@ function WorkerExecutionSettings() {
     void load();
   });
 
-  /** Write the configuration. A promise is awaited first, so a caller that has
+  /**
+   * Write one setting in the selected scope. A project reads null as "inherit
+   * again"; the global record has nothing above it, so the server refuses null
+   * there and this never sends one.
+   */
+  const writeSetting = useCallback(
+    async (key: SettingsKey, value: string | number | boolean | null) => {
+      setBusy(true);
+      try {
+        setSettings(await rpc.call("set_scope_setting", { projectId: scope, key, value }));
+      } catch (cause) {
+        toast.error(message(cause));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [rpc, scope],
+  );
+
+  /** The composer default is one plugin-wide switch, not a per-project one. */
+  const saveNewThreads = useCallback(
+    async (enabled: boolean) => {
+      setBusy(true);
+      try {
+        setNewThreads((await rpc.call("set_default", { enabled })).enabled);
+      } catch (cause) {
+        toast.error(message(cause));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [rpc],
+  );
+
+  /** Write the worker configuration. A promise is awaited first, so a caller that has
    * to read the catalog before it knows the value passes one. */
   const save = useCallback(
     async (next: WorkerConfig | null | Promise<WorkerConfig>) => {
@@ -417,39 +461,235 @@ function WorkerExecutionSettings() {
   // none, the way the server drops half a retry target instead of retrying on it.
   const fallback = completeExecution(stored?.fallback ?? null);
 
+  const off = loading || busy || settings === null;
+  const overridden = (key: SettingsKey) => settings?.overridden.includes(key) ?? false;
+
+  /** One enum setting, in the selected scope. In a project scope the first option
+   * is the inherited value, and picking it hands the override back. */
+  const enumRow = (
+    key: SettingsKey,
+    label: string,
+    hint: string,
+    options: readonly { value: string; label: string; help: string }[],
+  ) => {
+    const value = settings?.values[key];
+    const global = settings?.global[key];
+    // The same option list names the inherited value, so `Inherit (allowed)`
+    // reads as the choice it stands for rather than the stored `true`.
+    const inherited = options.find((option) => option.value === String(global))?.label ?? String(global);
+    return (
+      <SettingRow
+        key={key}
+        label={label}
+        hint={
+          <>
+            {hint}
+            <OptionHelp>
+              {options.map((option) => (
+                <OptionLine key={option.value} label={option.label} help={option.help} />
+              ))}
+            </OptionHelp>
+          </>
+        }
+      >
+        <select
+          aria-label={label}
+          value={scope === null || overridden(key) ? String(value ?? "") : ""}
+          disabled={off}
+          className="h-7 shrink-0 rounded-md border border-border/60 bg-card px-1.5 text-xs"
+          onChange={(event) =>
+            void writeSetting(key, event.target.value === "" ? null : event.target.value)
+          }
+        >
+          {scope === null ? null : (
+            <option value="">{global === undefined ? "Inherit" : `Inherit (${inherited})`}</option>
+          )}
+          {options
+            .filter((option) => scope === null || option.value !== String(global))
+            .map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+        </select>
+        {scope !== null && overridden(key) ? (
+          <span className="shrink-0 text-xs text-subtle-foreground/75">overrides Global</span>
+        ) : null}
+      </SettingRow>
+    );
+  };
+
+  /** One numeric cap. A project shows Inherit only once it has an override; the
+   * input always shows the value in force. */
+  const numberRow = (
+    key: "maxNudges" | "maxParallelWorkers" | "maxDelegationsPerTurn",
+    label: string,
+    hint: string,
+  ) => (
+    <SettingRow key={key} label={label} hint={hint}>
+      <input
+        type="number"
+        min={0}
+        aria-label={label}
+        value={settings?.values[key] ?? 0}
+        disabled={off}
+        className="h-7 w-20 shrink-0 rounded-md border border-border/60 bg-card px-1.5 text-xs"
+        onChange={(event) => void writeSetting(key, Number(event.target.value))}
+      />
+      {scope !== null && overridden(key) ? (
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 shrink-0 px-2 text-xs"
+          disabled={off}
+          onClick={() => void writeSetting(key, null)}
+        >
+          Inherit
+        </Button>
+      ) : null}
+    </SettingRow>
+  );
+
   return (
     <div className="rounded-md border border-border bg-surface-recessed/70 p-3">
-      <div className="flex flex-wrap items-center gap-2 border-b border-border/60 pb-3">
-        <label className="text-sm font-medium" htmlFor="orchestrator-scope">
-          Scope
-        </label>
-        <select
-          id="orchestrator-scope"
-          value={scope ?? ""}
-          disabled={loading || busy}
-          className="h-8 rounded-md border border-border/60 bg-card px-2 text-xs"
-          onChange={(event) => {
-            setLoading(true);
-            setScope(event.target.value === "" ? null : event.target.value);
-          }}
+      <div className="border-b border-border/60 pb-3">
+        <SettingRow
+          label="Scope"
+          hint={
+            scope === null
+              ? "Global: the values every project inherits."
+              : "This project's overrides. Anything it does not override comes from Global, and Inherit hands one back."
+          }
         >
-          <option value="">Global</option>
-          {projects.map((project) => (
-            <option key={project.id} value={project.id}>
-              {project.name}
-            </option>
-          ))}
-        </select>
-        <span className="text-xs text-subtle-foreground/75">
-          {scope === null
-            ? "the defaults every project inherits"
-            : "this project's own worker execution, presets, rules and limits"}
-        </span>
+          <select
+            id="orchestrator-scope"
+            aria-label="Scope"
+            value={scope ?? ""}
+            disabled={loading || busy}
+            className="h-8 shrink-0 rounded-md border border-border/60 bg-card px-2 text-xs"
+            onChange={(event) => {
+              setLoading(true);
+              setScope(event.target.value === "" ? null : event.target.value);
+            }}
+          >
+            <option value="">Global</option>
+            {projects.map((project) => (
+              <option key={project.id} value={project.id}>
+                {project.name}
+              </option>
+            ))}
+          </select>
+        </SettingRow>
       </div>
 
-      {scope === null ? null : <ProjectOverrides rpc={rpc} projectId={scope} disabled={busy} />}
+      <div className="mt-3 flex flex-col gap-2.5">
+        {enumRow(
+          "enforcement",
+          "Enforcement",
+          "How hard the watchdog pushes back when the orchestrator does work itself.",
+          ENFORCEMENT_LEVELS.map((level) => ({
+            value: level,
+            label: level,
+            help: ENFORCEMENT_DESCRIPTIONS[level],
+          })),
+        )}
+        {enumRow(
+          "allowReadCommands",
+          "Read-only commands",
+          "Whether looking around with the shell counts as work.",
+          [
+            {
+              value: "true",
+              label: "allowed",
+              help: "Allowed treats ls, cat, rg, git status, git diff and similar as looking around rather than doing the work.",
+            },
+            {
+              value: "false",
+              label: "every command is work",
+              help: "Every command is work counts even a read as the orchestrator doing the work itself.",
+            },
+          ],
+        )}
+        {numberRow(
+          "maxNudges",
+          "Reminders per thread",
+          "How many times this plugin may prod one thread, for either reason: doing work itself, or leaving a worker unjudged. One budget shared by both gates, whichever spends it first, and `bb orchestrator-mode status` reports the split. 0 turns reminders off; violations keep being recorded.",
+        )}
+        {numberRow(
+          "maxParallelWorkers",
+          "Workers running at once",
+          "Once this many workers are running, further delegations are refused and told why. Check units and fallbacks count too. 0 removes the cap.",
+        )}
+        {numberRow(
+          "maxDelegationsPerTurn",
+          "Workers per turn",
+          "A delegation is refused once one turn has delegated this many, so a runaway fan-out stops instead of filling the sidebar. Check units and fallback retries are the plugin's own doing and do not count. 0 removes the cap.",
+        )}
+        {enumRow(
+          "contractPreset",
+          "What the orchestrator is told",
+          "How much reading and checking the contract asks for. The exact text is at the bottom of this section.",
+          CONTRACT_PRESETS.map((preset) => ({
+            value: preset,
+            label: preset,
+            help: CONTRACT_PRESET_DESCRIPTIONS[preset],
+          })),
+        )}
+        {enumRow(
+          "workerRetention",
+          "Workers afterwards",
+          "What happens to a worker once its result has been read. Archiving hides a thread from the sidebar, but it stays recoverable.",
+          WORKER_RETENTION.map((policy) => ({
+            value: policy,
+            label: policy,
+            help: WORKER_RETENTION_DESCRIPTIONS[policy],
+          })),
+        )}
+        {scope === null ? (
+          <SettingRow
+            label="Start new threads as orchestrators"
+            hint={
+              <>
+                A composer default, the same for every project; threads already open, child workers and
+                side chats are never affected.
+                <OptionHelp>
+                  <OptionLine
+                    label="On"
+                    help="starts the threads you create from the composer in orchestrator mode."
+                  />
+                  <OptionLine
+                    label="Off"
+                    help="starts new threads as ordinary threads; you can still switch any thread on yourself."
+                  />
+                </OptionHelp>
+              </>
+            }
+          >
+            <Button
+              variant={newThreads ? "ghost" : "secondary"}
+              size="sm"
+              aria-pressed={!newThreads}
+              disabled={loading || busy}
+              className="h-7 px-2 text-xs"
+              onClick={() => void saveNewThreads(false)}
+            >
+              Off
+            </Button>
+            <Button
+              variant={newThreads ? "secondary" : "ghost"}
+              size="sm"
+              aria-pressed={newThreads}
+              disabled={loading || busy}
+              className="h-7 px-2 text-xs"
+              onClick={() => void saveNewThreads(true)}
+            >
+              On
+            </Button>
+          </SettingRow>
+        ) : null}
+      </div>
 
-      <div className="mt-3 flex items-start justify-between gap-6">
+      <div className="mt-3 border-t border-border/60 pt-3 flex items-start justify-between gap-6">
         <div className="min-w-0">
           <div className="text-sm font-medium">Which provider and model workers use</div>
           <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
@@ -654,10 +894,11 @@ function WorkerExecutionSettings() {
       </div>
 
       <div className="mt-3 border-t border-border/60 pt-3">
-        <div className="text-sm font-medium">Extra rules for this project</div>
+        <div className="text-sm font-medium">Extra rules</div>
         <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
-          Added to the contract as its own section, so a rule adds to what the orchestrator is
-          told instead of replacing the rules the watchdog enforces.
+          {scope === null
+            ? "Added to the contract as its own section, so a rule adds to what the orchestrator is told instead of replacing the rules the watchdog enforces."
+            : "Added to the contract the same way. A project with rules of its own uses them in place of the global ones."}
         </p>
         <textarea
           value={draft ?? contract?.extra ?? ""}
@@ -701,145 +942,56 @@ function WorkerExecutionSettings() {
   );
 }
 
+/** The settings keys the rows write; the RPC contract takes the same names. */
+type SettingsKey = keyof SettingsViewDto;
+
 /**
- * The settings a project can override, and the ones it inherits. Each row writes one
- * field through `set_project_setting`; a value of null clears the override, which is
- * what Inherit does. Absent from this list on purpose: `defaultForNewThreads` is a
- * composer default rather than thread behaviour, so it stays global.
+ * One row of the settings list: what the setting does, its control, and the state
+ * the control writes from. Labels sit on the left and controls on the right, the
+ * way BB's own settings rows read.
  */
-function ProjectOverrides({
-  rpc,
-  projectId,
-  disabled,
+function SettingRow({
+  label,
+  hint,
+  children,
 }: {
-  rpc: ReturnType<typeof useRpc<typeof rpcContract>>;
-  projectId: string;
-  disabled: boolean;
+  label: string;
+  hint: ReactNode;
+  children: ReactNode;
 }) {
-  const [view, setView] = useState<{ values: SettingsViewDto; overridden: string[] } | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  const load = useCallback(async () => {
-    try {
-      setView(await rpc.call("get_project_settings", { projectId }));
-    } catch {
-      // The rows render empty rather than lying about what is stored.
-    }
-  }, [rpc, projectId]);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
-  useRealtime("orchestrator-state", () => {
-    void load();
-  });
-
-  const write = useCallback(
-    async (key: string, value: string | number | boolean | null) => {
-      setBusy(true);
-      try {
-        setView(await rpc.call("set_project_setting", { projectId, key: key as never, value }));
-      } catch (cause) {
-        toast.error(message(cause));
-      } finally {
-        setBusy(false);
-      }
-    },
-    [rpc, projectId],
-  );
-
-  const overridden = new Set(view?.overridden ?? []);
-  const values = view?.values;
-  const off = disabled || busy || view === null;
-
-  /** One row: the effective value, a control that writes the override, and Inherit. */
-  const row = (
-    key: keyof SettingsViewDto,
-    label: string,
-    options: { value: string; label: string }[],
-  ) => (
-    <div className="flex flex-wrap items-center gap-2">
-      <span className="w-40 shrink-0 text-xs font-medium">{label}</span>
-      <select
-        aria-label={label}
-        value={overridden.has(key) ? String(values?.[key]) : ""}
-        disabled={off}
-        className="h-7 rounded-md border border-border/60 bg-card px-1.5 text-xs"
-        onChange={(event) =>
-          void write(key, event.target.value === "" ? null : event.target.value)
-        }
-      >
-        <option value="">
-          {values === undefined ? "Inherit" : `Inherit (${String(values[key])})`}
-        </option>
-        {options
-          .filter((option) => option.value !== String(values?.[key]))
-          .map((option) => (
-            <option key={option.value} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-      </select>
-      {overridden.has(key) ? (
-        <span className="text-xs text-subtle-foreground/75">overrides the global value</span>
-      ) : (
-        <span className="text-xs text-subtle-foreground/75">inherits</span>
-      )}
-    </div>
-  );
-
-  /** A numeric row: the input always shows the effective value, and Inherit clears the override. */
-  const numberRow = (
-    key: "maxNudges" | "maxParallelWorkers" | "maxDelegationsPerTurn",
-    label: string,
-    hint: string,
-  ) => (
-    <div className="flex flex-wrap items-center gap-2">
-      <span className="w-40 shrink-0 text-xs font-medium">{label}</span>
-      <input
-        type="number"
-        min={0}
-        aria-label={label}
-        value={values?.[key] ?? 0}
-        disabled={off}
-        className="h-7 w-20 rounded-md border border-border/60 bg-card px-1.5 text-xs"
-        onChange={(event) => void write(key, Number(event.target.value))}
-      />
-      {overridden.has(key) ? (
-        <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs" disabled={off} onClick={() => void write(key, null)}>
-          Inherit
-        </Button>
-      ) : (
-        <span className="text-xs text-subtle-foreground/75">inherits</span>
-      )}
-      <span className="text-xs text-subtle-foreground/75">{hint}</span>
-    </div>
-  );
-
   return (
-    <div className="mt-3 rounded-md border border-border/60 bg-card/40 p-2">
-      <div className="text-sm font-medium">Enforcement and limits for this project</div>
-      <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
-        Override any field for this project alone; Inherit hands it back to the global value.
-        Threads keep their own enforcement switch either way.
-      </p>
-      <div className="mt-2 flex flex-col gap-1.5">
-        {row(
-          "enforcement",
-          "Enforcement",
-          ENFORCEMENT_LEVELS.map((level) => ({ value: level, label: level })),
-        )}
-        {row("allowReadCommands", "Read-only commands", [
-          { value: "true", label: "allowed" },
-          { value: "false", label: "every command is work" },
-        ])}
-        {row("contractPreset", "Contract shape", CONTRACT_PRESETS.map((preset) => ({ value: preset, label: preset })))}
-        {row("workerRetention", "Workers afterwards", WORKER_RETENTION.map((policy) => ({ value: policy, label: policy })))}
-        {numberRow("maxNudges", "Reminders per thread", "0 turns reminders off")}
-        {numberRow("maxParallelWorkers", "Most workers at once", "0 removes the cap")}
-        {numberRow("maxDelegationsPerTurn", "Most workers per turn", "0 removes the cap")}
+    <div className="flex flex-wrap items-start justify-between gap-3">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm">{label}</div>
+        <div className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">{hint}</div>
       </div>
+      <div className="flex shrink-0 items-center gap-1.5">{children}</div>
     </div>
+  );
+}
+
+/**
+ * What every choice of one setting does, one line each. A `select` cannot explain
+ * the options it is not on, and "which of these do I want" is decided by exactly
+ * that, so the row carries the list.
+ */
+function OptionHelp({ children }: { children: ReactNode }) {
+  return <ul className="mt-1.5 flex flex-col gap-0.5">{children}</ul>;
+}
+
+/**
+ * One choice in a help list. A description that opens with the choice's own name
+ * — the convention the shared description maps follow — has that name emphasised
+ * where it already is rather than printed twice.
+ */
+function OptionLine({ label, help }: { label: string; help: string }) {
+  const opening = `${label.charAt(0).toUpperCase()}${label.slice(1)} `;
+  const names = help.startsWith(opening);
+  return (
+    <li>
+      <span className="font-medium text-foreground/85">{names ? opening.trimEnd() : label}</span>{" "}
+      {names ? help.slice(opening.length) : help}
+    </li>
   );
 }
 
@@ -875,11 +1027,11 @@ function dropFallback(config: WorkerConfig | null): WorkerConfig {
 
 export default definePluginApp((app) => {
   app.slots.settingsSection({
-    id: "worker-execution",
-    title: "Workers",
+    id: "scope",
+    title: "Settings",
     description:
-      "What delegated workers run on, how a failure is retried, and one-word presets a delegation can name. Enforcement, the contract and the limits are in the plugin settings above.",
-    component: WorkerExecutionSettings,
+      "Pick a scope with the selector: Global edits the values every project inherits, a project edits only what it changes. The plugin renders this itself, because BB's settings form holds one value per install and these resolve per project.",
+    component: ScopeSettings,
   });
 
   app.composer.customize({

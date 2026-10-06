@@ -305,27 +305,42 @@ describe("new-thread composer", () => {
   });
 });
 
-describe("the workers settings section", () => {
-  /** The section's own RPC surface: the worker configuration and the rules append. */
+describe("the settings section", () => {
+  /** The section's own RPC surface: the settings of one scope, the worker configuration and the rules append. */
   function makeSettingsRpc(initial: WorkerConfig = {}) {
     let worker: WorkerConfig = initial;
     let extra = "";
-    const projectWorker: Record<string, WorkerConfig> = {};
-    const projectRules: Record<string, string> = {};
-    const projectSettings: Record<string, Record<string, unknown>> = {};
-    /** The globals, with this project's overrides applied — what the server would resolve. */
-    const scopeValues = (projectId: string) => ({
-      enforcement: "guard" as const,
+    let newThreads = false;
+    /** The global record the server would resolve every scope over. */
+    const globals: Record<string, unknown> = {
+      enforcement: "guard",
       allowReadCommands: true,
       maxNudges: 3,
       maxParallelWorkers: 6,
       maxDelegationsPerTurn: 20,
-      contractPreset: "standard" as const,
-      workerRetention: "keep" as const,
-      ...(projectSettings[projectId] ?? {}),
+      contractPreset: "standard",
+      workerRetention: "keep",
+    };
+    const projectWorker: Record<string, WorkerConfig> = {};
+    const projectRules: Record<string, string> = {};
+    const projectSettings: Record<string, Record<string, unknown>> = {};
+    /** One scope's settings as the server returns them. */
+    const scopeView = (projectId: string | null) => ({
+      values: projectId === null ? globals : { ...globals, ...(projectSettings[projectId] ?? {}) },
+      global: globals,
+      overridden: projectId === null ? [] : Object.keys(projectSettings[projectId] ?? {}),
     });
     const calls: { method: string; input: unknown }[] = [];
     const handlers = {
+      get_default: async () => {
+        calls.push({ method: "get_default", input: null });
+        return { enabled: newThreads };
+      },
+      set_default: async (input: { enabled: boolean }) => {
+        calls.push({ method: "set_default", input });
+        newThreads = input.enabled;
+        return { enabled: newThreads };
+      },
       get_worker_execution: async () => {
         calls.push({ method: "get_worker_execution", input: null });
         return worker;
@@ -363,20 +378,30 @@ describe("the workers settings section", () => {
         projectRules[input.projectId] = input.extra;
         return { text: "contract text", extra: input.extra, limit: 370 };
       },
-      get_project_settings: async (input: { projectId: string }) => {
-        calls.push({ method: "get_project_settings", input });
-        return { values: scopeValues(input.projectId), overridden: Object.keys(projectSettings[input.projectId] ?? {}) };
+      get_scope_settings: async (input: { projectId: string | null }) => {
+        calls.push({ method: "get_scope_settings", input });
+        return scopeView(input.projectId);
       },
-      set_project_setting: async (input: { projectId: string; key: string; value: unknown }) => {
-        calls.push({ method: "set_project_setting", input });
-        const current = { ...(projectSettings[input.projectId] ?? {}) } as Record<string, unknown>;
-        if (input.value === null) delete current[input.key];
-        else current[input.key] = input.value;
-        projectSettings[input.projectId] = current as never;
-        return { values: scopeValues(input.projectId), overridden: Object.keys(current) };
+      set_scope_setting: async (input: { projectId: string | null; key: string; value: unknown }) => {
+        calls.push({ method: "set_scope_setting", input });
+        if (input.projectId === null) {
+          globals[input.key] = input.value;
+        } else {
+          const current = { ...(projectSettings[input.projectId] ?? {}) };
+          if (input.value === null) delete current[input.key];
+          else current[input.key] = input.value;
+          projectSettings[input.projectId] = current;
+        }
+        return scopeView(input.projectId);
       },
     };
-    return { handlers, calls, worker: () => worker };
+    return {
+      handlers,
+      calls,
+      /** The inputs one method was called with, in order. */
+      inputsOf: (method: string) => calls.filter((call) => call.method === method).map((call) => call.input),
+      worker: () => worker,
+    };
   }
 
   /** A catalog stand-in: one available provider, one default model. */
@@ -464,6 +489,47 @@ describe("the workers settings section", () => {
       extra: "Never touch files under generated/.",
     });
   });
+  it("writes the global record from the rows while Global is selected", async () => {
+    const rpc = makeSettingsRpc();
+    const slot = mountSettings(rpc);
+    await flush();
+
+    // Global scope offers no Inherit: the record has nothing above it to fall back to.
+    const enforcement = within(slot.container).getByLabelText("Enforcement") as HTMLSelectElement;
+    expect(Array.from(enforcement.options, (option) => option.textContent)).toEqual([
+      "instruct",
+      "guard",
+      "block",
+    ]);
+    await act(async () => {
+      fireEvent.change(enforcement, { target: { value: "block" } });
+    });
+    await flush();
+    expect(rpc.calls.filter((call) => call.method === "set_scope_setting").at(-1)?.input).toEqual({
+      projectId: null,
+      key: "enforcement",
+      value: "block",
+    });
+    expect((within(slot.container).getByLabelText("Enforcement") as HTMLSelectElement).value).toBe("block");
+  });
+
+  it("keeps the new-thread default global, and out of a project's scope", async () => {
+    const rpc = makeSettingsRpc();
+    const slot = mountSettings(rpc);
+    await flush();
+
+    await click(within(slot.container).getByRole("button", { name: "On" }));
+    expect(rpc.calls.filter((call) => call.method === "set_default").at(-1)?.input).toEqual({ enabled: true });
+
+    // A project has no such setting: it is a composer default, not thread behaviour.
+    const selector = within(slot.container).getByLabelText("Scope") as HTMLSelectElement;
+    await act(async () => {
+      fireEvent.change(selector, { target: { value: "proj_alpha" } });
+    });
+    await flush();
+    expect(within(slot.container).queryByText("Start new threads as orchestrators")).toBeNull();
+  });
+
   it("scopes the section to a project, and writes the override there", async () => {
     const rpc = makeSettingsRpc();
     const slot = mountSettings(rpc);
@@ -478,15 +544,20 @@ describe("the workers settings section", () => {
       fireEvent.change(selector, { target: { value: "proj_alpha" } });
     });
     await flush();
-    expect(rpc.calls.some((call) => call.method === "get_project_worker" && (call.input as { projectId: string }).projectId === "proj_alpha")).toBe(true);
+    expect(rpc.inputsOf("get_project_worker")).toContainEqual({ projectId: "proj_alpha" });
 
     // A settings row writes one field for the project, and Inherit clears it again.
     const enforcement = within(slot.container).getByLabelText("Enforcement") as HTMLSelectElement;
+    expect(Array.from(enforcement.options, (option) => option.textContent)).toEqual([
+      "Inherit (guard)",
+      "instruct",
+      "block",
+    ]);
     await act(async () => {
       fireEvent.change(enforcement, { target: { value: "block" } });
     });
     await flush();
-    expect(rpc.calls.filter((call) => call.method === "set_project_setting").at(-1)?.input).toEqual({
+    expect(rpc.calls.filter((call) => call.method === "set_scope_setting").at(-1)?.input).toEqual({
       projectId: "proj_alpha",
       key: "enforcement",
       value: "block",
@@ -494,10 +565,10 @@ describe("the workers settings section", () => {
 
     // The select's first option is the inherit affordance for an enum row.
     await act(async () => {
-      fireEvent.change(enforcement, { target: { value: "" } });
+      fireEvent.change(within(slot.container).getByLabelText("Enforcement"), { target: { value: "" } });
     });
     await flush();
-    expect(rpc.calls.filter((call) => call.method === "set_project_setting").at(-1)?.input).toEqual({
+    expect(rpc.calls.filter((call) => call.method === "set_scope_setting").at(-1)?.input).toEqual({
       projectId: "proj_alpha",
       key: "enforcement",
       value: null,

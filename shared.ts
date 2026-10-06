@@ -1212,6 +1212,23 @@ export const CONTRACT_PRESETS = [
 export type ContractPresetId = (typeof CONTRACT_PRESETS)[number];
 
 /**
+ * One line per preset, so the settings row can explain every shape rather than
+ * only the one in force. Wording is the same as the contract's own, shortened to
+ * one sentence each.
+ */
+export const CONTRACT_PRESET_DESCRIPTIONS: Record<ContractPresetId, string> = {
+  standard: "Standard delegates the work and reviews what comes back.",
+  "delegate-only":
+    "Delegate-only hands research over as well, so the orchestrator may not run commands at all.",
+  "research-first":
+    "Research-first asks for enough reading to write a brief that stands alone.",
+  "review-heavy":
+    "Review-heavy gives every unit an independent check unit before it is accepted.",
+  thorough:
+    "Thorough is both: enough reading to brief well, and a check unit for every unit.",
+};
+
+/**
  * How much appended instruction text the plugin accepts. `configure` truncates
  * the whole block at 4096 characters, and the tail is the part that explains
  * what to do when delegation is impossible, so the append is capped below the
