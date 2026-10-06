@@ -33,11 +33,13 @@ import {
 import { toast } from "sonner";
 import { WORKER_RETENTION, WORKER_RETENTION_DESCRIPTIONS, type ContractDto, type OrchestratorStateDto, type ScopeSettingsDto, type SettingsViewDto, type rpcContract } from "./server";
 import {
-  CONTRACT_PRESET_DESCRIPTIONS,
-  CONTRACT_PRESETS,
   ENFORCEMENT_DESCRIPTIONS,
   ENFORCEMENT_LEVELS,
   INSTRUCTION_LIMIT,
+  RESEARCH_DESCRIPTIONS,
+  RESEARCH_MODES,
+  VERIFICATION_DESCRIPTIONS,
+  VERIFICATION_MODES,
   type WorkerConfig,
   type WorkerExecution,
   type WorkerPresetName,
@@ -626,13 +628,23 @@ function ScopeSettings() {
           "A delegation is refused once one turn has delegated this many, so a runaway fan-out stops instead of filling the sidebar. Check units and fallback retries are the plugin's own doing and do not count. 0 removes the cap.",
         )}
         {enumRow(
-          "contractPreset",
-          "What the orchestrator is told",
-          "How much reading and checking the contract asks for. The exact text is at the bottom of this section.",
-          CONTRACT_PRESETS.map((preset) => ({
-            value: preset,
-            label: preset,
-            help: CONTRACT_PRESET_DESCRIPTIONS[preset],
+          "research",
+          "Who finds things out",
+          "What the orchestrator is told about research, before it hands a unit over.",
+          RESEARCH_MODES.map((mode) => ({
+            value: mode,
+            label: mode,
+            help: RESEARCH_DESCRIPTIONS[mode],
+          })),
+        )}
+        {enumRow(
+          "verification",
+          "How hard the review is",
+          "What has to be true before a unit counts as done. Every-unit doubles the workers a task needs, and check units count against the parallel cap above.",
+          VERIFICATION_MODES.map((mode) => ({
+            value: mode,
+            label: mode,
+            help: VERIFICATION_DESCRIPTIONS[mode],
           })),
         )}
         {enumRow(

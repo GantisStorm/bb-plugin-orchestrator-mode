@@ -120,11 +120,11 @@ and not only that it did.
 
 The contract is emitted, never rewritten. It states which acts the classifier
 flags, so a free-form replacement could desync the two and make the watchdog
-wrong; presets swap sections and project rules append one.
+wrong; the two shape settings swap sections and project rules append one.
 
 `configure` truncates dynamic instructions at 4096 characters, so the budget is
 an invariant rather than a hope: the budget test builds the largest contract
-every preset can produce — the longest model id the catalog accepts, presets in
+every combination of the two can produce — the longest model id the catalog accepts, presets in
 every kind, five reminders, an appended section at the cap — and asserts it fits
 and that the tail survives. That test is what sets the append cap, and the
 render clamps the append as its last resort rather than handing BB a block it

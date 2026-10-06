@@ -24,7 +24,7 @@ All notable changes to Orchestrator Mode are documented here. The format follows
   and its row appears only in Global scope.
 
 - Settings rows explain every choice, not only the one in force: enforcement, read-only
-  commands, the contract shapes, the worker retention policies and the new-thread default
+  commands, the two contract settings, the worker retention policies and the new-thread default
   each list what every option does, and the numeric rows carry the description the
   descriptor form used to hold. A `select` cannot explain the options it is not on, so the
   row carries the list; the option's own name is emphasised where the sentence already
@@ -42,7 +42,7 @@ All notable changes to Orchestrator Mode are documented here. The format follows
   surprising cap or contract is traceable to the layer that set it. `defaultForNewThreads`
   stays global: it is a composer default, not thread behaviour.
 
-- `contractPreset: "thorough"` composes the `research-first` reading requirement with `review-heavy`'s mandatory check unit and verdict, for work whose result is expensive to get wrong. The contract budget test covers it with every other preset, and it keeps honouring the read-only command allowance that `delegate-only` withdraws.
+- The contract shape is two settings, not a menu of presets: `research` (`as-is`, `read-first`, `delegated`) and `verification` (`when-needed`, `every-unit`). The five names that stood in for these combinations are gone — `thorough` was exactly `read-first` + `every-unit` — and every combination is now reachable, including the one the menu lacked (research delegated *and* every unit checked). A stored `contractPreset` is folded into the pair on load, for the globals and for every project override. `delegated` is still the one mode that withdraws the read-only shell allowance.
 - The contract names the worker execution presets you have actually stored (`Saved worker
   kinds: build, review; name one as \`preset\` for a unit of that kind.`), and says nothing when
   none are, so the pre-delegation override the tool already accepted is discoverable from the
@@ -174,8 +174,8 @@ All notable changes to Orchestrator Mode are documented here. The format follows
   a thread receives and sets or clears the appended project rules with `--rules`
   / `--clear-rules`; the settings section shows it with its length against the
   4096-character ceiling; project rules append their own section under a measured
-  cap; and `contractPreset` picks between `standard`, `delegate-only`,
-  `research-first` and `review-heavy`.
+  cap; and `research` (`as-is`, `read-first`, `delegated`) with `verification`
+  (`when-needed`, `every-unit`) pick which sections it emits.
 - **Fan-out guardrails.** `maxParallelWorkers` and `maxDelegationsPerTurn`
   (both `0` for no cap) refuse a delegation with a readable error, and a refusal
   is never retried on the fallback.

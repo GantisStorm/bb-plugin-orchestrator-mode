@@ -1332,11 +1332,13 @@ describe("the delegation tool", () => {
 
     expect(spawned).toHaveLength(2);
     // The check unit carries the original brief and the worker's claim, and is
-    // told to inspect rather than repair.
+    // told to go after the work — not to reread it — without repairing anything.
     const brief = String(spawned[1]!.prompt);
     expect(brief).toContain("Add a retry to src/retry.ts");
     expect(brief).toContain("did the thing");
     expect(brief).toContain("Do not modify any file");
+    expect(brief).toContain("run the tests, the command or the steps the brief names");
+    expect(brief).toContain("paste it, do not summarise it");
     expect(String(result)).toContain("VERDICT: pass");
 
     const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as OrchestratorStateDto;
@@ -1738,12 +1740,13 @@ describe("the delegation tool", () => {
     expect(archivedThreads).toEqual(["th_check"]);
   });
 
-  it("emits the contract shape the setting names", async () => {
-    const { harness } = await load({ contractPreset: "review-heavy" });
+  it("emits the contract the two settings name", async () => {
+    const { harness } = await load({ research: "read-first", verification: "every-unit" });
     const contract = (await harness.behavior.callRpc("get_contract", { threadId: null })) as {
       text: string;
     };
     expect(contract.text).toContain("Every unit gets checked before you trust it");
+    expect(contract.text).toContain("Read enough of the repository first to write a brief that stands alone.");
     expect(contract.text).not.toContain("Pass `verify: true` when you delegate a unit whose");
   });
 
@@ -1821,7 +1824,8 @@ describe("rpc", () => {
       maxNudges: 5,
       maxParallelWorkers: 6,
       maxDelegationsPerTurn: 20,
-      contractPreset: "standard",
+      research: "as-is",
+      verification: "when-needed",
       workerRetention: "keep",
     };
     expect(await harness.behavior.callRpc("get_scope_settings", { projectId: null })).toEqual({
@@ -2510,7 +2514,8 @@ describe("project scopes", () => {
     const { harness } = await load();
     await enable(harness, THREAD);
     await harness.behavior.runCli([
-      "scope", "--project", PROJECT, "--contract-preset", "thorough", "--rules", "Never touch files under generated/.",
+      "scope", "--project", PROJECT, "--research", "read-first", "--verification", "every-unit",
+      "--rules", "Never touch files under generated/.",
     ]);
     const scoped = await harness.behavior.resolveAgentConfiguration(
       makePluginAgentConfigurationContext({
@@ -2574,5 +2579,32 @@ describe("project scopes", () => {
     const both = await harness.behavior.runCli(["scope", "--global", "--project", PROJECT, "--max-parallel", "1"]);
     expect(both.exitCode).not.toBe(0);
     expect(both.stderr).toContain("--global");
+  });
+
+  it("folds a stored contractPreset into the two settings that replaced it", async () => {
+    const { bb, harness } = await load({ contractPreset: "thorough" }, undefined, {}, {
+      project_settings: { [PROJECT]: { contractPreset: "delegate-only" } },
+    });
+
+    // Global: thorough was read-first + every-unit.
+    expect(await harness.behavior.callRpc("get_scope_settings", { projectId: null })).toMatchObject({
+      values: { research: "read-first", verification: "every-unit" },
+      overridden: [],
+    });
+    // A project's override folds the same way, and counts as overriding both fields.
+    expect(await harness.behavior.callRpc("get_scope_settings", { projectId: PROJECT })).toMatchObject({
+      values: { research: "delegated", verification: "when-needed" },
+      overridden: ["research", "verification"],
+    });
+
+    // Written back once on load, so nothing reads the retired key from then on.
+    expect(await bb.storage.kv.get("settings")).toMatchObject({
+      research: "read-first",
+      verification: "every-unit",
+    });
+    expect(await bb.storage.kv.get("settings")).not.toHaveProperty("contractPreset");
+    expect(await bb.storage.kv.get("project_settings")).toEqual({
+      [PROJECT]: { research: "delegated", verification: "when-needed" },
+    });
   });
 });
