@@ -1043,6 +1043,34 @@ function stripHeredocBodies(text: string): string {
 }
 
 /**
+ * A delegation through the CLI, which exists for sessions whose tool list predates
+ * the native tool. Only a literal, single command counts: a chain, a redirect, a
+ * substitution or an expansion inside it is a command line doing more than
+ * delegating, and the line has to be nothing but delegations and — where the
+ * read-only allowance is on — reads.
+ */
+function isDelegationCommand(command: string, allowReadCommands: boolean): boolean {
+  const { unquoted, live, segments } = scanCommandLine(stripHeredocBodies(command.trim()));
+  // `$(...)`, backticks and `[<>](` run or read something else entirely, and a
+  // redirect writes wherever it points.
+  if (/\$\(|`/.test(live)) return false;
+  if (/[<(]\(/.test(unquoted)) return false;
+  if (/(^|[^>])>(?!&)/.test(unquoted) || />>/.test(unquoted)) return false;
+  if (/\btee\b/.test(unquoted)) return false;
+  const delegates = (part: string) =>
+    /^(?:\S*\/)?bb\s+orchestrator-mode\s+delegate(?:\s|$)/.test(part.trim());
+  return (
+    segments.some((part) => delegates(part)) &&
+    segments.every(
+      (part) =>
+        part.trim() === "" ||
+        delegates(part) ||
+        (allowReadCommands && isReadOnlyCommand(part.trim())),
+    )
+  );
+}
+
+/**
  * A message to a worker this orchestrator recorded. Correcting a worker is the
  * orchestrator's own job, so `bb thread tell <worker-id> "..."` counts as
  * delegation rather than as doing the work; a thread it never delegated to is
@@ -1214,8 +1242,10 @@ export function classifyRow(
   if (workKind === "command") {
     // A malformed row must not throw out of the scan loop: a non-string command reads as no command at all.
     const command = typeof row.command === "string" ? row.command.trim() : "";
-    // Correcting a recorded worker is the orchestrator's own job, not work.
+    // Correcting a recorded worker is the orchestrator's own job, not work, and a
+    // session whose tool list predates the native tool delegates through the CLI.
     if (isWorkerFollowup(command, workerThreadIds)) return null;
+    if (isDelegationCommand(command, allowReadCommands)) return null;
     if (allowReadCommands && command !== "" && isReadOnlyCommand(command)) {
       return null;
     }
@@ -1425,8 +1455,8 @@ ${workspaceRule}
    constraints and definition of done.
 3. Delegate every unit with the \`${DELEGATE_TOOL}\` tool. Fan out independent
    units in parallel; sequence only real dependencies. If the tool is missing,
-   this session predates the mode: say it arrives with the next session, do no
-   work, and stop.
+   this session predates it: delegate with \`bb orchestrator-mode delegate --task
+   "..."\` instead, which counts as delegation, not work.
 ${reviewStep}
 5. Report by synthesizing: what was delegated, what each worker produced, what
    is left. Link worker ids so the user can open them.

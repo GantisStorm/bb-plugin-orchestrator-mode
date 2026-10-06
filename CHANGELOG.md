@@ -52,6 +52,15 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ### Added
 
+- **CLI delegation fallback.** `bb orchestrator-mode delegate --task "..."` hands a
+  unit to a worker when the native `orchestrator_delegate` tool is not in the
+  session's tool list (a resumed session keeps the list it started with, and one
+  built before the mode cannot gain tools mid-flight). It takes the tool's own
+  arguments, validated by the same schema, and the classifier counts a literal
+  delegation line as delegation rather than work: a chain, redirect, substitution
+  or expansion on that line is still work, and reads after it still need the
+  read-only allowance. Ported from upstream's CLI delegation.
+
 - **Mixed checkouts.** `workerWorkspace` gained `mixed`: the orchestrator decides
   per delegation, every call must name `workspace: "shared"` or
   `workspace: "worktree"`, and the contract says to give a worktree to a unit that

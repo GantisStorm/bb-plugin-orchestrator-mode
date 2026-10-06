@@ -91,6 +91,10 @@ name, falling back to this project's remembered defaults. Override those for one
 unit with `provider`, `model`, `reasoning` and `permissionMode`. Give a hard unit
 a stronger model and a mechanical one a cheaper model.
 
+If `orchestrator_delegate` is not in your tool list, delegate through the CLI
+instead: `bb orchestrator-mode delegate --task "..."` (add `--workspace worktree`,
+`--verify`, `--no-wait`, `--hidden` as the unit needs). It counts as delegation.
+
 To correct a worker, tell it: `bb thread tell <worker-id> "..."` counts as
 delegation, not as doing the work, as long as the message is literal and the id is
 one you delegated to.

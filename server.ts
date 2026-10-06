@@ -1512,19 +1512,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   // --- layer 1: the contract ----------------------------------------------
 
-  bb.agents.registerTool({
-    name: DELEGATE_TOOL,
-    description:
-      "Hand one unit of work to a worker thread and get its result back. The only way an orchestrator-mode thread gets work done. The worker cannot see this conversation, so `task` must be a complete, self-contained brief: goal, context, constraints, and what done means.",
-    instructions:
-      "In orchestrator mode, delegate every unit of real work with orchestrator_delegate instead of doing it yourself. Fan out independent units in parallel; sequence only genuine dependencies.",
-    presentation: {
-      label: {
-        pending: "Delegating to a worker thread",
-        completed: "Delegated to a worker thread",
-      },
-    },
-    parameters: z.object({
+  /**
+   * The delegation arguments, named once so the native tool and the CLI command
+   * the fallback uses take exactly the same shape.
+   */
+  const delegateParameters = z.object({
       task: z
         .string()
         .min(1)
@@ -1592,27 +1584,42 @@ export default async function plugin(bb: BbPluginApi) {
         .describe(
           "Permission mode for this worker. Defaults to the plugin's worker permission mode, then the project's remembered mode.",
         ),
-    }),
-    async execute(
-      {
-        task,
-        title,
-        waitForResult,
-        timeoutSeconds,
-        hidden,
-        workspace,
-        preset,
-        verify,
-        model,
-        provider,
-        reasoning,
-        permissionMode,
+  });
+
+  bb.agents.registerTool({
+    name: DELEGATE_TOOL,
+    description:
+      "Hand one unit of work to a worker thread and get its result back. The only way an orchestrator-mode thread gets work done. The worker cannot see this conversation, so `task` must be a complete, self-contained brief: goal, context, constraints, and what done means.",
+    instructions:
+      "In orchestrator mode, delegate every unit of real work with orchestrator_delegate instead of doing it yourself. Fan out independent units in parallel; sequence only genuine dependencies.",
+    presentation: {
+      label: {
+        pending: "Delegating to a worker thread",
+        completed: "Delegated to a worker thread",
       },
-      { threadId, projectId, signal },
-    ) {
-      if (threadId === undefined || projectId === undefined) {
-        throw new Error("orchestrator_delegate needs a thread context.");
-      }
+    },
+    parameters: delegateParameters,
+    execute: (args, ctx) => delegateTask(args, ctx),
+  });
+
+  /**
+   * One delegation, from the native tool or from the CLI fallback a session with a
+   * stale tool list uses. The tool passes the context it was given; the CLI passes
+   * the thread it was pointed at, and the project is resolved from that thread when
+   * the caller has none.
+   */
+  async function delegateTask(
+    data: z.infer<typeof delegateParameters>,
+    { threadId, projectId: contextProjectId, signal }: { threadId?: string; projectId?: string; signal?: AbortSignal },
+  ): Promise<string> {
+    const { task, title, waitForResult, timeoutSeconds, hidden, workspace, preset, verify, model, provider, reasoning, permissionMode } = data;
+    if (threadId === undefined) {
+      throw new Error("orchestrator_delegate needs a thread context.");
+    }
+    const projectId = contextProjectId ?? (await projectOfThread(threadId)) ?? undefined;
+    if (projectId === undefined) {
+      throw new Error("orchestrator_delegate needs a thread context.");
+    }
       // A check unit inspects finished work, so it can only start once the
       // worker has settled. Refusing beats spawning a worker nobody checks.
       if (verify === true && waitForResult === false) {
@@ -1964,8 +1971,7 @@ export default async function plugin(bb: BbPluginApi) {
         return await finish(workerId, workerTitle, first);
       }
       return await retryOnFallback(fallback, `Worker ${workerId} failed.`);
-    },
-  });
+  }
 
   bb.agents.registerTool({
     name: REVIEW_TOOL,
@@ -2993,6 +2999,60 @@ export default async function plugin(bb: BbPluginApi) {
                 `  project rules:       ${view.rules === null ? "inherits the global rules" : `${view.rules.length} characters`}`,
               ].join("\n"),
             );
+          },
+        }),
+        delegate: cliCommand({
+          summary: "Delegate to a worker when the native tool is unavailable",
+          options: {
+            ...threadOption,
+            task: {
+              type: "string",
+              required: true,
+              description: "Complete, self-contained worker brief (1-20,000 characters)",
+            },
+            title: { type: "string", description: "Worker title (at most 200 characters)" },
+            "no-wait": {
+              type: "boolean",
+              description: "Return immediately instead of waiting for the worker",
+            },
+            timeout: {
+              type: "integer",
+              min: 10,
+              max: 3600,
+              description: "How long to wait for the worker, in seconds (default 900)",
+            },
+            hidden: { type: "boolean", description: "Keep the worker out of the sidebar" },
+            workspace: {
+              type: "enum",
+              values: [...WORKER_WORKSPACES],
+              description: "Where this unit runs, under a mixed scope",
+            },
+            verify: {
+              type: "boolean",
+              description: "Also spawn an independent check unit on the same brief",
+            },
+          },
+          async run(input, ctx) {
+            const threadId = resolveThreadId(input.options.thread, ctx);
+            const parsed = delegateParameters.safeParse({
+              task: input.options.task,
+              title: input.options.title,
+              waitForResult: input.options["no-wait"] !== true,
+              timeoutSeconds: input.options.timeout,
+              hidden: input.options.hidden,
+              workspace: input.options.workspace,
+              verify: input.options.verify,
+            });
+            if (!parsed.success) {
+              throw new PluginCliError("invalid delegation arguments", {
+                code: "invalid_arguments",
+                hint: parsed.error.issues
+                  .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+                  .join("; "),
+              });
+            }
+            const output = await delegateTask(parsed.data, { threadId });
+            return render(input.options.json, { output }, output);
           },
         }),
         contract: cliCommand({

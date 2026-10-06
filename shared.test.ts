@@ -433,6 +433,50 @@ describe("stderr suppression", () => {
   }
 });
 
+describe("CLI delegation", () => {
+  // Ported from upstream: a session whose tool list predates the native tool
+  // delegates through the CLI, and that line is delegation, not work.
+  it("allows a literal delegate command", () => {
+    expect(isReadOnlyCommand("bb orchestrator-mode delegate --task 'add a retry'")).toBe(false);
+    expect(
+      classifyRow(
+        { kind: "work", workKind: "command", command: `bb orchestrator-mode delegate --thread th_x --task "add a retry"`, id: "cli-1" },
+        { allowReadCommands: false, workerThreadIds: [] },
+      ),
+    ).toBeNull();
+    expect(
+      classifyRow(
+        { kind: "work", workKind: "command", command: "bb orchestrator-mode delegate --task x && ls", id: "cli-2" },
+        { allowReadCommands: true, workerThreadIds: [] },
+      ),
+    ).toBeNull();
+  });
+
+  it("refuses a delegation that does anything else", () => {
+    const refused = [
+      `bb orchestrator-mode delegate --task "$(rm -rf build)"`,
+      "bb orchestrator-mode delegate --task x; npm install",
+      "bb orchestrator-mode delegate --task x && npm install",
+      "bb orchestrator-mode delegate --task x > out.txt",
+    ];
+    for (const command of refused) {
+      expect(
+        classifyRow({ kind: "work", workKind: "command", command, id: `cli-${command.length}` }, {
+          allowReadCommands: true,
+          workerThreadIds: [],
+        }),
+      ).not.toBeNull();
+    }
+    // Reads after a delegation need the read-only allowance, as anywhere else.
+    expect(
+      classifyRow({ kind: "work", workKind: "command", command: "bb orchestrator-mode delegate --task x && ls", id: "cli-3" }, {
+        allowReadCommands: false,
+        workerThreadIds: [],
+      }),
+    ).not.toBeNull();
+  });
+});
+
 describe("worker follow-ups", () => {
   const worker = "th_worker";
   const classify = (command: string, workerThreadIds: readonly string[] = [worker], allowReadCommands = true) =>

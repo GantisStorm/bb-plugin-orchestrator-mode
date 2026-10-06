@@ -1594,6 +1594,30 @@ describe("the delegation tool", () => {
     await expect(delegate()).rejects.toThrow(/caps a turn at 2/);
   });
 
+  it("delegates through the CLI when the native tool is not in the session", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    harness.inspection.sdk.stub("threads.spawn", async (args) => {
+      spawned.push(args as unknown as Record<string, unknown>);
+      return makeThreadResponse({ id: "th_cli_worker", parentThreadId: THREAD, environmentId: "env_1" });
+    });
+    harness.inspection.sdk.stub("threads.output", async () => ({ output: "the worker finished the task" }));
+
+    const result = await harness.behavior.runCli([
+      "delegate", "--thread", THREAD, "--task", "Add a retry to src/retry.ts", "--no-wait",
+    ]);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("th_cli_worker");
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toMatchObject({ prompt: "Add a retry to src/retry.ts", parentThreadId: THREAD });
+
+    // A bad argument is refused before anything is spawned.
+    const bad = await harness.behavior.runCli(["delegate", "--thread", THREAD, "--task", ""]);
+    expect(bad.exitCode).not.toBe(0);
+    expect(spawned).toHaveLength(1);
+  });
+
   it("names the preset in every child's title", async () => {
     const model = "command-code/deepseek/deepseek-v4.1-flash-fast";
     const { harness } = await load({}, undefined, {}, {
