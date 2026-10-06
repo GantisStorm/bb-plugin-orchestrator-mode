@@ -1348,6 +1348,126 @@ describe("the delegation tool", () => {
     expect(state).toMatchObject({ unreviewed: 1 });
   });
 
+  it("gives a worktree unit its own checkout, and keeps its check unit in it", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    let started = 0;
+    harness.inspection.sdk.stub("threads.spawn", async (args) => {
+      spawned.push(args as unknown as Record<string, unknown>);
+      const first = started++ === 0;
+      return makeThreadResponse({
+        id: first ? "th_unit" : "th_check",
+        parentThreadId: THREAD,
+        environmentId: first ? "env_worktree" : "env_parent",
+      });
+    });
+    harness.inspection.sdk.stub("threads.output", async ({ threadId }) => ({
+      output: threadId === "th_check" ? "VERDICT: pass" : "did the thing",
+    }));
+    harness.inspection.sdk.stub("environments.get", async ({ environmentId }: { environmentId: string }) => ({
+      environmentId,
+      hostId: "host_1",
+      branchName: "bb/work/th-unit",
+      path: "/tmp/worktrees/th-unit",
+      isWorktree: true,
+      status: "ready",
+    }));
+
+    const result = await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Add a retry to src/retry.ts", workspace: "worktree", verify: true },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    // The unit is spawned in a managed worktree on the orchestrator's own machine.
+    expect(spawned[0]!.environment).toEqual({
+      type: "host",
+      hostId: "host_1",
+      workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+    });
+    // Its check unit reuses that worktree, so it inspects the same working tree.
+    expect(spawned[1]!.environment).toEqual({ type: "reuse", environmentId: "env_worktree" });
+    // The result names the branch, because nothing lands until it is merged, and
+    // hands over the merge brief the orchestrator is allowed to run.
+    expect(String(result)).toContain("bb/work/th-unit");
+    expect(String(result)).toContain("bb environment diff env_worktree");
+    expect(String(result)).toContain('delegate a merge unit with `workspace: "shared"`');
+    expect(String(result)).toContain("report what conflicts instead of resolving them");
+
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as OrchestratorStateDto;
+    expect(state.delegations[0]).toMatchObject({ environmentId: "env_worktree" });
+  });
+
+  it("keeps every worker in the orchestrator's checkout when the scope says shared", async () => {
+    const { harness } = await load({ workerWorkspace: "shared" });
+    await enable(harness);
+    harness.inspection.sdk.stub("threads.spawn", async (args) => {
+      spawned.push(args as unknown as Record<string, unknown>);
+      return makeThreadResponse({ id: "th_unit", parentThreadId: THREAD, environmentId: "env_parent" });
+    });
+
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Add a retry to src/retry.ts" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    expect(spawned[0]!.environment).toEqual({ type: "reuse", environmentId: "env_1" });
+  });
+
+  it("makes every delegation name its checkout under a mixed scope", async () => {
+    const { harness } = await load({ workerWorkspace: "mixed" });
+    await enable(harness);
+    harness.inspection.sdk.stub("threads.spawn", async (args) => {
+      spawned.push(args as unknown as Record<string, unknown>);
+      return makeThreadResponse({ id: "th_unit", parentThreadId: THREAD, environmentId: "env_1" });
+    });
+
+    // No choice is refused, and the refusal names both options.
+    await expect(
+      harness.behavior.callAgentTool(DELEGATE_TOOL, { task: "Touch two files" }, { threadId: THREAD, projectId: "proj_1" }),
+    ).rejects.toThrow(/names where it runs/);
+    expect(spawned).toHaveLength(0);
+
+    // An explicit choice is honoured both ways, whatever the call is.
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "A unit that stays put", workspace: "shared" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned[0]!.environment).toEqual({ type: "reuse", environmentId: "env_1" });
+
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "A unit that needs its own copy", workspace: "worktree" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned[1]!.environment).toMatchObject({
+      type: "host",
+      workspace: { type: "managed-worktree" },
+    });
+  });
+
+  it("teaches the merge path to a worktree scope", async () => {
+    const { harness } = await load({ workerWorkspace: "worktree" });
+    const contract = (await harness.behavior.callRpc("get_contract", { threadId: null })) as { text: string };
+    expect(contract.text).toContain("Units run in their own worktrees");
+    expect(contract.text).toContain('workspace: "shared"');
+    expect(contract.text).toContain("delegate the merge as its own unit");
+
+    const mixed = await load({ workerWorkspace: "mixed" });
+    const mixedContract = (await mixed.harness.behavior.callRpc("get_contract", { threadId: null })) as {
+      text: string;
+    };
+    expect(mixedContract.text).toContain("Name where each unit runs");
+    // A shared scope stays silent about checkouts it never creates.
+    const shared = await load({ workerWorkspace: "shared" });
+    const sharedContract = (await shared.harness.behavior.callRpc("get_contract", { threadId: null })) as {
+      text: string;
+    };
+    expect(sharedContract.text).not.toContain("worktree");
+  });
+
   it("does not check a worker that failed", async () => {
     const { harness } = await load();
     await enable(harness);
@@ -1472,6 +1592,51 @@ describe("the delegation tool", () => {
     await delegate();
     await delegate();
     await expect(delegate()).rejects.toThrow(/caps a turn at 2/);
+  });
+
+  it("names the preset in every child's title", async () => {
+    const model = "command-code/deepseek/deepseek-v4.1-flash-fast";
+    const { harness } = await load({}, undefined, {}, {
+      worker: { presets: { build: { model }, research: { model }, review: { model } } },
+    });
+    await enable(harness);
+    harness.inspection.sdk.stub("threads.spawn", async (args) => {
+      spawned.push(args as unknown as Record<string, unknown>);
+      return makeThreadResponse({ id: `th_${spawned.length}`, parentThreadId: THREAD, environmentId: "env_1" });
+    });
+    harness.inspection.sdk.stub("threads.output", async () => ({ output: "done" }));
+
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Add a retry to src/retry.ts", preset: "build" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned[0]!.title).toBe("BUILD: Add a retry to src/retry.ts");
+
+    // An explicit title is prefixed too, and the check unit keeps the prefix.
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Check the docs", title: "Doc pass", preset: "review", verify: true },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned[1]!.title).toBe("REVIEW: Doc pass");
+    expect(spawned[2]!.title).toBe("REVIEW: Doc pass (check)");
+
+    // A title that already names the preset is left alone, and a delegation
+    // without one is titled exactly as it was.
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Find the call sites", title: "RESEARCH: call sites", preset: "research" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned[3]!.title).toBe("RESEARCH: call sites");
+
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Just a plain unit" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned[4]!.title).toBe("Just a plain unit");
   });
 
   it("offers no cap when a cap is set to zero", async () => {
@@ -1746,8 +1911,8 @@ describe("the delegation tool", () => {
       text: string;
     };
     expect(contract.text).toContain("Every unit gets checked before you trust it");
-    expect(contract.text).toContain("runs what the unit claims");
-    expect(contract.text).not.toContain("Pass `verify: true` when you delegate a unit whose");
+    expect(contract.text).toContain("runs what it claims");
+    expect(contract.text).not.toContain("`verify: true` for a unit whose result you cannot judge");
   });
 
   it("rejects an empty brief", async () => {
@@ -1826,6 +1991,7 @@ describe("rpc", () => {
       maxDelegationsPerTurn: 20,
       contractPreset: "standard",
       workerRetention: "keep",
+      workerWorkspace: "shared",
     };
     expect(await harness.behavior.callRpc("get_scope_settings", { projectId: null })).toEqual({
       values: globals,
@@ -2580,29 +2746,4 @@ describe("project scopes", () => {
     expect(both.stderr).toContain("--global");
   });
 
-  it("folds a retired contract shape into one of the three levels", async () => {
-    const { bb, harness } = await load({ contractPreset: "research-first" }, undefined, {}, {
-      // The two-knob shape, and the five-preset shape, in the same store.
-      project_settings: { [PROJECT]: { research: "delegated", verification: "every-unit" } },
-    });
-
-    // Global: research-first was reading without the mandatory check, which is standard.
-    expect(await harness.behavior.callRpc("get_scope_settings", { projectId: null })).toMatchObject({
-      values: { contractPreset: "standard", allowReadCommands: true },
-      overridden: [],
-    });
-    // A project's two-knob pair folds to the one level that covers it: delegated
-    // research is what `delegate-only` is, and the mandatory check is subsumed in a
-    // level that already takes the shell away.
-    expect(await harness.behavior.callRpc("get_scope_settings", { projectId: PROJECT })).toMatchObject({
-      values: { contractPreset: "delegate-only", allowReadCommands: true },
-      overridden: ["contractPreset"],
-    });
-
-    // Written back once on load, so nothing reads the retired keys from then on.
-    expect(await bb.storage.kv.get("settings")).toMatchObject({ contractPreset: "standard" });
-    expect(await bb.storage.kv.get("project_settings")).toEqual({
-      [PROJECT]: { contractPreset: "delegate-only" },
-    });
-  });
 });

@@ -184,6 +184,37 @@ pair rather than a switch:
   or `Retry` (re-delegate the same brief on a second provider, model and access
   you pick, each with its own picker).
 
+### Where workers run
+
+A scope's **Where workers run** row decides the checkout a delegation uses:
+
+- **Shared** (default) runs every worker in the orchestrator's own checkout, so a
+  diff is visible the moment a worker stops, and two units that touch the same
+  files can overwrite each other.
+- **Worktree** gives one unit its own git worktree and branch, created by BB from
+  the project's default branch on the machine the orchestrator runs on. Nothing it
+  writes lands in your checkout until you merge it, and its check unit and any
+  fallback retry reuse that same worktree, so they inspect and continue the same
+  working tree.
+- **Mixed** leaves the choice to the orchestrator: every delegation must name
+  `workspace: "shared"` or `workspace: "worktree"`, and the contract tells it to
+  give a worktree to any unit that would touch files another unit is touching. A
+  delegation that names neither is refused with both options spelled out, because a
+  silent default would make mixed behave like shared.
+
+A worktree only holds tracked files, so install what the repo needs from a
+committed `.bb-env-setup.sh` (see `bb guide environments`); until that runs, a
+check unit cannot execute the tests it is meant to run. The delegation result
+names the branch, and `bb environment diff <id>` shows what the unit changed.
+
+**Landing a worktree.** The orchestrator cannot merge by hand: the watchdog counts
+a `git merge` as doing the work, so the contract tells it to delegate the merge as
+its own unit with `workspace: "shared"`, or to name the branch for you. Either way
+the merge runs in your checkout and its conflicts land in the report.
+`bb environment commit` and `bb environment pull-request` also operate on the
+environment directly. Deleting a worktree is core's `bb environment delete <id>`,
+refused while its worker thread is live.
+
 The retry runs once, and it covers both ways a worker fails: a spawn the
 provider refuses outright, and a worker thread that lands in `error`. The
 fallback inherits every field it does not name, so a retry target with no access
@@ -332,8 +363,11 @@ or `VERDICT: fail`.
   one. Earlier timeline work is not judged retroactively.
 - **This is a coordination aid.** The instructions and classifier are not a
   security boundary or a guarantee that every action will be caught.
-- **Workers share your environment.** Delegation uses ordinary worker threads;
-  it does not isolate their files or remove their provider costs.
+- **Workers share your environment by default.** Delegation uses ordinary worker
+  threads; with the default `shared` workspace they edit your checkout directly,
+  and the plugin neither isolates them nor removes their provider costs. Set the
+  workspace to `worktree` for a unit that needs its own copy of the repo, and see
+  [Where workers run](#where-workers-run) for what that costs.
 
 ## CLI
 
@@ -353,7 +387,7 @@ bb orchestrator-mode off
 | `status [--thread <id>] [--json]` | Show mode, enforcement, violations, nudges and delegations. |
 | `on [--thread <id>] [--enforcement instruct\|guard\|block] [--json]` | Enable the thread, with an optional enforcement override. |
 | `off [--thread <id>] [--json]` | Disable the thread and clear its enforcement override. |
-| `scope [--global \| --project <id>] [--enforcement <level>] [--read-commands on\|off] [--max-nudges <n>] [--max-parallel <n>] [--max-per-turn <n>] [--contract-preset <standard\|review-heavy\|delegate-only>] [--retention <policy>] [--worker-provider <id>] [--worker-model <id>] [--clear-worker] [--rules <text>] [--clear-rules] [--inherit <key>] [--inherit-all] [--json]` | With `--global`, read or write the record every project inherits (settings only; the worker execution and rules have their own commands). With `--project`, read or write that project's overrides: settings, worker execution and appended rules. Without either, list every project that has any. |
+| `scope [--global \| --project <id>] [--enforcement <level>] [--read-commands on\|off] [--max-nudges <n>] [--max-parallel <n>] [--max-per-turn <n>] [--contract-preset <standard\|review-heavy\|delegate-only>] [--retention <policy>] [--worker-workspace <shared\|worktree>] [--worker-provider <id>] [--worker-model <id>] [--clear-worker] [--rules <text>] [--clear-rules] [--inherit <key>] [--inherit-all] [--json]` | With `--global`, read or write the record every project inherits (settings only; the worker execution and rules have their own commands). With `--project`, read or write that project's overrides: settings, worker execution and appended rules. Without either, list every project that has any. |
 | `contract [--thread <id>] [--rules <text>] [--clear-rules] [--json]` | Print the exact instructions this thread receives, or set and clear the project rules appended to them. |
 | `violations [--thread <id>] [--clear] [--json]` | List violations, or clear them and reset correction counters. |
 | `default [on\|off] [--json]` | Show or set the default for new threads. |
@@ -364,16 +398,25 @@ ordinary terminal, provide a thread ID for thread commands.
 
 </details>
 
+A delegation that names a `preset` gives every child it spawns that name in its
+title, uppercased and colon-separated (`BUILD: Add a retry to src/retry.ts`,
+`RESEARCH: find the call sites (check)`), so the sidebar says what a worker is
+doing without opening the brief. A title that already names the preset is left
+alone, and a delegation without one is titled exactly as before.
+
 Two tools. `orchestrator_delegate({ task, title?, waitForResult?,
-timeoutSeconds?, hidden?, preset?, verify?, provider?, model?, reasoning?,
-permissionMode? })` hands one unit to a worker, and
+timeoutSeconds?, hidden?, workspace?, preset?, verify?, provider?, model?,
+reasoning?, permissionMode? })` hands one unit to a worker, and
 `orchestrator_review({ workerThreadId, verdict, notes?, verifiedBy? })` records
 your verdict on the result. The watchdog expects one verdict per worker whose
 result was used.
 The brief is required and limited to 20,000 characters; the title is limited to
 200. Waiting defaults to `true`, with a 900-second timeout (range 10–3,600).
 `hidden` defaults to `false`. A timeout returns the worker's status and leaves it
-running. `preset` names a stored execution preset, applied under the call's own
+running. `workspace` picks where this one unit runs: `shared` or `worktree`, overriding the
+[worker workspace](#where-workers-run) setting for that call. Under a `mixed`
+scope it is required, and under `shared` or `worktree` it is the way to make one
+unit the exception. `preset` names a stored execution preset, applied under the call's own
 arguments; asking for one that is not stored is an error that names the ones
 that are, and the contract names the stored kinds so the orchestrator knows what
 it may ask for. `verify` adds a [check unit](#reviewing-worker-output). The four
@@ -437,6 +480,7 @@ CLI, and the composer toggles.
 | `maxNudges` | `3` | Corrective messages per enablement, for direct work and for unjudged workers. It is one budget shared by both gates, whichever spends it first, and `bb orchestrator-mode status` reports the split; non-negative numbers are rounded down. `0` disables nudges. Recording and `block` stops continue after the cap. |
 | `contractPreset` | `standard` | Which [contract level](#the-contract) a session receives. |
 | `workerRetention` | `keep` | What happens to a worker once its result has been read: keep it, archive check units, or archive every read worker. |
+| `workerWorkspace` | `shared` | Where a delegation runs: `shared`, `worktree`, or `mixed` (the orchestrator names one per unit, see [Where workers run](#where-workers-run)). |
 | `maxParallelWorkers` | `8` | Refuse a delegation while this many workers are running. `0` removes the cap. |
 | `maxDelegationsPerTurn` | `20` | Refuse a delegation once a turn has delegated this many. `0` removes the cap. |
 

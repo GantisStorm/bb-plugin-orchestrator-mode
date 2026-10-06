@@ -92,7 +92,19 @@ unit with `provider`, `model`, `reasoning` and `permissionMode`. Give a hard uni
 a stronger model and a mechanical one a cheaper model.
 
 `preset` names a kind of work the plugin has a saved setup for, such as `build`,
-`review` or `research`. Your own arguments beat the preset for that unit.
+`review` or `research`. Your own arguments beat the preset for that unit. Naming
+one also titles the child `BUILD:`, `REVIEW:` or `RESEARCH:`, so the sidebar shows
+what it is doing.
+
+`workspace` picks where the unit runs. `shared` (the default) uses the checkout
+you are in, so its edits are visible to you immediately. `worktree` gives the
+unit its own worktree and branch; nothing it writes lands in your checkout, the
+result names the branch, and the user merges it. Ask for `worktree` when two units
+would touch the same files, or when a unit should not disturb the working tree.
+
+Under a `mixed` scope every delegation has to name one. To land a worktree unit,
+delegate the merge as its own unit with `workspace: "shared"`, naming the branch
+to bring in; merging by hand counts as doing the work yourself.
 
 When the plugin has a retry target configured, it re-delegates a failed worker
 once on that provider and model before you hear about the failure, so do not

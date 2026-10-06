@@ -131,6 +131,12 @@ export interface Delegation {
   reviewedAt?: number | null;
   /** The error text when this worker failed, so the orchestrator sees why. */
   failure?: string | null;
+  /**
+   * The environment this worker ran in. It is what a check unit and a fallback
+   * retry reuse, so both stay in the same checkout, and it names the worktree a
+   * `worktree` delegation left behind.
+   */
+  environmentId?: string | null;
 }
 
 export interface ThreadState {
@@ -183,6 +189,7 @@ const delegationSchema = z.object({
   notes: z.string().nullable().optional(),
   reviewedAt: z.number().nullable().optional(),
   failure: z.string().nullable().optional(),
+  environmentId: z.string().nullable().optional(),
 });
 
 const violationSchema = z.object({
@@ -265,6 +272,27 @@ export const WORKER_RETENTION = ["keep", "archive-checks", "archive-all"] as con
 type WorkerRetention = (typeof WORKER_RETENTION)[number];
 
 /**
+ * Where a delegation's workers run. `shared` reuses the checkout the orchestrator
+ * itself is in, which is what an edit-then-review flow wants; `worktree` gives a
+ * unit its own checkout so parallel workers cannot overwrite each other.
+ */
+export const WORKER_WORKSPACES = ["shared", "worktree", "mixed"] as const;
+export type WorkerWorkspace = (typeof WORKER_WORKSPACES)[number];
+
+/**
+ * One line per choice, for the settings row. Each opens with the choice's own
+ * name, the convention the row relies on to emphasise it.
+ */
+export const WORKER_WORKSPACE_DESCRIPTIONS: Record<WorkerWorkspace, string> = {
+  shared:
+    "Shared runs every worker in the orchestrator's own checkout, so two units that touch the same files can overwrite each other.",
+  worktree:
+    "Worktree gives each unit its own git worktree and branch. Nothing it writes lands in your checkout until you merge it, each worktree needs its dependencies installed by a committed .bb-env-setup.sh, and a check unit can only run tests once that has happened.",
+  mixed:
+    "Mixed makes it the orchestrator's call: every delegation names `workspace: \"shared\"` or `workspace: \"worktree\"`, and the contract tells it to give a worktree to a unit that would touch files another unit is touching. A shared unit's edits are visible to you at once; a worktree unit's stay on its branch until a merge unit brings them in.",
+};
+
+/**
  * One line per retention policy, so the settings row can explain every choice
  * rather than only the one in force. Archiving hides a thread from the sidebar;
  * it stays recoverable.
@@ -287,6 +315,7 @@ const SETTINGS_KEYS = [
   "maxDelegationsPerTurn",
   "contractPreset",
   "workerRetention",
+  "workerWorkspace",
 ] as const;
 const settingsKeySchema = z.enum(SETTINGS_KEYS);
 
@@ -299,6 +328,7 @@ const settingsViewSchema = z.object({
   maxDelegationsPerTurn: z.number(),
   contractPreset: z.enum(CONTRACT_PRESETS),
   workerRetention: z.enum(WORKER_RETENTION),
+  workerWorkspace: z.enum(WORKER_WORKSPACES),
 });
 
 export type SettingsViewDto = z.infer<typeof settingsViewSchema>;
@@ -489,43 +519,6 @@ function executionSources(exec: WorkerExecution): WorkerExecutionSources {
   };
 }
 
-/** The level a retired preset stands for. Reading alone was never a level of its own. */
-const PRESET_FOLD: Record<string, ContractPresetId> = {
-  standard: "standard",
-  "research-first": "standard",
-  "delegate-only": "delegate-only",
-  "review-heavy": "review-heavy",
-  thorough: "review-heavy",
-};
-
-/** The stored keys this fold retires: the five presets, and the pair that replaced them. */
-const RETIRED_KEYS = ["contractPreset", "research", "verification"] as const;
-
-/**
- * One stored settings record, with any retired shape folded into a level. Two older
- * shapes exist on disk: the five presets, and the two-knob pair that followed them.
- * Both fold wherever a record is read, so no install is migrated by hand and no
- * retired key stays load-bearing.
- *
- * ponytail: kept for any install that has not been read by this version yet. Delete
- * once every store has been through it, or sooner if none ever held one.
- */
-function foldLegacy(record: Record<string, unknown>): Record<string, unknown> {
-  if (!RETIRED_KEYS.some((key) => key in record)) return record;
-  const { contractPreset: legacy, research, verification, ...kept } = record;
-
-  const preset: ContractPresetId =
-    typeof legacy === "string" && legacy in PRESET_FOLD
-      ? PRESET_FOLD[legacy]
-      : research === "delegated"
-        ? "delegate-only"
-        : verification === "every-unit"
-          ? "review-heavy"
-          : "standard";
-
-  return { ...kept, contractPreset: preset };
-}
-
 export default async function plugin(bb: BbPluginApi) {
   const catalog = await loadWorkerCatalog(bb);
 
@@ -538,6 +531,7 @@ export default async function plugin(bb: BbPluginApi) {
     maxDelegationsPerTurn: number;
     contractPreset: ContractPresetId;
     workerRetention: WorkerRetention;
+    workerWorkspace: WorkerWorkspace;
   }
 
   /** The global record: what every project inherits, plus the composer default. */
@@ -563,6 +557,7 @@ export default async function plugin(bb: BbPluginApi) {
     maxDelegationsPerTurn: 20,
     contractPreset: "standard",
     workerRetention: "keep",
+    workerWorkspace: "shared",
   };
 
   /**
@@ -588,10 +583,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   /**
    * The global record a stored value stands for. Every field is validated, so a
-   * hand-edited or older record keeps the default of any field it gets wrong.
+   * hand-edited record keeps the default of any field it gets wrong, and a key this
+   * version no longer has is ignored.
    */
   function readGlobals(stored: unknown, base: SettingsView = DEFAULT_SETTINGS): OrchestratorSettings {
-    const record = stored !== null && typeof stored === "object" ? foldLegacy(stored as Record<string, unknown>) : {};
+    const record = stored !== null && typeof stored === "object" ? (stored as Record<string, unknown>) : {};
     return {
       ...sanitizedSettings(record, base),
       defaultForNewThreads: record.defaultForNewThreads === true,
@@ -714,6 +710,9 @@ export default async function plugin(bb: BbPluginApi) {
       workerRetention: isOneOf(WORKER_RETENTION, values.workerRetention)
         ? values.workerRetention
         : base.workerRetention,
+      workerWorkspace: isOneOf(WORKER_WORKSPACES, values.workerWorkspace)
+        ? values.workerWorkspace
+        : base.workerWorkspace,
     };
   }
 
@@ -1009,15 +1008,10 @@ export default async function plugin(bb: BbPluginApi) {
   async function loadProjectOverrides(): Promise<void> {
     const storedSettings = await bb.storage.kv.get<unknown>(PROJECT_SETTINGS_KEY);
     if (storedSettings !== null && typeof storedSettings === "object") {
-      let folded = false;
       for (const [projectId, value] of Object.entries(storedSettings as Record<string, unknown>)) {
         if (value === null || typeof value !== "object") continue;
-        const record = foldLegacy(value as Record<string, unknown>);
-        if (record !== value) folded = true;
-        projectSettings[projectId] = record as Partial<OrchestratorSettings>;
+        projectSettings[projectId] = value as Partial<OrchestratorSettings>;
       }
-      // Written back once, so the stored records stop carrying a key nothing reads.
-      if (folded) await bb.storage.kv.set(PROJECT_SETTINGS_KEY, projectSettings);
     }
     const storedWorker = await bb.storage.kv.get<unknown>(PROJECT_WORKER_KEY);
     if (storedWorker !== null && typeof storedWorker === "object") {
@@ -1065,16 +1059,12 @@ export default async function plugin(bb: BbPluginApi) {
       workerConfig: workerFor(project),
       extra: rulesFor(project),
       preset: settings.contractPreset,
+      workspace: settings.workerWorkspace,
     });
   }
 
-  const storedGlobals = await bb.storage.kv.get<unknown>(GLOBAL_SETTINGS_KEY);
-  globalSettings = readGlobals(storedGlobals);
+  globalSettings = readGlobals(await bb.storage.kv.get<unknown>(GLOBAL_SETTINGS_KEY));
   applySettings(globalSettings);
-  if (storedGlobals !== null && typeof storedGlobals === "object" && RETIRED_KEYS.some((key) => key in storedGlobals)) {
-    // Written back once, so the stored record stops carrying the key the split replaced.
-    await bb.storage.kv.set(GLOBAL_SETTINGS_KEY, globalSettings);
-  }
   live.worker = storedWorkerConfig(await bb.storage.kv.get<unknown>(WORKER_KEY));
   await loadProjectOverrides();
   {
@@ -1556,6 +1546,12 @@ export default async function plugin(bb: BbPluginApi) {
         .boolean()
         .optional()
         .describe("Keep the worker out of the sidebar. Default false."),
+      workspace: z
+        .enum(WORKER_WORKSPACES)
+        .optional()
+        .describe(
+          "Where this unit runs: `shared` (the orchestrator's own checkout) or `worktree` (its own git worktree and branch, which stays out until a merge unit brings it in). Default: the plugin setting, except under `mixed`, where every delegation has to name one.",
+        ),
       preset: z
         .enum(WORKER_PRESETS)
         .optional()
@@ -1604,6 +1600,7 @@ export default async function plugin(bb: BbPluginApi) {
         waitForResult,
         timeoutSeconds,
         hidden,
+        workspace,
         preset,
         verify,
         model,
@@ -1623,12 +1620,66 @@ export default async function plugin(bb: BbPluginApi) {
           "verify: true needs waitForResult: true, because a check unit has to inspect finished work. Wait for this worker, or record a verdict yourself and delegate the check as its own unit.",
         );
       }
+      /**
+       * Where this unit runs. The call always wins; `mixed` has no default of its
+       * own, so under it every delegation has to say, which is the whole point of
+       * the mode: the orchestrator decides per unit.
+       */
+      const scopeWorkspace = settingsFor(projectId).workerWorkspace;
+      if (workspace === undefined && scopeWorkspace === "mixed") {
+        throw new Error(
+          "This scope runs workers in both checkouts, so each delegation names where it runs: `workspace: \"shared\"` uses the orchestrator's own checkout, so its edits are visible at once, and `workspace: \"worktree\"` gives the unit its own branch, which stays out until a merge unit brings it in.",
+        );
+      }
+      const unitWorkspace = workspace ?? scopeWorkspace;
       const parent = await bb.sdk.threads.get({ threadId });
-      const environment =
-        parent.environmentId === null
-          ? { type: "project-default" as const }
-          : { type: "reuse" as const, environmentId: parent.environmentId };
-      const workerTitle = title?.trim() || task.trim().split("\n")[0]!.slice(0, 120);
+      /**
+       * The machine a new worktree belongs on: the orchestrator's own, so the unit
+       * sees the same host as the thread that handed it the work. An environment
+       * that cannot be read leaves it unset, which asks BB for this machine.
+       */
+      let parentHostId: string | undefined;
+      if (unitWorkspace === "worktree" && parent.environmentId !== null) {
+        try {
+          parentHostId = (await bb.sdk.environments.get({ environmentId: parent.environmentId })).hostId;
+        } catch {
+          parentHostId = undefined;
+        }
+      }
+      /**
+       * The checkout one unit runs in. Without a worktree it is the orchestrator's
+       * own; with one, BB creates a managed worktree off the project's default
+       * branch on the machine the orchestrator runs on. A check unit or a retry
+       * passes the environment its unit was spawned into, so it inspects and
+       * continues the same working tree instead of opening a second one.
+       */
+      function environmentFor(reuseId: string | null | undefined) {
+        if (reuseId !== null && reuseId !== undefined) {
+          return { type: "reuse" as const, environmentId: reuseId };
+        }
+        if (unitWorkspace !== "worktree") {
+          return parent.environmentId === null
+            ? { type: "project-default" as const }
+            : { type: "reuse" as const, environmentId: parent.environmentId };
+        }
+        return {
+          type: "host" as const,
+          ...(parentHostId === undefined ? {} : { hostId: parentHostId }),
+          workspace: { type: "managed-worktree" as const, baseBranch: { kind: "default" as const } },
+        };
+      }
+      /**
+       * The worker's title, carrying the preset it runs under: the sidebar is the
+       * only place a delegation is visible, and `BUILD: …` says what the thread is
+       * doing before the brief does. A title that already names the preset is left
+       * alone, so the prefix is never doubled.
+       */
+      const baseTitle = title?.trim() || task.trim().split("\n")[0]!.slice(0, 120);
+      const presetPrefix = preset === undefined ? null : `${preset.toUpperCase()}:`;
+      const workerTitle =
+        presetPrefix === null || baseTitle.toUpperCase().startsWith(presetPrefix)
+          ? baseTitle
+          : `${presetPrefix} ${baseTitle}`;
       const orchestratorId = threadId;
       const targetProjectId = projectId;
 
@@ -1671,12 +1722,17 @@ export default async function plugin(bb: BbPluginApi) {
       });
       assertInCatalog(workerExec);
 
-      /** Spawn one worker on `exec` and record it against this orchestrator. */
+      /**
+       * Spawn one worker on `exec`, in `environment`, and record it against this
+       * orchestrator. The spawned thread comes back so a check unit or a retry can
+       * reuse the checkout this unit was given.
+       */
       async function spawnWorker(
         exec: WorkerExecution,
         workerLabel: string,
+        environment: ReturnType<typeof environmentFor>,
         options: { brief?: string; verifierFor?: string; pluginInitiated?: boolean } = {},
-      ): Promise<string> {
+      ): Promise<{ id: string; environmentId: string | null }> {
         const countPerTurn = options.pluginInitiated !== true;
         await assertWithinBudget(orchestratorId, countPerTurn, targetProjectId);
         try {
@@ -1709,10 +1765,11 @@ export default async function plugin(bb: BbPluginApi) {
                 ...(options.verifierFor === undefined
                   ? {}
                   : { verifierFor: options.verifierFor, verifiedBy: null, verdict: null }),
+                environmentId: spawned.environmentId ?? null,
               },
             ]),
           }));
-          return spawned.id;
+          return { id: spawned.id, environmentId: spawned.environmentId ?? null };
         } finally {
           // However the spawn ended, its claim stops counting against the caps.
           releaseClaim(orchestratorId, countPerTurn);
@@ -1788,9 +1845,13 @@ export default async function plugin(bb: BbPluginApi) {
         const retryExec = reconcile({ ...workerExec, ...fallback });
         const target = retryExec.model ?? "the project default";
         bb.log.warn(`${reason} Retrying on ${target}.`);
-        const retryId = await spawnWorker(retryExec, `${workerTitle} (fallback)`, {
-          pluginInitiated: true,
-        });
+        const retry = await spawnWorker(
+          retryExec,
+          `${workerTitle} (fallback)`,
+          environmentFor(workerEnvironmentId),
+          { pluginInitiated: true },
+        );
+        const retryId = retry.id;
         const settled = await settle(retryId, timeoutMs);
         return `${reason} Re-delegated the same brief on \`${target}\` as worker ${retryId}.\n\n${await finish(retryId, `${workerTitle} (fallback)`, settled)}`;
       }
@@ -1810,11 +1871,13 @@ export default async function plugin(bb: BbPluginApi) {
         const verifierExec = reconcile({ ...workerExec });
         let verifierId: string;
         try {
-          verifierId = await spawnWorker(verifierExec, `${workerLabel} (check)`, {
-            brief,
-            verifierFor: workerId,
-            pluginInitiated: true,
-          });
+          verifierId = (
+            await spawnWorker(verifierExec, `${workerLabel} (check)`, environmentFor(workerEnvironmentId), {
+              brief,
+              verifierFor: workerId,
+              pluginInitiated: true,
+            })
+          ).id;
         } catch (cause) {
           bb.log.warn(`check unit for ${workerId} could not start: ${String(cause)}`);
           return `\n\nNo check unit ran: ${String(cause)}`;
@@ -1836,13 +1899,33 @@ export default async function plugin(bb: BbPluginApi) {
         }`;
       }
 
+      /**
+       * What a worktree unit leaves behind, named so it can be reviewed or merged.
+       * An environment that cannot be read still names the id, because that is the
+       * handle every `bb environment` command takes.
+       */
+      async function worktreeNote(environmentId: string | null): Promise<string> {
+        if (unitWorkspace !== "worktree" || environmentId === null) return "";
+        try {
+          const environment = await bb.sdk.environments.get({ environmentId });
+          const branch = environment.branchName;
+          const where = branch === null ? `environment ${environmentId}` : `branch \`${branch}\``;
+          // The merge brief is written out, because the orchestrator cannot merge by
+          // hand: the watchdog counts that as doing the work.
+          const land = `delegate a merge unit with \`workspace: "shared"\`: "Merge ${where} into this checkout and report what conflicts instead of resolving them."`;
+          return `\n\nThis unit ran in its own worktree on ${where}. Nothing is merged from it: \`bb environment diff ${environmentId}\` shows what it changed. To land it, ${land}`;
+        } catch {
+          return `\n\nThis unit ran in its own worktree (environment ${environmentId}). Nothing is merged from it. To land it, delegate a merge unit with \`workspace: "shared"\` naming that environment.`;
+        }
+      }
+
       /** The worker's report, plus an independent check when one was asked for. */
       async function finish(
         workerId: string,
         workerLabel: string,
         settled: Settled,
       ): Promise<string> {
-        const reported = report(workerId, settled);
+        const reported = `${report(workerId, settled)}${await worktreeNote(workerEnvironmentId)}`;
         // Checking a worker that never ran is pointless: there is nothing to
         // inspect, and the orchestrator has to re-delegate that unit anyway.
         if (verify !== true || settled.running || settled.status === "error") return reported;
@@ -1852,8 +1935,12 @@ export default async function plugin(bb: BbPluginApi) {
       const timeoutMs = Math.min(Math.max(timeoutSeconds ?? 900, 10), 3600) * 1000;
       const fallback = workerConfig.fallback;
       let workerId: string;
+      /** The checkout the unit's workers run in, reused by its check unit and retry. */
+      let workerEnvironmentId: string | null = null;
       try {
-        workerId = await spawnWorker(workerExec, workerTitle);
+        const spawned = await spawnWorker(workerExec, workerTitle, environmentFor(null));
+        workerId = spawned.id;
+        workerEnvironmentId = spawned.environmentId;
       } catch (cause) {
         // A cap is our own refusal, not a provider that could not start: send
         // it straight back so the orchestrator changes what it is doing.
@@ -1869,7 +1956,7 @@ export default async function plugin(bb: BbPluginApi) {
 
       if (waitForResult === false) {
         const retry = fallback === undefined ? "" : " If it fails, re-delegate it on the configured fallback.";
-        return `Delegated without waiting.\nWorker thread ${workerId}, titled "${workerTitle}"\nCheck on it later and fold its result into your report.${retry}`;
+        return `Delegated without waiting.\nWorker thread ${workerId}, titled "${workerTitle}"\nCheck on it later and fold its result into your report.${retry}${await worktreeNote(workerEnvironmentId)}`;
       }
 
       const first = await settle(workerId, timeoutMs);
@@ -1987,6 +2074,7 @@ export default async function plugin(bb: BbPluginApi) {
         workerConfig: workerFor(context.project.id),
         extra: rulesFor(context.project.id),
         preset: settings.contractPreset,
+        workspace: settings.workerWorkspace,
       }),
     };
   });
@@ -2533,6 +2621,7 @@ export default async function plugin(bb: BbPluginApi) {
     "max-per-turn"?: number;
     "contract-preset"?: ContractPresetId;
     retention?: WorkerRetention;
+    "worker-workspace"?: WorkerWorkspace;
   }
 
   function settingsPatch(options: ScopeSettingsFlags): Partial<OrchestratorSettings> {
@@ -2548,6 +2637,9 @@ export default async function plugin(bb: BbPluginApi) {
         ? {}
         : { contractPreset: options["contract-preset"] }),
       ...(options.retention === undefined ? {} : { workerRetention: options.retention }),
+      ...(options["worker-workspace"] === undefined
+        ? {}
+        : { workerWorkspace: options["worker-workspace"] }),
     };
   }
 
@@ -2741,6 +2833,11 @@ export default async function plugin(bb: BbPluginApi) {
               values: [...WORKER_RETENTION],
               description: "Write that scope's worker retention policy",
             },
+            "worker-workspace": {
+              type: "enum",
+              values: [...WORKER_WORKSPACES],
+              description: "Write that scope's worker workspace: shared or worktree",
+            },
             "worker-provider": { type: "string", description: "Write this project's worker provider" },
             "worker-model": { type: "string", description: "Write this project's worker model" },
             "clear-worker": {
@@ -2830,6 +2927,7 @@ export default async function plugin(bb: BbPluginApi) {
                   `  fan-out cap:          ${values.maxParallelWorkers === 0 ? "none" : `${values.maxParallelWorkers} in flight`}, ${values.maxDelegationsPerTurn === 0 ? "none" : `${values.maxDelegationsPerTurn} per turn`}`,
                   `  contract shape:       ${values.contractPreset}`,
                   `  worker retention:     ${values.workerRetention}`,
+                  `  worker workspace:     ${values.workerWorkspace}`,
                   `  workers run as:       ${worker}${describeFallback(live.worker.fallback)}${describePresets(live.worker.presets)}`,
                   `  rules:                ${extraInstructions === "" ? "none" : `${extraInstructions.length} characters`}`,
                   `  new threads default:  ${live.defaultForNewThreads ? "on" : "off"}`,
@@ -2885,6 +2983,7 @@ export default async function plugin(bb: BbPluginApi) {
                 `  fan-out cap:         ${values.maxParallelWorkers === 0 ? "none" : `${values.maxParallelWorkers} in flight`}, ${values.maxDelegationsPerTurn === 0 ? "none" : `${values.maxDelegationsPerTurn} per turn`}`,
                 `  contract shape:      ${values.contractPreset}${view.overridden.includes("contractPreset") ? " (project)" : " (global)"}`,
                 `  worker retention:    ${values.workerRetention}${view.overridden.includes("workerRetention") ? " (project)" : " (global)"}`,
+                `  worker workspace:    ${values.workerWorkspace}${view.overridden.includes("workerWorkspace") ? " (project)" : " (global)"}`,
                 `  workers run as:      ${view.worker}`,
                 `  project rules:       ${view.rules === null ? "inherits the global rules" : `${view.rules.length} characters`}`,
               ].join("\n"),
