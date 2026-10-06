@@ -310,6 +310,20 @@ describe("the workers settings section", () => {
   function makeSettingsRpc(initial: WorkerConfig = {}) {
     let worker: WorkerConfig = initial;
     let extra = "";
+    const projectWorker: Record<string, WorkerConfig> = {};
+    const projectRules: Record<string, string> = {};
+    const projectSettings: Record<string, Record<string, unknown>> = {};
+    /** The globals, with this project's overrides applied — what the server would resolve. */
+    const scopeValues = (projectId: string) => ({
+      enforcement: "guard" as const,
+      allowReadCommands: true,
+      maxNudges: 3,
+      maxParallelWorkers: 6,
+      maxDelegationsPerTurn: 20,
+      contractPreset: "standard" as const,
+      workerRetention: "keep" as const,
+      ...(projectSettings[projectId] ?? {}),
+    });
     const calls: { method: string; input: unknown }[] = [];
     const handlers = {
       get_worker_execution: async () => {
@@ -330,12 +344,49 @@ describe("the workers settings section", () => {
         extra = input.extra;
         return { text: "contract text", extra, limit: 370 };
       },
+      get_project_worker: async (input: { projectId: string }) => {
+        calls.push({ method: "get_project_worker", input });
+        return projectWorker[input.projectId] ?? {};
+      },
+      set_project_worker: async (input: { projectId: string; config: WorkerConfig | null }) => {
+        calls.push({ method: "set_project_worker", input });
+        if (input.config === null) delete projectWorker[input.projectId];
+        else projectWorker[input.projectId] = input.config;
+        return projectWorker[input.projectId] ?? {};
+      },
+      get_project_rules: async (input: { projectId: string }) => {
+        calls.push({ method: "get_project_rules", input });
+        return { text: "contract text", extra: projectRules[input.projectId] ?? "", limit: 370 };
+      },
+      set_project_rules: async (input: { projectId: string; extra: string }) => {
+        calls.push({ method: "set_project_rules", input });
+        projectRules[input.projectId] = input.extra;
+        return { text: "contract text", extra: input.extra, limit: 370 };
+      },
+      get_project_settings: async (input: { projectId: string }) => {
+        calls.push({ method: "get_project_settings", input });
+        return { values: scopeValues(input.projectId), overridden: Object.keys(projectSettings[input.projectId] ?? {}) };
+      },
+      set_project_setting: async (input: { projectId: string; key: string; value: unknown }) => {
+        calls.push({ method: "set_project_setting", input });
+        const current = { ...(projectSettings[input.projectId] ?? {}) } as Record<string, unknown>;
+        if (input.value === null) delete current[input.key];
+        else current[input.key] = input.value;
+        projectSettings[input.projectId] = current as never;
+        return { values: scopeValues(input.projectId), overridden: Object.keys(current) };
+      },
     };
     return { handlers, calls, worker: () => worker };
   }
 
   /** A catalog stand-in: one available provider, one default model. */
   const settingsSdk = {
+    projects: {
+      list: async () => [
+        { id: "proj_alpha", name: "Alpha" },
+        { id: "proj_beta", name: "Beta" },
+      ],
+    },
     providers: {
       models: async (input?: { providerId?: string }) =>
         input?.providerId === undefined
@@ -411,6 +462,67 @@ describe("the workers settings section", () => {
     await click(within(slot.container).getByRole("button", { name: "Save rules" }));
     expect(rpc.calls.filter((call) => call.method === "set_contract").at(-1)?.input).toEqual({
       extra: "Never touch files under generated/.",
+    });
+  });
+  it("scopes the section to a project, and writes the override there", async () => {
+    const rpc = makeSettingsRpc();
+    const slot = mountSettings(rpc);
+    await flush();
+
+    // Global by default: the project RPCs are untouched.
+    expect(rpc.calls.some((call) => call.method === "get_project_worker")).toBe(false);
+    const selector = within(slot.container).getByLabelText("Scope") as HTMLSelectElement;
+    expect(Array.from(selector.options, (option) => option.textContent)).toEqual(["Global", "Alpha", "Beta"]);
+
+    await act(async () => {
+      fireEvent.change(selector, { target: { value: "proj_alpha" } });
+    });
+    await flush();
+    expect(rpc.calls.some((call) => call.method === "get_project_worker" && (call.input as { projectId: string }).projectId === "proj_alpha")).toBe(true);
+
+    // A settings row writes one field for the project, and Inherit clears it again.
+    const enforcement = within(slot.container).getByLabelText("Enforcement") as HTMLSelectElement;
+    await act(async () => {
+      fireEvent.change(enforcement, { target: { value: "block" } });
+    });
+    await flush();
+    expect(rpc.calls.filter((call) => call.method === "set_project_setting").at(-1)?.input).toEqual({
+      projectId: "proj_alpha",
+      key: "enforcement",
+      value: "block",
+    });
+
+    // The select's first option is the inherit affordance for an enum row.
+    await act(async () => {
+      fireEvent.change(enforcement, { target: { value: "" } });
+    });
+    await flush();
+    expect(rpc.calls.filter((call) => call.method === "set_project_setting").at(-1)?.input).toEqual({
+      projectId: "proj_alpha",
+      key: "enforcement",
+      value: null,
+    });
+  });
+
+  it("clears a project's worker execution when Inherit is pressed in project scope", async () => {
+    const rpc = makeSettingsRpc({ providerId: "command-code", model: "model-a" });
+    const slot = mountSettings(rpc);
+    await flush();
+    const selector = within(slot.container).getByLabelText("Scope") as HTMLSelectElement;
+    await act(async () => {
+      fireEvent.change(selector, { target: { value: "proj_beta" } });
+    });
+    await flush();
+
+    // Custom stores a project execution; Inherit then hands it back to the global one.
+    await click(within(slot.container).getByRole("button", { name: "Custom" }));
+    expect(rpc.calls.filter((call) => call.method === "set_project_worker").at(-1)?.input).toMatchObject({
+      projectId: "proj_beta",
+    });
+    await click(within(slot.container).getByRole("button", { name: "Inherit" }));
+    expect(rpc.calls.filter((call) => call.method === "set_project_worker").at(-1)?.input).toEqual({
+      projectId: "proj_beta",
+      config: null,
     });
   });
 });

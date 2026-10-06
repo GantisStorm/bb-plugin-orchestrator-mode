@@ -31,9 +31,11 @@ import {
   type PluginComposerScope,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
-import type { ContractDto, OrchestratorStateDto, rpcContract } from "./server";
+import { WORKER_RETENTION, type ContractDto, type OrchestratorStateDto, type SettingsViewDto, type rpcContract } from "./server";
 import {
+  CONTRACT_PRESETS,
   ENFORCEMENT_DESCRIPTIONS,
+  ENFORCEMENT_LEVELS,
   INSTRUCTION_LIMIT,
   type WorkerConfig,
   type WorkerExecution,
@@ -311,6 +313,8 @@ function OrchestratorToggle() {
 function WorkerExecutionSettings() {
   const rpc = useRpc<typeof rpcContract>();
   const sdk = useSdk();
+  const [scope, setScope] = useState<string | null>(null);
+  const [projects, setProjects] = useState<{ id: string; name: string }[]>([]);
   const [stored, setStored] = useState<WorkerConfig | null>(null);
   const [contract, setContract] = useState<ContractDto | null>(null);
   const [draft, setDraft] = useState<string | null>(null);
@@ -319,14 +323,25 @@ function WorkerExecutionSettings() {
 
   const load = useCallback(async () => {
     try {
-      setStored(await rpc.call("get_worker_execution"));
-      setContract(await rpc.call("get_contract", { threadId: null }));
+      const listed = await sdk.projects.list({ includePersonal: true });
+      setProjects(listed.map((project) => ({ id: project.id, name: project.name ?? project.id })));
+    } catch {
+      // Without the list the selector stays on Global; the plugin settings above still apply.
+    }
+    try {
+      if (scope === null) {
+        setStored(await rpc.call("get_worker_execution"));
+        setContract(await rpc.call("get_contract", { threadId: null }));
+      } else {
+        setStored(await rpc.call("get_project_worker", { projectId: scope }));
+        setContract(await rpc.call("get_project_rules", { projectId: scope }));
+      }
     } catch {
       // Keep whatever is on screen; every write reports its own failure.
     } finally {
       setLoading(false);
     }
-  }, [rpc]);
+  }, [rpc, sdk, scope]);
 
   useEffect(() => {
     void load();
@@ -341,14 +356,22 @@ function WorkerExecutionSettings() {
     async (next: WorkerConfig | null | Promise<WorkerConfig>) => {
       setBusy(true);
       try {
-        setStored(await rpc.call("set_worker_execution", await next));
+        const value = await next;
+        if (scope === null) {
+          setStored(await rpc.call("set_worker_execution", value));
+        } else {
+          // For a project, nothing stored means it inherits the global execution,
+          // which is what the Inherit button asks for.
+          const config = value === null || Object.keys(value).length === 0 ? null : value;
+          setStored(await rpc.call("set_project_worker", { projectId: scope, config }));
+        }
       } catch (cause) {
         toast.error(message(cause));
       } finally {
         setBusy(false);
       }
     },
-    [rpc],
+    [rpc, scope],
   );
 
   /**
@@ -377,14 +400,18 @@ function WorkerExecutionSettings() {
     if (draft === null) return;
     setBusy(true);
     try {
-      setContract(await rpc.call("set_contract", { extra: draft }));
+      setContract(
+        scope === null
+          ? await rpc.call("set_contract", { extra: draft })
+          : await rpc.call("set_project_rules", { projectId: scope, extra: draft }),
+      );
       setDraft(null);
     } catch (cause) {
       toast.error(message(cause));
     } finally {
       setBusy(false);
     }
-  }, [draft, rpc]);
+  }, [draft, rpc, scope]);
 
   // A fallback that lost the ids an uninstalled provider can take with it is kept as
   // none, the way the server drops half a retry target instead of retrying on it.
@@ -392,7 +419,37 @@ function WorkerExecutionSettings() {
 
   return (
     <div className="rounded-md border border-border bg-surface-recessed/70 p-3">
-      <div className="flex items-start justify-between gap-6">
+      <div className="flex flex-wrap items-center gap-2 border-b border-border/60 pb-3">
+        <label className="text-sm font-medium" htmlFor="orchestrator-scope">
+          Scope
+        </label>
+        <select
+          id="orchestrator-scope"
+          value={scope ?? ""}
+          disabled={loading || busy}
+          className="h-8 rounded-md border border-border/60 bg-card px-2 text-xs"
+          onChange={(event) => {
+            setLoading(true);
+            setScope(event.target.value === "" ? null : event.target.value);
+          }}
+        >
+          <option value="">Global</option>
+          {projects.map((project) => (
+            <option key={project.id} value={project.id}>
+              {project.name}
+            </option>
+          ))}
+        </select>
+        <span className="text-xs text-subtle-foreground/75">
+          {scope === null
+            ? "the defaults every project inherits"
+            : "this project's own worker execution, presets, rules and limits"}
+        </span>
+      </div>
+
+      {scope === null ? null : <ProjectOverrides rpc={rpc} projectId={scope} disabled={busy} />}
+
+      <div className="mt-3 flex items-start justify-between gap-6">
         <div className="min-w-0">
           <div className="text-sm font-medium">Which provider and model workers use</div>
           <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
@@ -640,6 +697,148 @@ function WorkerExecutionSettings() {
         </pre>
       </details>
 
+    </div>
+  );
+}
+
+/**
+ * The settings a project can override, and the ones it inherits. Each row writes one
+ * field through `set_project_setting`; a value of null clears the override, which is
+ * what Inherit does. Absent from this list on purpose: `defaultForNewThreads` is a
+ * composer default rather than thread behaviour, so it stays global.
+ */
+function ProjectOverrides({
+  rpc,
+  projectId,
+  disabled,
+}: {
+  rpc: ReturnType<typeof useRpc<typeof rpcContract>>;
+  projectId: string;
+  disabled: boolean;
+}) {
+  const [view, setView] = useState<{ values: SettingsViewDto; overridden: string[] } | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setView(await rpc.call("get_project_settings", { projectId }));
+    } catch {
+      // The rows render empty rather than lying about what is stored.
+    }
+  }, [rpc, projectId]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+  useRealtime("orchestrator-state", () => {
+    void load();
+  });
+
+  const write = useCallback(
+    async (key: string, value: string | number | boolean | null) => {
+      setBusy(true);
+      try {
+        setView(await rpc.call("set_project_setting", { projectId, key: key as never, value }));
+      } catch (cause) {
+        toast.error(message(cause));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [rpc, projectId],
+  );
+
+  const overridden = new Set(view?.overridden ?? []);
+  const values = view?.values;
+  const off = disabled || busy || view === null;
+
+  /** One row: the effective value, a control that writes the override, and Inherit. */
+  const row = (
+    key: keyof SettingsViewDto,
+    label: string,
+    options: { value: string; label: string }[],
+  ) => (
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="w-40 shrink-0 text-xs font-medium">{label}</span>
+      <select
+        aria-label={label}
+        value={overridden.has(key) ? String(values?.[key]) : ""}
+        disabled={off}
+        className="h-7 rounded-md border border-border/60 bg-card px-1.5 text-xs"
+        onChange={(event) =>
+          void write(key, event.target.value === "" ? null : event.target.value)
+        }
+      >
+        <option value="">
+          {values === undefined ? "Inherit" : `Inherit (${String(values[key])})`}
+        </option>
+        {options
+          .filter((option) => option.value !== String(values?.[key]))
+          .map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+      </select>
+      {overridden.has(key) ? (
+        <span className="text-xs text-subtle-foreground/75">overrides the global value</span>
+      ) : (
+        <span className="text-xs text-subtle-foreground/75">inherits</span>
+      )}
+    </div>
+  );
+
+  /** A numeric row: the input always shows the effective value, and Inherit clears the override. */
+  const numberRow = (
+    key: "maxNudges" | "maxParallelWorkers" | "maxDelegationsPerTurn",
+    label: string,
+    hint: string,
+  ) => (
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="w-40 shrink-0 text-xs font-medium">{label}</span>
+      <input
+        type="number"
+        min={0}
+        aria-label={label}
+        value={values?.[key] ?? 0}
+        disabled={off}
+        className="h-7 w-20 rounded-md border border-border/60 bg-card px-1.5 text-xs"
+        onChange={(event) => void write(key, Number(event.target.value))}
+      />
+      {overridden.has(key) ? (
+        <Button variant="ghost" size="sm" className="h-6 px-1.5 text-xs" disabled={off} onClick={() => void write(key, null)}>
+          Inherit
+        </Button>
+      ) : (
+        <span className="text-xs text-subtle-foreground/75">inherits</span>
+      )}
+      <span className="text-xs text-subtle-foreground/75">{hint}</span>
+    </div>
+  );
+
+  return (
+    <div className="mt-3 rounded-md border border-border/60 bg-card/40 p-2">
+      <div className="text-sm font-medium">Enforcement and limits for this project</div>
+      <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
+        Override any field for this project alone; Inherit hands it back to the global value.
+        Threads keep their own enforcement switch either way.
+      </p>
+      <div className="mt-2 flex flex-col gap-1.5">
+        {row(
+          "enforcement",
+          "Enforcement",
+          ENFORCEMENT_LEVELS.map((level) => ({ value: level, label: level })),
+        )}
+        {row("allowReadCommands", "Read-only commands", [
+          { value: "true", label: "allowed" },
+          { value: "false", label: "every command is work" },
+        ])}
+        {row("contractPreset", "Contract shape", CONTRACT_PRESETS.map((preset) => ({ value: preset, label: preset })))}
+        {row("workerRetention", "Workers afterwards", WORKER_RETENTION.map((policy) => ({ value: policy, label: policy })))}
+        {numberRow("maxNudges", "Reminders per thread", "0 turns reminders off")}
+        {numberRow("maxParallelWorkers", "Most workers at once", "0 removes the cap")}
+        {numberRow("maxDelegationsPerTurn", "Most workers per turn", "0 removes the cap")}
+      </div>
     </div>
   );
 }
