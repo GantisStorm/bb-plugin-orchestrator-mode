@@ -318,7 +318,8 @@ describe("the settings section", () => {
       maxNudges: 3,
       maxParallelWorkers: 6,
       maxDelegationsPerTurn: 20,
-      contractPreset: "standard",
+      research: "as-is",
+      verification: "when-needed",
       workerRetention: "keep",
     };
     const projectWorker: Record<string, WorkerConfig> = {};
@@ -511,6 +512,22 @@ describe("the settings section", () => {
       value: "block",
     });
     expect((within(slot.container).getByLabelText("Enforcement") as HTMLSelectElement).value).toBe("block");
+
+    // The two contract settings are rows of their own, and each writes its own key.
+    const verification = within(slot.container).getByLabelText("How hard the review is") as HTMLSelectElement;
+    expect(Array.from(verification.options, (option) => option.textContent)).toEqual([
+      "when-needed",
+      "every-unit",
+    ]);
+    await act(async () => {
+      fireEvent.change(verification, { target: { value: "every-unit" } });
+    });
+    await flush();
+    expect(rpc.calls.filter((call) => call.method === "set_scope_setting").at(-1)?.input).toEqual({
+      projectId: null,
+      key: "verification",
+      value: "every-unit",
+    });
   });
 
   it("keeps the new-thread default global, and out of a project's scope", async () => {

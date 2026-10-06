@@ -27,12 +27,13 @@ import { z } from "zod";
 import {
   DEFAULT_ENFORCEMENT,
   DELEGATE_TOOL,
-  CONTRACT_PRESETS,
   ENFORCEMENT_LEVELS,
   PERMISSION_MODES,
   REASONING_LEVELS,
+  RESEARCH_MODES,
   REVIEW_TOOL,
   REVIEW_VERDICTS,
+  VERIFICATION_MODES,
   WORKER_PRESETS,
   SERVICE_TIERS,
   EXTRA_INSTRUCTION_LIMIT,
@@ -50,13 +51,14 @@ import {
   type EnforcementLevel,
   type PermissionMode,
   type ReasoningLevel,
+  type ResearchMode,
   type ReviewVerdict,
   type ServiceTier,
+  type VerificationMode,
   type Violation,
   type WorkerCatalog,
   type WorkerConfig,
   type WorkerPresetName,
-  type ContractPresetId,
   type WorkRowLike,
   type WorkerExecution,
   type WorkerModelOption,
@@ -285,7 +287,8 @@ const SETTINGS_KEYS = [
   "maxNudges",
   "maxParallelWorkers",
   "maxDelegationsPerTurn",
-  "contractPreset",
+  "research",
+  "verification",
   "workerRetention",
 ] as const;
 const settingsKeySchema = z.enum(SETTINGS_KEYS);
@@ -297,7 +300,8 @@ const settingsViewSchema = z.object({
   maxNudges: z.number(),
   maxParallelWorkers: z.number(),
   maxDelegationsPerTurn: z.number(),
-  contractPreset: z.enum(CONTRACT_PRESETS),
+  research: z.enum(RESEARCH_MODES),
+  verification: z.enum(VERIFICATION_MODES),
   workerRetention: z.enum(WORKER_RETENTION),
 });
 
@@ -489,6 +493,33 @@ function executionSources(exec: WorkerExecution): WorkerExecutionSources {
   };
 }
 
+/**
+ * The two settings that replaced `contractPreset`, keyed by the value it used to
+ * hold. Folded wherever a stored record is read, so the split needs no migration
+ * pass and no compatibility branch in the settings themselves: an install keeps
+ * whatever shape it had chosen.
+ *
+ * ponytail: kept for any install that has not loaded a build writing the pair
+ * yet. Delete once every store has been read once by this version, or sooner if
+ * no install ever held a preset.
+ */
+const PRESET_FOLD: Record<string, readonly [ResearchMode, VerificationMode]> = {
+  standard: ["as-is", "when-needed"],
+  "research-first": ["read-first", "when-needed"],
+  "delegate-only": ["delegated", "when-needed"],
+  "review-heavy": ["as-is", "every-unit"],
+  thorough: ["read-first", "every-unit"],
+};
+
+/** One stored settings record, with a legacy `contractPreset` folded into the pair. */
+function foldPreset(record: Record<string, unknown>): Record<string, unknown> {
+  const preset = record.contractPreset;
+  if (typeof preset !== "string") return record;
+  const { contractPreset: _preset, ...rest } = record;
+  const [research, verification] = PRESET_FOLD[preset] ?? ["as-is", "when-needed"];
+  return { ...rest, research, verification };
+}
+
 export default async function plugin(bb: BbPluginApi) {
   const catalog = await loadWorkerCatalog(bb);
 
@@ -499,7 +530,8 @@ export default async function plugin(bb: BbPluginApi) {
     maxNudges: number;
     maxParallelWorkers: number;
     maxDelegationsPerTurn: number;
-    contractPreset: ContractPresetId;
+    research: ResearchMode;
+    verification: VerificationMode;
     workerRetention: WorkerRetention;
   }
 
@@ -520,7 +552,8 @@ export default async function plugin(bb: BbPluginApi) {
     maxNudges: 3,
     maxParallelWorkers: 6,
     maxDelegationsPerTurn: 20,
-    contractPreset: "standard",
+    research: "as-is",
+    verification: "when-needed",
     workerRetention: "keep",
   };
 
@@ -550,7 +583,7 @@ export default async function plugin(bb: BbPluginApi) {
    * hand-edited or older record keeps the default of any field it gets wrong.
    */
   function readGlobals(stored: unknown, base: SettingsView = DEFAULT_SETTINGS): OrchestratorSettings {
-    const record = stored !== null && typeof stored === "object" ? (stored as Record<string, unknown>) : {};
+    const record = stored !== null && typeof stored === "object" ? foldPreset(stored as Record<string, unknown>) : {};
     return {
       ...sanitizedSettings(record, base),
       defaultForNewThreads: record.defaultForNewThreads === true,
@@ -667,9 +700,10 @@ export default async function plugin(bb: BbPluginApi) {
         values.maxDelegationsPerTurn === undefined
           ? base.maxDelegationsPerTurn
           : capOf(values.maxDelegationsPerTurn, base.maxDelegationsPerTurn),
-      contractPreset: isOneOf(CONTRACT_PRESETS, values.contractPreset)
-        ? values.contractPreset
-        : base.contractPreset,
+      research: isOneOf(RESEARCH_MODES, values.research) ? values.research : base.research,
+      verification: isOneOf(VERIFICATION_MODES, values.verification)
+        ? values.verification
+        : base.verification,
       workerRetention: isOneOf(WORKER_RETENTION, values.workerRetention)
         ? values.workerRetention
         : base.workerRetention,
@@ -968,10 +1002,15 @@ export default async function plugin(bb: BbPluginApi) {
   async function loadProjectOverrides(): Promise<void> {
     const storedSettings = await bb.storage.kv.get<unknown>(PROJECT_SETTINGS_KEY);
     if (storedSettings !== null && typeof storedSettings === "object") {
+      let folded = false;
       for (const [projectId, value] of Object.entries(storedSettings as Record<string, unknown>)) {
         if (value === null || typeof value !== "object") continue;
-        projectSettings[projectId] = value as Partial<OrchestratorSettings>;
+        const record = foldPreset(value as Record<string, unknown>);
+        if (record !== value) folded = true;
+        projectSettings[projectId] = record as Partial<OrchestratorSettings>;
       }
+      // Written back once, so the stored records stop carrying a key nothing reads.
+      if (folded) await bb.storage.kv.set(PROJECT_SETTINGS_KEY, projectSettings);
     }
     const storedWorker = await bb.storage.kv.get<unknown>(PROJECT_WORKER_KEY);
     if (storedWorker !== null && typeof storedWorker === "object") {
@@ -1018,12 +1057,18 @@ export default async function plugin(bb: BbPluginApi) {
       reminders,
       workerConfig: workerFor(project),
       extra: rulesFor(project),
-      preset: settings.contractPreset,
+      research: settings.research,
+      verification: settings.verification,
     });
   }
 
-  globalSettings = readGlobals(await bb.storage.kv.get<unknown>(GLOBAL_SETTINGS_KEY));
+  const storedGlobals = await bb.storage.kv.get<unknown>(GLOBAL_SETTINGS_KEY);
+  globalSettings = readGlobals(storedGlobals);
   applySettings(globalSettings);
+  if (storedGlobals !== null && typeof storedGlobals === "object" && "contractPreset" in storedGlobals) {
+    // Written back once, so the stored record stops carrying the key the split replaced.
+    await bb.storage.kv.set(GLOBAL_SETTINGS_KEY, globalSettings);
+  }
   live.worker = storedWorkerConfig(await bb.storage.kv.get<unknown>(WORKER_KEY));
   await loadProjectOverrides();
   {
@@ -1515,7 +1560,7 @@ export default async function plugin(bb: BbPluginApi) {
         .boolean()
         .optional()
         .describe(
-          "Also spawn an independent check unit on the same brief, told to inspect the work and report pass or fail. Use it for a unit whose result you cannot judge from its report alone. Default false.",
+          "Also spawn an independent check unit on the same brief, told to run what the unit claims and report its raw output before a pass or fail verdict. Use it for a unit whose result you cannot judge from its report alone. Default false.",
         ),
       model: z
         .string()
@@ -1935,7 +1980,8 @@ export default async function plugin(bb: BbPluginApi) {
         reminders,
         workerConfig: workerFor(context.project.id),
         extra: rulesFor(context.project.id),
-        preset: settings.contractPreset,
+        research: settings.research,
+        verification: settings.verification,
       }),
     };
   });
@@ -2480,7 +2526,8 @@ export default async function plugin(bb: BbPluginApi) {
     "max-nudges"?: number;
     "max-parallel"?: number;
     "max-per-turn"?: number;
-    "contract-preset"?: ContractPresetId;
+    research?: ResearchMode;
+    verification?: VerificationMode;
     retention?: WorkerRetention;
   }
 
@@ -2493,9 +2540,8 @@ export default async function plugin(bb: BbPluginApi) {
       ...(options["max-nudges"] === undefined ? {} : { maxNudges: options["max-nudges"] }),
       ...(options["max-parallel"] === undefined ? {} : { maxParallelWorkers: options["max-parallel"] }),
       ...(options["max-per-turn"] === undefined ? {} : { maxDelegationsPerTurn: options["max-per-turn"] }),
-      ...(options["contract-preset"] === undefined
-        ? {}
-        : { contractPreset: options["contract-preset"] }),
+      ...(options.research === undefined ? {} : { research: options.research }),
+      ...(options.verification === undefined ? {} : { verification: options.verification }),
       ...(options.retention === undefined ? {} : { workerRetention: options.retention }),
     };
   }
@@ -2655,40 +2701,46 @@ export default async function plugin(bb: BbPluginApi) {
             enforcement: {
               type: "enum",
               values: [...ENFORCEMENT_LEVELS],
-              description: "Write this project's enforcement override",
+              description: "Write that scope's enforcement level",
             },
             "read-commands": {
               type: "enum",
               values: ["on", "off"],
-              description: "Write this project's read-only command allowance",
+              description: "Write that scope's read-only command allowance",
             },
             "max-nudges": {
               type: "integer",
               min: 0,
               max: 1000,
-              description: "Write this project's reminder cap",
+              description: "Write that scope's reminder cap",
             },
             "max-parallel": {
               type: "integer",
               min: 0,
               max: 1000,
-              description: "Write this project's parallel worker cap",
+              description: "Write that scope's parallel worker cap",
             },
             "max-per-turn": {
               type: "integer",
               min: 0,
               max: 1000,
-              description: "Write this project's per-turn delegation cap",
+              description: "Write that scope's per-turn delegation cap",
             },
-            "contract-preset": {
+            research: {
               type: "enum",
-              values: [...CONTRACT_PRESETS],
-              description: "Write this project's contract shape",
+              values: [...RESEARCH_MODES],
+              description:
+                "Write that scope's answer to who finds things out: as-is, read-first, or delegated",
+            },
+            verification: {
+              type: "enum",
+              values: [...VERIFICATION_MODES],
+              description: "Write that scope's review strength: when-needed or every-unit",
             },
             retention: {
               type: "enum",
               values: [...WORKER_RETENTION],
-              description: "Write this project's worker retention policy",
+              description: "Write that scope's worker retention policy",
             },
             "worker-provider": { type: "string", description: "Write this project's worker provider" },
             "worker-model": { type: "string", description: "Write this project's worker model" },
@@ -2777,7 +2829,8 @@ export default async function plugin(bb: BbPluginApi) {
                   `  read commands:        ${values.allowReadCommands ? "allowed" : "all commands are work"}`,
                   `  reminders per thread: ${values.maxNudges}`,
                   `  fan-out cap:          ${values.maxParallelWorkers === 0 ? "none" : `${values.maxParallelWorkers} in flight`}, ${values.maxDelegationsPerTurn === 0 ? "none" : `${values.maxDelegationsPerTurn} per turn`}`,
-                  `  contract shape:       ${values.contractPreset}`,
+                  `  research:             ${values.research}`,
+                  `  verification:         ${values.verification}`,
                   `  worker retention:     ${values.workerRetention}`,
                   `  workers run as:       ${worker}${describeFallback(live.worker.fallback)}${describePresets(live.worker.presets)}`,
                   `  rules:                ${extraInstructions === "" ? "none" : `${extraInstructions.length} characters`}`,
@@ -2832,7 +2885,8 @@ export default async function plugin(bb: BbPluginApi) {
                 `  read commands:       ${values.allowReadCommands ? "allowed" : "all commands are work"}${view.overridden.includes("allowReadCommands") ? " (project)" : " (global)"}`,
                 `  reminders per thread: ${values.maxNudges}${view.overridden.includes("maxNudges") ? " (project)" : " (global)"}`,
                 `  fan-out cap:         ${values.maxParallelWorkers === 0 ? "none" : `${values.maxParallelWorkers} in flight`}, ${values.maxDelegationsPerTurn === 0 ? "none" : `${values.maxDelegationsPerTurn} per turn`}`,
-                `  contract shape:      ${values.contractPreset}${view.overridden.includes("contractPreset") ? " (project)" : " (global)"}`,
+                `  research:            ${values.research}${view.overridden.includes("research") ? " (project)" : " (global)"}`,
+                `  verification:        ${values.verification}${view.overridden.includes("verification") ? " (project)" : " (global)"}`,
                 `  worker retention:    ${values.workerRetention}${view.overridden.includes("workerRetention") ? " (project)" : " (global)"}`,
                 `  workers run as:      ${view.worker}`,
                 `  project rules:       ${view.rules === null ? "inherits the global rules" : `${view.rules.length} characters`}`,
