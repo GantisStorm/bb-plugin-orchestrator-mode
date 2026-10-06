@@ -51,6 +51,12 @@ const CATALOG: ProviderCatalogFixture = {
   },
 };
 
+/** A catalog for the explicit worker-pin regression cases. */
+const PIN_CATALOG: ProviderCatalogFixture = {
+  providers: [{ id: "grok", available: true }],
+  models: { grok: [{ id: "grok-test-model" }] },
+};
+
 function workRow(overrides: Record<string, unknown>): Record<string, unknown> {
   return {
     kind: "work",
@@ -607,6 +613,7 @@ describe("the watchdog", () => {
   it.each([
     "git status",
     "bb status --json; bb provider models codex --environment env_bucd4j3r9b --json",
+    "find benchmarks -maxdepth 2 -type f 2>/dev/null; find research/sqlite -maxdepth 2 -type f 2>/dev/null",
   ])("lets read-only command `%s` through", async (command) => {
     const { harness } = await load({ enforcement: "block", allowReadCommands: true });
     await arm(harness);
@@ -623,6 +630,68 @@ describe("the watchdog", () => {
     expect(state.violations).toEqual([]);
     expect(stoppedThreads).toEqual([]);
     expect(sentTexts).toEqual([]);
+  });
+
+  it("allows stdin follow-ups to recorded workers with read-only exploration disabled", async () => {
+    const { harness } = await load({ enforcement: "block", allowReadCommands: false });
+    await arm(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL, { task: "Review the implementation", waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    const command = `bb thread tell ${WORKER} --model grok-4.7 --mode steer --message-file - <<'FOLLOWUP'\nAdd tests and run them in the worker.\nFOLLOWUP`;
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: "row_followup", workKind: "command", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, command }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      violations: [], delegations: [{ threadId: WORKER }],
+    });
+    expect(stoppedThreads).toEqual([]);
+    expect(sentTexts).toEqual([]);
+  });
+
+  it("recognises workers recorded while the timeline request is in flight", async () => {
+    const { harness } = await load({ enforcement: "block", allowReadCommands: false });
+    await arm(harness);
+    const command = `bb thread tell ${WORKER} 'Add tests'`;
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: "row_concurrent_followup", workKind: "command", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, command }),
+    ];
+    timelineMaxSeq = 4;
+    harness.inspection.sdk.stub("threads.timeline", async () => {
+      await harness.behavior.callAgentTool(
+        DELEGATE_TOOL, { task: "Review the implementation", waitForResult: false },
+        { threadId: THREAD, projectId: "proj_1" },
+      );
+      return { rows: timelineRows, maxSeq: timelineMaxSeq };
+    });
+    await idle(harness);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      violations: [], delegations: [{ threadId: WORKER }],
+    });
+    expect(stoppedThreads).toEqual([]);
+    expect(sentTexts).toEqual([]);
+  });
+
+  it("still flags follow-up commands to unrecorded threads", async () => {
+    const { harness } = await load({ enforcement: "block" });
+    await arm(harness);
+    timelineRows = [
+      ...timelineRows,
+      workRow({ id: "row_unrecorded", workKind: "command", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, command: "bb thread tell th_other 'Do work'" }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    await vi.waitFor(() => expect(stoppedThreads).toEqual([THREAD]));
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      violations: [{ id: "row_unrecorded" }],
+    });
   });
 
   it("never classifies the same row twice", async () => {
@@ -853,6 +922,8 @@ describe("the delegation tool", () => {
       prompt: "Implement the retry policy in src/retry.ts",
       environment: { type: "reuse", environmentId: "env_1" },
     });
+    expect(spawned[0]).not.toHaveProperty("providerId");
+    expect(spawned[0]).not.toHaveProperty("model");
     expect(String(result)).toContain("the worker finished the task");
     expect(String(result)).toContain(WORKER);
 
@@ -861,6 +932,99 @@ describe("the delegation tool", () => {
     };
     expect(state.delegations).toHaveLength(1);
     expect(state.delegations[0]!.threadId).toBe(WORKER);
+  });
+
+  it.each(["provider", "providerId"])("pins %s and the model before starting a worker", async (field) => {
+    const { harness } = await load({}, undefined, PIN_CATALOG);
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      {
+        task: "Probe the contract and scope without changing project files",
+        [field]: "grok",
+        model: "grok-test-model",
+        waitForResult: false,
+      },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toMatchObject({
+      providerId: "grok",
+      model: "grok-test-model",
+      parentThreadId: THREAD,
+      executionInputSources: { providerId: "explicit", model: "explicit" },
+    });
+    expect(harness.inspection.sdk.callsTo("threads.update")).toEqual([]);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      enabled: true,
+      delegations: [{ threadId: WORKER }],
+    });
+  });
+
+  it.each([
+    { providerId: "grok" },
+    { model: "grok-test-model" },
+  ])("supports an individual worker pin: %j", async (pins) => {
+    const { harness } = await load({}, undefined, PIN_CATALOG);
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Probe the scope", ...pins, waitForResult: false },
+      { threadId: THREAD },
+    );
+    expect(spawned[0]).toMatchObject(pins);
+    // Model-only calls infer its provider, as the execution-controls path does.
+    expect(spawned[0]).toMatchObject({ providerId: "grok" });
+    if (!("model" in pins)) expect(spawned[0]).not.toHaveProperty("model");
+  });
+
+  it.each(["provider", "providerId"])("normalises whitespace in %s and model pins", async (field) => {
+    const { harness } = await load({}, undefined, PIN_CATALOG);
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Probe the scope", [field]: " grok ", model: " grok-test-model ", waitForResult: false },
+      { threadId: THREAD },
+    );
+    expect(spawned[0]).toMatchObject({ providerId: "grok", model: "grok-test-model" });
+  });
+
+  it.each([
+    { providerId: "" },
+    { providerId: "   " },
+    { providerId: "x".repeat(121) },
+    { provider: "" },
+    { provider: "   " },
+    { provider: "x".repeat(121) },
+    { model: "" },
+    { model: "   " },
+    { model: "x".repeat(201) },
+  ])("rejects invalid worker pins before spawning: %j", async (pins) => {
+    const { harness } = await load();
+    await expect(harness.behavior.callAgentTool(
+      DELEGATE_TOOL, { task: "Probe the scope", ...pins }, { threadId: THREAD },
+    )).rejects.toThrow();
+    expect(spawned).toEqual([]);
+  });
+
+  it("does not fall back to an unpinned worker when BB rejects the pins", async () => {
+    const { harness } = await load({}, undefined, PIN_CATALOG);
+    await enable(harness);
+    harness.inspection.sdk.stub("threads.spawn", async () => {
+      throw new Error("requested provider/model unavailable");
+    });
+    await expect(harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Probe the scope", providerId: "grok", model: "grok-test-model" },
+      { threadId: THREAD },
+    )).rejects.toThrow("requested provider/model unavailable");
+    const calls = harness.inspection.sdk.callsTo("threads.spawn");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]![0]).toMatchObject({ providerId: "grok", model: "grok-test-model" });
+    expect(harness.inspection.sdk.callsTo("threads.wait")).toEqual([]);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      delegations: [],
+    });
   });
 
   it("returns immediately when asked not to wait", async () => {
@@ -2421,6 +2585,86 @@ describe("cli", () => {
     expect(harness.inspection.sdk.callsTo("threads.wait")).toEqual([]);
   });
 
+  it("pins the requested provider and model through CLI delegation", async () => {
+    const { harness } = await load({}, undefined, PIN_CATALOG);
+    await enable(harness);
+    const result = await harness.behavior.runCli([
+      "delegate", "--task", "Probe the contract and scope",
+      "--provider", "grok", "--model", "grok-test-model", "--no-wait",
+    ], { threadId: THREAD, projectId: "proj_1" });
+    expect(result.exitCode).toBe(0);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toMatchObject({
+      providerId: "grok",
+      model: "grok-test-model",
+      parentThreadId: THREAD,
+    });
+    expect(harness.inspection.sdk.callsTo("threads.update")).toEqual([]);
+  });
+
+  it.each(["--provider-id", "--providerId"])("accepts the %s CLI alias", async (flag) => {
+    const { harness } = await load({}, undefined, PIN_CATALOG);
+    await enable(harness);
+    const result = await harness.behavior.runCli([
+      "delegate", "--task", "Probe the scope", flag, "grok",
+      "--model", "grok-test-model", "--no-wait",
+    ], { threadId: THREAD });
+    expect(result.exitCode).toBe(0);
+    expect(spawned[0]).toMatchObject({ providerId: "grok", model: "grok-test-model" });
+  });
+
+  it("accepts matching provider aliases after trimming", async () => {
+    const { harness } = await load({}, undefined, PIN_CATALOG);
+    await enable(harness);
+    await harness.behavior.callAgentTool(DELEGATE_TOOL, {
+      task: "Probe matching aliases", provider: " grok ", providerId: "grok",
+      model: "grok-test-model", waitForResult: false,
+    }, { threadId: THREAD });
+    expect(spawned[0]).toMatchObject({ providerId: "grok", model: "grok-test-model" });
+  });
+
+  it("refuses conflicting provider aliases without spawning", async () => {
+    const { harness } = await load({}, undefined, PIN_CATALOG);
+    await enable(harness);
+    await expect(harness.behavior.callAgentTool(DELEGATE_TOOL, {
+      task: "Probe conflicting aliases", provider: "grok", providerId: "other",
+      model: "grok-test-model", waitForResult: false,
+    }, { threadId: THREAD })).rejects.toThrow("must match");
+    expect(spawned).toEqual([]);
+  });
+
+  it.each(["provider", "providerId"])("does not retarget an unknown %s to the model owner", async (field) => {
+    const { harness } = await load({}, undefined, PIN_CATALOG);
+    await enable(harness);
+    await expect(harness.behavior.callAgentTool(DELEGATE_TOOL, {
+      task: "Probe unknown pins", [field]: "other", model: "grok-test-model",
+      waitForResult: false,
+    }, { threadId: THREAD })).rejects.toThrow("Unknown worker provider");
+    expect(spawned).toEqual([]);
+  });
+
+  it.each(["provider", "providerId"])("refuses a model incompatible with the pinned %s", async (field) => {
+    const { harness } = await load({}, undefined, {
+      providers: [...CATALOG.providers!, ...PIN_CATALOG.providers!],
+      models: { ...CATALOG.models, ...PIN_CATALOG.models },
+    });
+    await enable(harness);
+    await expect(harness.behavior.callAgentTool(DELEGATE_TOOL, {
+      task: "Probe incompatible pins", [field]: "grok", model: "claude-opus-5-5",
+      waitForResult: false,
+    }, { threadId: THREAD })).rejects.toThrow("pinned provider");
+    expect(spawned).toEqual([]);
+  });
+
+  it("advertises worker pins in CLI help", async () => {
+    const { harness } = await load();
+    const result = await harness.behavior.runCli(["delegate", "--help"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("--provider");
+    expect(result.stdout).toContain("--model");
+    expect(spawned).toEqual([]);
+  });
+
   it.each(["tool", "cli"])("preserves project worker execution through %s delegation", async (route) => {
     const { harness } = await load();
     await enable(harness);
@@ -2471,6 +2715,12 @@ describe("cli", () => {
       ["--task", ""],
       ["--task", "x".repeat(20_001)],
       ["--task", "x", "--timeout", "9"],
+      ["--task", "x", "--provider", ""],
+      ["--task", "x", "--provider", "   "],
+      ["--task", "x", "--provider", "x".repeat(121)],
+      ["--task", "x", "--model", ""],
+      ["--task", "x", "--model", "   "],
+      ["--task", "x", "--model", "x".repeat(201)],
     ]) {
       const result = await harness.behavior.runCli(["delegate", ...args, "--json"], { threadId: THREAD });
       expect(result.exitCode).toBe(1);

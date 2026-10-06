@@ -238,10 +238,13 @@ export interface Violation {
 interface ClassifierOptions {
   /** Read-only shell commands are research, not work. Default true. */
   allowReadCommands: boolean;
+  /** Retained worker IDs recorded by this orchestrator's delegation handler. */
+  workerThreadIds: readonly string[];
 }
 
 const DEFAULT_CLASSIFIER_OPTIONS: ClassifierOptions = {
   allowReadCommands: true,
+  workerThreadIds: [],
 };
 
 /**
@@ -1024,14 +1027,33 @@ function stripHeredocBodies(text: string): string {
   }
 }
 
+/** Remove only unquoted, literal stderr discards, never quoted data or fd operands. */
+function stripStderrDiscard(command: string): string {
+  let result = "";
+  let start = 0;
+  let boundary = true;
+  walkShell(command, (char, quote, escaped, delimiter, index) => {
+    if (boundary && quote === "" && !escaped && !delimiter && char === "2") {
+      const match = /^2>[ \t]*\/dev\/null(?=$|[\s;|&])/.exec(command.slice(index));
+      if (match !== null) {
+        result += command.slice(start, index);
+        start = index + match[0].length;
+      }
+    }
+    boundary = quote === "" && !escaped && !delimiter &&
+      (/[ \t\r\n]/.test(char) || isCommandSeparator(command, index));
+  });
+  return result + command.slice(start);
+}
+
 /**
- * True when every command in a shell line only reads. Any redirect, any
- * unknown program, and any mutating `git`/`bb` subcommand makes it work.
+ * True when every command in a shell line only reads. Output redirects count
+ * as work except literal stderr suppression with `2>/dev/null`.
  */
 export function isReadOnlyCommand(command: string): boolean {
   const trimmed = command.trim();
   if (trimmed === "") return true;
-  const { unquoted, live, segments } = scanCommandLine(stripHeredocBodies(trimmed));
+  const { unquoted, live, segments } = scanCommandLine(stripStderrDiscard(stripHeredocBodies(trimmed)));
   // A redirect writes, whatever the program is. Only unquoted text counts: `echo 'a > b'` writes nothing.
   if (/(^|[^>])>(?!&)/.test(unquoted)) return false;
   if (/\btee\b/.test(unquoted)) return false;
@@ -1043,6 +1065,12 @@ export function isReadOnlyCommand(command: string): boolean {
 
   return segments.every((segment) => isReadOnlySegment(segment.trim()));
 }
+
+/** Options whose next word is a literal pattern/format, not a find action. */
+const FIND_PATTERN_OPTIONS: ReadonlySet<string> = new Set([
+  "-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename",
+  "-lname", "-ilname", "-regex", "-iregex", "-printf",
+]);
 
 /**
  * True when one command in a line only reads.
@@ -1090,6 +1118,14 @@ function isReadOnlySegment(segment: string): boolean {
   if (name === "env") return isReadOnlyEnvSegment(args);
   if (!READ_ONLY_PROGRAMS.has(name)) return false;
   const mutating = MUTATING_PROGRAM_FLAGS[name];
+  if (name === "find" && mutating !== undefined) {
+    for (let index = 0; index < args.length; index += 1) {
+      const arg = args[index]!;
+      if (mutating(arg)) return false;
+      if (FIND_PATTERN_OPTIONS.has(arg.replace(/^--/, "-"))) index += 1;
+    }
+    return true;
+  }
   return mutating === undefined || !args.some((arg) => mutating(arg));
 }
 
@@ -1133,9 +1169,42 @@ function isReadOnlyBbSegment(rest: readonly string[]): boolean {
   return verb !== undefined && verbs.has(verb);
 }
 
+/** Only an explicit, recorded worker target makes a follow-up delegation. */
+function isWorkerFollowup(segment: string, workerThreadIds: readonly string[]): boolean {
+  const match = /^(?:\S*\/)?bb\s+thread\s+(?:tell|message)\s+(?:'([A-Za-z0-9_-]+)'|"([A-Za-z0-9_-]+)"|([A-Za-z0-9_-]+))(?=\s|$)/.exec(segment);
+  const target = match?.[1] ?? match?.[2] ?? match?.[3];
+  return target !== undefined && workerThreadIds.includes(target);
+}
+
+/** End of a quoted, non-expanding heredoc; null for unsupported/unfinished input. */
+function literalHeredocEnd(command: string, offset: number): number | null {
+  const header = /^<<(-?)(?:'([A-Za-z0-9_-]+)'|"([A-Za-z0-9_-]+)")[ \t]*\r?\n/.exec(command.slice(offset));
+  if (header === null) return null;
+  const delimiter = header[2] ?? header[3]!;
+  const stripTabs = header[1] === "-";
+  let start = offset + header[0].length;
+  while (start <= command.length) {
+    const newline = command.indexOf("\n", start);
+    const end = newline === -1 ? command.length : newline;
+    let line = command.slice(start, end).replace(/\r$/, "");
+    if (stripTabs) line = line.replace(/^\t+/, "");
+    if (line === delimiter) return end;
+    if (newline === -1) break;
+    start = newline + 1;
+  }
+  return null;
+}
+
 /** CLI delegation is permitted even in sessions without the native tool. */
-function isDelegationCommand(command: string, allowReadCommands: boolean): boolean {
-  // ponytail: ordinary shell quoting only; use a shell parser if expansion forms are needed.
+function isDelegationCommand(
+  command: string,
+  allowReadCommands: boolean,
+  workerThreadIds: readonly string[],
+): boolean {
+  // Ordinary shell quoting only; quoted heredoc bodies are literal message data.
+  const delegates = (part: string) =>
+    /^(?:\S*\/)?bb\s+orchestrator-mode\s+delegate(?:\s|$)/.test(part) ||
+    isWorkerFollowup(part, workerThreadIds);
   const segments: string[] = [];
   let segment = "";
   let quote: "'" | '"' | null = null;
@@ -1162,6 +1231,13 @@ function isDelegationCommand(command: string, allowReadCommands: boolean): boole
     } else if (char === "'" || char === '"') {
       segment += char;
       quote = char;
+    } else if (char === "<" && command[index + 1] === "<") {
+      if (!isWorkerFollowup(segment.trim(), workerThreadIds)) return false;
+      const end = literalHeredocEnd(command, index);
+      if (end === null) return false;
+      segments.push(segment.trim());
+      segment = "";
+      index = end;
     } else if (/[<>()]/.test(char)) {
       return false;
     } else if (char === "&" && command[index + 1] !== "&") {
@@ -1176,7 +1252,6 @@ function isDelegationCommand(command: string, allowReadCommands: boolean): boole
   }
   if (quote !== null || escaped) return false;
   segments.push(segment.trim());
-  const delegates = (part: string) => /^(?:\S*\/)?bb\s+orchestrator-mode\s+delegate(?:\s|$)/.test(part);
   return segments.some(delegates) && segments.every((part) =>
     part === "" || delegates(part) || (allowReadCommands && isReadOnlyCommand(part)),
   );
@@ -1190,7 +1265,7 @@ export function classifyRow(
   row: WorkRowLike & { id: string; turnId?: string | null },
   options: Partial<ClassifierOptions> = {},
 ): Violation | null {
-  const { allowReadCommands } = { ...DEFAULT_CLASSIFIER_OPTIONS, ...options };
+  const { allowReadCommands, workerThreadIds = [] } = { ...DEFAULT_CLASSIFIER_OPTIONS, ...options };
   if (row.kind !== "work") return null;
   const workKind = row.workKind ?? "";
   if (ALWAYS_ALLOWED.has(workKind)) return null;
@@ -1214,7 +1289,7 @@ export function classifyRow(
   if (workKind === "command") {
     // A malformed row must not throw out of the scan loop: a non-string command reads as no command at all.
     const command = typeof row.command === "string" ? row.command.trim() : "";
-    if (isDelegationCommand(command, allowReadCommands)) return null;
+    if (isDelegationCommand(command, allowReadCommands, workerThreadIds)) return null;
     if (allowReadCommands && command !== "" && isReadOnlyCommand(command)) {
       return null;
     }
@@ -1386,7 +1461,7 @@ export function buildInstructions(input: InstructionInput): string {
         : "";
 
   const commands = input.allowReadCommands && preset !== "delegate-only"
-    ? "Read-only shell commands (`ls`, `cat`, `rg`, `git status`, `git diff`, `git log`, `find`, `wc`, `bb status`, `bb provider list`, `bb provider models`) are allowed for orientation; anything that writes, builds, installs or commits is not."
+    ? "Read-only shell commands are allowed for orientation. Literal stderr suppression (`2>/dev/null`) is allowed; other output redirects count as work."
     : "Only CLI delegation commands may run; read-only shell exploration is disabled.";
 
   const reminderLines = (input.reminders ?? [])
@@ -1419,16 +1494,17 @@ ${commands}
 ${workspaceRule}
 1. Understand the request. Read and search freely; ask when the goal is
    ambiguous.${research}
-2. Decompose it into units of work with self-contained briefs. A worker cannot
-   see this conversation, so each brief carries its own goal, context,
-   constraints and definition of done.
+2. Give each unit a self-contained brief: goal, context, constraints and
+   definition of done. A worker cannot see this conversation.
 3. Delegate with \`${DELEGATE_TOOL}\`; if unavailable, use
    \`bb orchestrator-mode delegate --task 'complete brief'\`.
    Quote briefs safely; \`--no-wait\` fans out independent units. Resuming a
    provider session may retain its original tool list.
+   Pin with \`--provider <id> --model <id>\`; pinning does not require turning this mode off.
 ${reviewStep}
-5. Report by synthesizing: what was delegated, what each worker produced, what
-   is left. Link worker ids so the user can open them.
+   Send corrections with \`bb thread tell <worker-id> ...\` (alias \`message\`) to
+   recorded workers; safely quoted messages or quoted stdin heredocs are delegation.
+5. Synthesise results and what remains. Link worker ids so the user can open them.
 
 ## When you may act directly
 
@@ -1438,7 +1514,7 @@ tool that changes something, stop and delegate.
 ## Choosing the worker's model
 
 ${workerBudget(input.workerConfig)} Override per delegation with \`model\`,
-\`provider\`, \`reasoning\` and \`permissionMode\`. Give a hard unit a stronger
+\`provider\` (alias \`providerId\`), \`reasoning\` and \`permissionMode\`. Give a hard unit a stronger
 model, a mechanical one a cheaper one.${savedPresets} Ids come from
 \`bb provider list\` and \`bb provider models <provider>\`; both are read-only.
 

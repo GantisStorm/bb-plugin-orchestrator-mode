@@ -47,14 +47,24 @@ and request nested rows so completed turn summaries still expose their work.
 File changes and image generation count as work. Command rows count unless they
 delegate through the plugin CLI or the read-only command setting allows them.
 Delegation command checks respect quoted briefs and reject executable
-substitutions, redirections and mixed chains that perform direct work.
+substitutions, output redirections and mixed chains that perform direct work.
+Worker follow-ups through `bb thread tell`/`message` are delegation only when
+the literal target ID is in this parent's retained delegation records, even
+when read-only exploration is disabled. The watchdog refreshes that worker
+list after reading the timeline so newly recorded workers are included.
+Quoted stdin heredocs (including tab-stripping `<<-`) are read as literal
+message data; unquoted, unfinished or unsupported heredocs remain work.
 Generic tool rows are classified using
 their names; this is a heuristic, not a complete description of their effects.
 
 Recognised research includes reads, searches, web fetches, plans and questions.
 Delegation rows remain available. Shell read-only checks reject writes through
-redirection and mutating command chains; consult `isReadOnlyCommand` and its
-tests for the exact recognised commands.
+redirection and mutating command chains. Literal stderr suppression with
+`2>/dev/null` (or `2> /dev/null`) is allowed when every command only reads;
+other output redirects still count as work. `find` actions that delete,
+execute programs, or write result files also count as work, even with errors
+suppressed. Consult `isReadOnlyCommand` and its tests for the exact recognised
+commands.
 Mixed Git subcommands require recognised query forms: listing branches or
 tags, inspecting remotes and showing reflogs. Creating or deleting branches
 and tags, changing remotes and rewriting reflogs count as work.
@@ -72,9 +82,19 @@ the stop request. This plugin is a coordination aid, not a security boundary.
 
 ## Worker lifecycle
 
-`orchestrator_delegate` and the `delegate` CLI create a child in the parent's environment, without
-passing the parent's conversation. Workers do not inherit the new-root-thread
-default. Their permissions and execution remain ordinary BB thread behaviour.
+`orchestrator_delegate` and the `delegate` CLI create a child without passing
+the parent's conversation. Shared workers reuse the parent's environment;
+worktree workers receive their own checkout. Workers do not inherit the
+new-root-thread default.
+Optional `provider` (alias `providerId`) and `model` pins (CLI: `--provider`
+and `--model`) are trimmed and validated at the input boundary. Conflicting
+provider aliases or a model incompatible with a pinned provider are refused.
+Execution is passed to `threads.spawn` with explicit provenance, before the
+worker's first turn, never through a later update. Omitted fields resolve
+through presets, scoped worker settings and BB's defaults. The plugin checks
+its provider/model catalog and BB validates availability. A failed spawn
+creates no delegation record and is never retried unpinned; a configured
+retry target may still apply.
 
 The tool waits by default, reports the settled status and returns up to 12,000
 characters of final output. With `waitForResult: false`, it returns the worker

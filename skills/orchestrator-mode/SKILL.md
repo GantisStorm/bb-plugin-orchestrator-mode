@@ -21,7 +21,7 @@ the mode is on for you.
 
 ```
 bb orchestrator-mode status [--thread <id>] [--json]
-bb orchestrator-mode delegate --task <brief> [--title <title>] [--no-wait] [--timeout <seconds>] [--hidden] [--thread <id>] [--json]
+bb orchestrator-mode delegate --task <brief> [--title <title>] [--provider <id>] [--model <id>] [--no-wait] [--timeout <seconds>] [--hidden] [--thread <id>] [--json]
 bb orchestrator-mode on [--thread <id>] [--enforcement instruct|guard|block] [--json]
 bb orchestrator-mode off [--thread <id>] [--json]
 bb orchestrator-mode violations [--thread <id>] [--clear] [--json]
@@ -57,7 +57,10 @@ Read-only shell commands (`ls`, `cat`, `rg`, `git status`, `git diff`,
 `git log`, `find`, `wc`, `bb status`, `bb provider list`, `bb provider models`)
 do not count as work while "Let the orchestrator read with shell commands" is
 on and the contract is not `delegate-only`. Chained commands are allowed when
-every segment is read-only. Creating images counts as work and must be
+every segment is read-only. Literal stderr suppression (`2>/dev/null` or
+`2> /dev/null`) is allowed, including on chained `find` queries. Other
+output redirects and mutating `find` actions (`-delete`, `-exec`, `-fprint`)
+still count as work. Creating images counts as work and must be
 delegated; inspecting images is allowed. Git commands that create or delete
 branches or tags, change remotes, or rewrite reflogs also count as work.
 
@@ -75,9 +78,41 @@ Arguments are `task` (required, at most 20,000 characters), `title` (optional,
 at most 200), `waitForResult` (default `true`), `timeoutSeconds` (default `900`,
 integer range 10 to 3,600), `hidden` (default `false`), `preset` (optional, a
 stored execution preset), `verify` (default `false`, adds the check unit
-described below) and `provider`, `model`, `reasoning`, `permissionMode` for this
+described below) and `provider` (alias `providerId`), `model`, `reasoning`, `permissionMode` for this
 one unit. With `waitForResult: false` the worker keeps running: inspect it later
 and review its result.
+
+Optional `provider` (alias `providerId`, 1–120 characters) and `model`
+(1–200) are trimmed; blank pins are rejected. If both provider names are
+supplied, they must match. Provider pins are never silently retargeted: name a
+model that the pinned provider serves. The CLI equivalents are `--provider`
+(aliases `--provider-id` and `--providerId`) and `--model`. Pins take effect
+before the first turn and do not require disabling orchestrator mode. Failed
+spawns are not retried with unpinned workers; an explicitly configured retry
+target still applies.
+
+A resumed session may retain an older native tool schema without the pin
+arguments. Use the CLI with `--provider` and `--model` rather than unpinned
+delegation in that case.
+
+### Following up with a worker
+
+`bb thread tell <worker-id> ...` (alias `message`) counts as delegation when
+the target is in this orchestrator's retained delegation records. It remains
+allowed when read-only shell exploration is disabled. Literal quoted messages
+and `--message-file <path>` can carry the follow-up. For stdin, use a quoted
+heredoc delimiter so the shell cannot execute substitutions in the message:
+
+```sh
+bb thread tell <worker-id> --model <model-id> --mode steer --message-file - <<'FOLLOWUP'
+Review the implementation and add the missing tests in your worker thread.
+FOLLOWUP
+```
+
+Unknown/unrecorded targets (including the orchestrator itself), unquoted
+heredocs, command substitutions outside literal message data, file-output
+redirects and mixed chains doing local work are not delegation. Each worker
+in a chained follow-up must be recorded. At most 250 worker records are retained.
 
 ## Recording a verdict
 

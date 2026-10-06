@@ -72,6 +72,14 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ### Fixed
 
+- Treat `bb thread tell`/`message` follow-ups to recorded workers as delegation,
+  including literal quoted stdin heredocs, without allowing local shell work.
+- Allow literal `2>/dev/null` stderr suppression on read-only commands without
+  flagging exploratory `find` queries, while rejecting file-output redirects
+  and mutating `find` actions.
+- Allow explicit provider/model pins in the delegation tool and CLI before
+  workers start, so provider-constrained personas can keep orchestrator mode on.
+
 - CLI delegation shares the native tool's worker handler, including caps,
   verification and retention. Both routes honour project worker execution,
   and active mode-change notifications use the project's complete contract.

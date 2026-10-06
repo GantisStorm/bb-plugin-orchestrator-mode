@@ -76,8 +76,11 @@ accent while the mode is on.
 
 The `orchestrator_delegate` tool creates a child thread from a self-contained
 brief and can wait for its result. Workers use the parent's environment and
-appear in the sidebar unless you request a hidden worker.
+appear in the sidebar unless you request a hidden worker. Optional `providerId`
+and `model` pins are applied before the worker starts.
 Existing sessions without that tool can use `bb orchestrator-mode delegate`.
+Follow-ups with `bb thread tell <worker-id>` (alias `message`) are delegation
+for recorded workers, including messages supplied through quoted stdin heredocs.
 
 You choose their provider and model with BB's own picker in the plugin's
 settings, or per delegation in the tool call, and the orchestrator has to record
@@ -163,7 +166,9 @@ flowchart TD
 - **Classification.** The watchdog treats file changes, image generation,
   mutating commands and mutating tool names as work. Reads, searches, plans,
   questions and delegation
-  remain available; command leniency is configurable.
+  remain available; command leniency is configurable. Read-only queries may
+  suppress stderr with `2>/dev/null`; output-file redirects and mutating `find`
+  actions still count as work.
 - **Session timing.** Running turns receive mode changes as steering messages.
   Session configuration applies when the provider session is next constructed;
   resuming can retain its original tools, so CLI delegation remains available.
@@ -387,7 +392,7 @@ bb orchestrator-mode off
 | Command | Does |
 | --- | --- |
 | `status [--thread <id>] [--json]` | Show mode, enforcement, violations, nudges and delegations. |
-| `delegate --task <brief> [--title <title>] [--no-wait] [--timeout <seconds>] [--hidden] [--thread <id>] [--json]` | Run the same delegation action when the native tool is unavailable. |
+| `delegate --task <brief> [--title <title>] [--provider <id>] [--model <id>] [--no-wait] [--timeout <seconds>] [--hidden] [--thread <id>] [--json]` | Run the same delegation action, with optional worker pins, when the native tool is unavailable. |
 | `on [--thread <id>] [--enforcement instruct\|guard\|block] [--json]` | Enable the thread, with an optional enforcement override. |
 | `off [--thread <id>] [--json]` | Disable the thread and clear its enforcement override. |
 | `scope [--global \| --project <id>] [--enforcement <level>] [--read-commands on\|off] [--max-nudges <n>] [--max-parallel <n>] [--max-per-turn <n>] [--contract-preset <standard\|review-heavy\|delegate-only>] [--retention <policy>] [--worker-workspace <shared\|worktree>] [--worker-provider <id>] [--worker-model <id>] [--clear-worker] [--rules <text>] [--clear-rules] [--inherit <key>] [--inherit-all] [--json]` | With `--global`, read or write the record every project inherits (settings only; the worker execution and rules have their own commands). With `--project`, read or write that project's overrides: settings, worker execution and appended rules. Without either, list every project that has any. |
@@ -408,7 +413,7 @@ doing without opening the brief. A title that already names the preset is left
 alone, and a delegation without one is titled exactly as before.
 
 Two tools. `orchestrator_delegate({ task, title?, waitForResult?,
-timeoutSeconds?, hidden?, workspace?, preset?, verify?, provider?, model?,
+timeoutSeconds?, hidden?, workspace?, preset?, verify?, provider?, providerId?, model?,
 reasoning?, permissionMode? })` hands one unit to a worker, and
 `orchestrator_review({ workerThreadId, verdict, notes?, verifiedBy? })` records
 your verdict on the result. The watchdog expects one verdict per worker whose
@@ -424,8 +429,18 @@ arguments; asking for one that is not stored is an error that names the ones
 that are, and the contract names the stored kinds so the orchestrator knows what
 it may ask for. `verify` adds a [check unit](#reviewing-worker-output). The four
 execution arguments are optional and fall back to a preset, then the
-[worker execution](#worker-execution), then the project defaults. The
-bundled [skill](skills/orchestrator-mode/SKILL.md) explains the mode, delegation
+[worker execution](#worker-execution), then the project defaults.
+
+Optional `provider` (alias `providerId`, 1–120 characters) and `model`
+(1–200) are trimmed; blank pins are rejected. If both provider names are
+supplied, they must match. Provider pins are never silently retargeted: name a
+model that the pinned provider serves. The CLI equivalents are `--provider`
+(aliases `--provider-id` and `--providerId`) and `--model`. Pins take effect
+before the first turn and do not require disabling orchestrator mode. Failed
+spawns are not retried with unpinned workers; an explicitly configured retry
+target still applies.
+
+The bundled [skill](skills/orchestrator-mode/SKILL.md) explains the mode, delegation
 and CLI; enabled sessions receive the contract directly.
 
 ## Scope

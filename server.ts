@@ -1534,6 +1534,13 @@ export default async function plugin(bb: BbPluginApi) {
       .max(20_000)
       .describe("Complete, self-contained brief for the worker."),
     title: z.string().max(200).optional().describe("Worker thread title."),
+    providerId: z
+      .string()
+      .trim()
+      .min(1)
+      .max(120)
+      .optional()
+      .describe("Alias for provider: pin this registered provider before the worker starts. If both are supplied, they must match."),
     waitForResult: z
       .boolean()
       .optional()
@@ -1569,6 +1576,7 @@ export default async function plugin(bb: BbPluginApi) {
       ),
     model: z
       .string()
+      .trim()
       .min(1)
       .max(200)
       .optional()
@@ -1577,6 +1585,7 @@ export default async function plugin(bb: BbPluginApi) {
       ),
     provider: z
       .string()
+      .trim()
       .min(1)
       .max(120)
       .optional()
@@ -1609,6 +1618,7 @@ export default async function plugin(bb: BbPluginApi) {
       verify,
       model,
       provider,
+      providerId,
       reasoning,
       permissionMode,
     }: z.infer<typeof delegateParameters>,
@@ -1717,14 +1727,25 @@ export default async function plugin(bb: BbPluginApi) {
     // Per-delegation arguments win over a preset, which wins over the worker
     // settings; a field none of them names is left out so the worker resolves
     // the project default.
+    const pinnedProvider = provider ?? providerId;
+    if (provider !== undefined && providerId !== undefined && provider !== providerId) {
+      throw new Error("provider and providerId must match when both are supplied.");
+    }
+    assertInCatalog({
+      ...(pinnedProvider === undefined ? {} : { providerId: pinnedProvider }),
+      ...(model === undefined ? {} : { model }),
+    });
     const workerExec = reconcile({
       ...executionOf(workerConfig),
       ...presetExec,
-      ...(provider === undefined ? {} : { providerId: provider }),
+      ...(pinnedProvider === undefined ? {} : { providerId: pinnedProvider }),
       ...(model === undefined ? {} : { model }),
       ...(reasoning === undefined ? {} : { reasoningLevel: reasoning }),
       ...(permissionMode === undefined ? {} : { permissionMode }),
     });
+    if (pinnedProvider !== undefined && workerExec.providerId !== pinnedProvider) {
+      throw new Error("The worker model does not belong to the pinned provider; supply a compatible model.");
+    }
     assertInCatalog(workerExec);
 
     /**
@@ -1974,7 +1995,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: DELEGATE_TOOL,
     description:
-      "Hand one unit of work to a worker thread and get its result back. The only way an orchestrator-mode thread gets work done. The worker cannot see this conversation, so `task` must be a complete, self-contained brief: goal, context, constraints, and what done means.",
+      "Hand one unit of work to a worker thread and get its result back. Optionally pin its providerId and model before it starts. The only way an orchestrator-mode thread gets work done. The worker cannot see this conversation, so `task` must be a complete, self-contained brief: goal, context, constraints, and what done means.",
     instructions:
       "In orchestrator mode, delegate every unit of real work with orchestrator_delegate instead of doing it yourself. Fan out independent units in parallel; sequence only genuine dependencies.",
     presentation: {
@@ -2204,6 +2225,8 @@ export default async function plugin(bb: BbPluginApi) {
     // Incremental responses carry row patches instead of full rows. Nested
     // rows keep work visible after a completed turn collapses to a summary.
     const rows = asScanRows(timeline.delta?.upsertRows ?? timeline.rows);
+    // A worker may have been recorded while the timeline request was in flight.
+    const workerThreadIds = (await getState(threadId))?.delegations.map((worker) => worker.threadId) ?? [];
     const enabledAtMs = state.enabledAt === null ? 0 : Date.parse(state.enabledAt);
     // A missing or malformed maxSeq must not poison the cursor: Math.max(2, undefined) is NaN, which persists as null.
     const reportedMaxSeq = typeof timeline.maxSeq === "number" && Number.isFinite(timeline.maxSeq) ? timeline.maxSeq : 0;
@@ -2240,7 +2263,9 @@ export default async function plugin(bb: BbPluginApi) {
         // Turns that ran before the session could gain the contract are never
         // judged, only recorded.
         if (turnId !== null && graceTurnIds.includes(turnId)) continue;
-        const violation = classifyRow(row, { allowReadCommands: scanSettings.allowReadCommands });
+        const violation = classifyRow(row, {
+          allowReadCommands: scanSettings.allowReadCommands, workerThreadIds,
+        });
         if (violation !== null) {
           fresh.push(violation);
           if (seq >= liveSeq) {
@@ -2256,6 +2281,7 @@ export default async function plugin(bb: BbPluginApi) {
         // past it, so the next scan keeps enforcing instead of failing forever.
         bb.log.warn(`scan skipped a malformed row in ${threadId}: ${String(cause)}`);
       }
+
     }
 
     if (fresh.length === 0 && maxSeq === state.lastSeq) return;
@@ -2766,6 +2792,8 @@ export default async function plugin(bb: BbPluginApi) {
             ...threadOption,
             task: { type: "string", required: true, description: "Complete, self-contained worker brief (1–20,000 characters)" },
             title: { type: "string", description: "Worker title (at most 200 characters)" },
+            provider: { type: "string", aliases: ["provider-id", "providerId"], description: "Pin the worker's registered provider before it starts (1–120 characters)" },
+            model: { type: "string", description: "Pin the worker's model before it starts (1–200 characters)" },
             "no-wait": { type: "boolean", description: "Return immediately so other units can be delegated" },
             timeout: { type: "integer", min: 10, max: 3600, description: "Wait timeout in seconds (default 900)" },
             hidden: { type: "boolean", description: "Keep the worker out of the sidebar" },
@@ -2775,6 +2803,8 @@ export default async function plugin(bb: BbPluginApi) {
             const parsed = delegateParameters.safeParse({
               task: input.options.task,
               title: input.options.title,
+              provider: input.options.provider,
+              model: input.options.model,
               waitForResult: input.options["no-wait"] !== true,
               timeoutSeconds: input.options.timeout,
               hidden: input.options.hidden,

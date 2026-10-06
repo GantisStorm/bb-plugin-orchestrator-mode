@@ -93,6 +93,20 @@ describe("read-only command detection", () => {
     "git diff --stat",
     "git log --oneline -20",
     "find . -name '*.ts'",
+    "find benchmarks -maxdepth 2 -type f 2>/dev/null",
+    "find benchmarks 2>/dev/null",
+    "find benchmarks 2> /dev/null",
+    "2>/dev/null find benchmarks",
+    "find benchmarks 2>/dev/null;find research/sqlite 2>/dev/null",
+    "find benchmarks 2>/dev/null && ls research",
+    "find benchmarks 2>/dev/null | head -20",
+    "find benchmarks -name '-delete' 2>/dev/null",
+    "find benchmarks -name 'file -delete' 2>/dev/null",
+    "find benchmarks -printf '-delete' 2>/dev/null",
+    "rg '2>/dev/null' src 2>/dev/null",
+    "find . -name '--delete' 2>/dev/null",
+    "find . -regex '.*-exec.*' 2>/dev/null",
+    "find benchmarks -maxdepth 2 -type f 2>/dev/null; find research/sqlite -maxdepth 2 -type f 2>/dev/null",
     "wc -l src/*.ts",
     "pwd",
     "jq '.name' package.json",
@@ -185,6 +199,46 @@ describe("read-only command detection", () => {
     "git push",
     "echo hi > out.txt",
     "cat a >> b",
+    "find benchmarks 2> errors.log",
+    "find benchmarks 2>> errors.log",
+    "find benchmarks 2>/dev/null > files.txt",
+    "find benchmarks > /dev/null 2> errors.log",
+    "find benchmarks 2>/dev/null-output",
+    "find benchmarks 2>/dev/null/../out.txt",
+    "find benchmarks 2>/dev/null*",
+    "find benchmarks 2>/dev/null\"-output\"",
+    "find benchmarks 2>/dev/null$OUTPUT_SUFFIX",
+    "find benchmarks 2>/dev/null; rm file.txt",
+    "find benchmarks 2>/dev/null && npm test",
+    "find benchmarks 2>/dev/null & rm file.txt",
+    "find benchmarks 2>/dev/null&rm file.txt",
+    "ls 1>&2>/dev/null",
+    "ls name\\;2>/dev/null",
+    "ls name\\ 2>/dev/null",
+    "ls '2'>/dev/null",
+    "ls 2>/dev/null > output.txt",
+    "git -C repo -c core.fsmonitor=/tmp/worker-hook.sh status 2>/dev/null",
+    "rg --pre=cat pattern 2>/dev/null",
+    "find . --delete 2>/dev/null",
+    "find benchmarks -delete 2>/dev/null",
+    "find benchmarks '-delete' 2>/dev/null",
+    "find benchmarks -de'le'te 2>/dev/null",
+    "find benchmarks -dele\\te 2>/dev/null",
+    "find benchmarks -exec touch out.txt --help \\; 2>/dev/null",
+    "find benchmarks -exec touch out.txt \\; 2>/dev/null",
+    "find benchmarks -execdir touch out.txt \\; 2>/dev/null",
+    "find benchmarks -ok touch out.txt \\; 2>/dev/null",
+    "find benchmarks -okdir touch out.txt \\; 2>/dev/null",
+    "find benchmarks -fprint files.txt 2>/dev/null",
+    "find benchmarks -fprint0 files.txt 2>/dev/null",
+    "find benchmarks -fprintf files.txt '%p' 2>/dev/null",
+    "find benchmarks -fls files.txt 2>/dev/null",
+    "npm test 2>/dev/null",
+    "ls $(touch out.txt) 2>/dev/null",
+    "cat <(touch out.txt) 2>/dev/null",
+    "cat >(touch out.txt) 2>/dev/null",
+    "find benchmarks 2>'errors 2>/dev/null suffix'",
+    "find benchmarks 2>\"errors 2>/dev/null suffix\"",
     "ls | tee out.txt",
     "make",
     "pytest",
@@ -394,6 +448,14 @@ describe("direct-work classification", () => {
 
   it("allows a read-only command by default", () => {
     expect(classifyRow(row({ id: "r3", workKind: "command", command: "git status" }))).toBeNull();
+  });
+
+  it("allows exploratory find commands that suppress stderr", () => {
+    const command = "find benchmarks -maxdepth 2 -type f 2>/dev/null; find research/sqlite -maxdepth 2 -type f 2>/dev/null";
+    expect(classifyRow(row({ id: "find-with-stderr", workKind: "command", command }))).toBeNull();
+    expect(classifyRow(row({ id: "find-with-stderr", workKind: "command", command }), {
+      allowReadCommands: false,
+    })).not.toBeNull();
   });
 
   it("does not throw on a malformed command row", () => {
@@ -720,6 +782,20 @@ describe("the contract", () => {
     expect(text.toLowerCase()).toContain("editing");
   });
 
+  it("documents the stderr-suppression exception", () => {
+    const text = buildInstructions({ enforcement: "guard", allowReadCommands: true });
+    expect(text).toContain("2>/dev/null");
+    expect(text).toContain("other output redirects count as work");
+  });
+
+  it("explains how to pin workers without disabling the mode", () => {
+    const text = buildInstructions({ enforcement: "guard", allowReadCommands: true });
+    expect(text).toContain("`providerId`");
+    expect(text).toContain("`model`");
+    expect(text).toContain("--provider <id> --model <id>");
+    expect(text).toContain("pinning does not require turning this mode off");
+  });
+
   it("only warns about the watchdog when one is running", () => {
     expect(buildInstructions({ enforcement: "instruct", allowReadCommands: true })).toContain(
       "nothing is watching",
@@ -762,10 +838,86 @@ describe("the contract", () => {
     );
   });
 
+  it("documents worker follow-up messaging", () => {
+    const text = buildInstructions({ enforcement: "guard", allowReadCommands: true });
+    expect(text).toContain("bb thread tell <worker-id>");
+    expect(text).toContain("quoted stdin heredocs are delegation");
+  });
+
+  it.each(["thr_z5wtd7fibg", "thr_3fuxqgieyy"])(
+    "allows worker follow-up messaging to %s as delegation",
+    (threadId) => {
+      const command = `bb thread tell ${threadId} --model grok-4.7 --mode steer --message-file -`;
+      expect(isReadOnlyCommand(command)).toBe(false);
+      expect(classifyRow(row({ id: threadId, workKind: "command", command }), {
+        allowReadCommands: false,
+        workerThreadIds: ["thr_z5wtd7fibg", "thr_3fuxqgieyy"],
+      })).toBeNull();
+    },
+  );
+
+  it.each([
+    "bb thread tell thr_worker 'Review the implementation and add tests'",
+    "bb thread message thr_worker --message-file followup.md",
+    "bb thread tell 'thr_worker' --mode queue 'Add tests'",
+    "bb thread tell \"thr_worker\" --mode auto 'Add tests'",
+    "/usr/local/bin/bb thread tell thr_worker 'Add tests'",
+    "bb thread tell thr_worker 'Use `npm test` and $(example) as literal text'",
+    "bb thread tell thr_worker --message-file - <<'FOLLOWUP'\nAdd tests; do not change the contract.\nRun `npm test` and $(example) in the worker, not here.\nFOLLOWUP",
+    "bb thread tell thr_worker --message-file - <<\"FOLLOWUP\"\nAdd tests > 3 cases.\nFOLLOWUP\n",
+    "bb thread tell thr_worker --message-file - <<-'FOLLOWUP'\n\tAdd tests\n\tFOLLOWUP",
+    "bb thread tell thr_worker 'First task'; bb thread tell thr_worker2 'Second task'",
+  ])("allows recorded-worker follow-up: %s", (command) => {
+    expect(classifyRow(row({ id: "followup", workKind: "command", command }), {
+      allowReadCommands: false,
+      workerThreadIds: ["thr_worker", "thr_worker2"],
+    })).toBeNull();
+  });
+
+  it.each([
+    "bb thread tell thr_unknown 'Do work'",
+    "bb thread tell thr_parent 'Disable the mode'",
+    "bb thread tell thr_worker 'Add tests'; npm test",
+    "bb thread tell thr_worker 'Add tests' > output.txt",
+    "bb thread tell thr_worker 'Add tests' & npm test",
+    'bb thread tell thr_worker "$(npm test)"',
+    "bb thread tell thr_worker `npm test`",
+    "bb thread tell thr_worker --message-file <(npm test)",
+    "bb thread tell thr_worker --message-file - <<FOLLOWUP\n$(npm test)\nFOLLOWUP",
+    "bb thread tell thr_worker --message-file - <<'FOLLOWUP'\nAdd tests\nFOLLOWUP\nnpm test",
+    "bb thread tell thr_worker --message-file - <<'FOLLOWUP'; npm test\nAdd tests\nFOLLOWUP",
+    "bb thread tell thr_worker --message-file - <<'FOLLOWUP'\nAdd tests\nFOLLOWUP extra",
+    "bb thread tell thr_worker --message-file - <<'FOLLOWUP'\nNo closing delimiter",
+    'bb thread tell thr_worker "message <<\'FOLLOWUP\'\n$(npm test)\nFOLLOWUP\n"',
+  ])("rejects unsafe or unrecorded-worker follow-up: %s", (command) => {
+    expect(classifyRow(row({ id: "followup", workKind: "command", command }), {
+      workerThreadIds: ["thr_worker", "thr_worker2"],
+    })).not.toBeNull();
+  });
+
+  it("treats a plain heredoc as a read, not worker delegation", () => {
+    const work = row({ id: "plain-heredoc", workKind: "command", command: "cat <<'FOLLOWUP'\ntext\nFOLLOWUP" });
+    expect(classifyRow(work, { workerThreadIds: ["thr_worker"] })).toBeNull();
+    expect(classifyRow(work, {
+      workerThreadIds: ["thr_worker"], allowReadCommands: false,
+    })).not.toBeNull();
+  });
+
+  it("allows read-only checks around worker messages only when exploration is enabled", () => {
+    const command = "bb status --json; bb thread tell thr_worker 'Add tests'";
+    const work = row({ id: "followup", workKind: "command", command });
+    expect(classifyRow(work, { workerThreadIds: ["thr_worker"] })).toBeNull();
+    expect(classifyRow(work, {
+      workerThreadIds: ["thr_worker"], allowReadCommands: false,
+    })).not.toBeNull();
+  });
+
   it("allows CLI delegation even when read-only exploration is disabled", () => {
     for (const command of [
       "bb orchestrator-mode delegate --task 'Implement retries; add tests > 3 cases'",
       'bb orchestrator-mode delegate --task "Implement retries" --no-wait',
+      "bb orchestrator-mode delegate --task 'Probe the scope' --provider grok --model grok-test-model --no-wait",
+      "bb orchestrator-mode delegate --task 'Probe the scope' --provider-id grok --model grok-test-model",
       "bb orchestrator-mode delegate --task 'Use `npm test` and $(example) as literal text'",
     ]) {
       expect(classifyRow(row({ id: command, workKind: "command", command }), {
