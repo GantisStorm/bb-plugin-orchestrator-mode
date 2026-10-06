@@ -2413,3 +2413,96 @@ describe("sweep regressions", () => {
     expect(state.delegations.map((delegation) => delegation.threadId)).toContain("th_worker_1");
   });
 });
+describe("project scopes", () => {
+  const PROJECT = "proj_scoped";
+  const OTHER = "proj_other";
+  const threadIn = (projectId: string) => makeThreadResponse({ id: THREAD, projectId, environmentId: "env_1" });
+
+  it("resolves a project's settings over the globals, thread first, and reports the scope", async () => {
+    const { harness } = await load();
+    await enable(harness, THREAD);
+    harness.inspection.sdk.stub("threads.get", async () => threadIn(PROJECT));
+
+    const written = await harness.behavior.runCli([
+      "scope", "--project", PROJECT, "--enforcement", "block", "--max-nudges", "7", "--max-parallel", "2",
+    ]);
+    expect(written.exitCode).toBe(0);
+    expect(written.stdout).toContain("project proj_scoped");
+    expect(written.stdout).toContain("settings overridden: enforcement, maxNudges, maxParallelWorkers");
+
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as OrchestratorStateDto;
+    expect(state.effectiveEnforcement).toBe("block");
+    expect(state.maxNudges).toBe(7);
+    expect(state.maxParallelWorkers).toBe(2);
+
+    const status = await harness.behavior.runCli(["status", "--thread", THREAD]);
+    expect(status.stdout).toContain("scope:             project proj_scoped (overrides: enforcement, maxNudges, maxParallelWorkers)");
+
+    // A thread override still wins over the project's.
+    await harness.behavior.callRpc("set_enabled", { threadId: THREAD, enabled: true, enforcement: "instruct" });
+    const overridden = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as OrchestratorStateDto;
+    expect(overridden.effectiveEnforcement).toBe("instruct");
+  });
+
+  it("applies a project's fan-out cap to that project only", async () => {
+    const { harness } = await load({ maxParallelWorkers: 0 });
+    await enable(harness, THREAD);
+    let spawned = 0;
+    harness.inspection.sdk.stub("threads.spawn", async () =>
+      makeThreadResponse({ id: `th_cap${++spawned}`, parentThreadId: THREAD }),
+    );
+    // Not waiting keeps both workers in flight, which is what the cap counts.
+    const delegate = (projectId: string, task: string) =>
+      harness.behavior.callAgentTool(DELEGATE_TOOL, { task, waitForResult: false }, { threadId: THREAD, projectId });
+    await delegate(PROJECT, "first");
+    await delegate(PROJECT, "second");
+    expect(spawned).toBe(2);
+
+    await harness.behavior.runCli(["scope", "--project", PROJECT, "--max-parallel", "1"]);
+    await expect(delegate(PROJECT, "third")).rejects.toThrow(/caps parallel workers at 1/);
+    // The neighbouring project still runs on the global cap.
+    await delegate(OTHER, "fourth");
+    expect(spawned).toBe(3);
+  });
+
+  it("hands a session the contract its project resolves, and the global one to another project", async () => {
+    const { harness } = await load();
+    await enable(harness, THREAD);
+    await harness.behavior.runCli([
+      "scope", "--project", PROJECT, "--contract-preset", "thorough", "--rules", "Never touch files under generated/.",
+    ]);
+    const scoped = await harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({
+        thread: { id: THREAD },
+        project: { id: PROJECT },
+        pluginMetadata: writeMirror({ enabled: true, enforcement: null }),
+      }),
+    );
+    expect(scoped.instructions).toContain("Every unit gets checked before you trust it");
+    expect(scoped.instructions).toContain("Never touch files under generated/.");
+
+    const other = await harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({
+        thread: { id: THREAD },
+        project: { id: OTHER },
+        pluginMetadata: writeMirror({ enabled: true, enforcement: null }),
+      }),
+    );
+    expect(other.instructions).not.toContain("Never touch files under generated/.");
+    expect(other.instructions).not.toContain("Every unit gets checked before you trust it");
+  });
+
+  it("lists project overrides and clears them on request", async () => {
+    const { harness } = await load();
+    await harness.behavior.runCli(["scope", "--project", PROJECT, "--max-nudges", "9", "--rules", "Prefer the repo skill copies."]);
+    const listed = await harness.behavior.runCli(["scope"]);
+    expect(listed.stdout).toContain(PROJECT);
+    expect(listed.stdout).toContain("settings: maxNudges");
+
+    const cleared = await harness.behavior.runCli(["scope", "--project", PROJECT, "--inherit-all"]);
+    expect(cleared.stdout).toContain("none (inherits the globals)");
+    expect(cleared.stdout).toContain("inherits the global rules");
+    const empty = await harness.behavior.runCli(["scope"]);
+    expect(empty.stdout).toContain("no project overrides");
+  });
+});
