@@ -72,6 +72,10 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ### Fixed
 
+- Git's program-running global options remain work after `-C`, `--git-dir`,
+  `--work-tree` or `--namespace` operands. Ordinary reads still pass, including
+  operands whose literal values look like those execution options.
+
 - The read-only classifier is sound before permissive. A line is now only
   read-only when every program in it is one the module models and no argument
   can make it write, because a missed work act is the harm the watchdog exists

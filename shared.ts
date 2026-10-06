@@ -777,12 +777,15 @@ const GIT_GLOBAL_VALUE_FLAGS: Record<string, true> = {
  * makes everywhere else.
  */
 function gitRunsAProgram(rest: readonly string[]): boolean {
-  for (const token of rest) {
+  for (let index = 0; index < rest.length; index += 1) {
+    const token = rest[index]!;
     if (!token.startsWith("-")) return false;
-    if (token === "-C") continue;
     if (token === "-c" || (token.startsWith("-c") && token.length > 2)) return true;
     if (token === "--config-env" || token.startsWith("--config-env=")) return true;
     if (token === "--exec-path" || token.startsWith("--exec-path=")) return true;
+    // A global option operand is neither a subcommand nor another option.
+    // Skip it so a later program-running option is still checked.
+    if (GIT_GLOBAL_VALUE_FLAGS[token] === true) index += 1;
   }
   return false;
 }

@@ -562,6 +562,48 @@ describe("telling a command from a tool call's title", () => {
   });
 });
 
+describe("Git global option operands", () => {
+  for (const prefix of ["-C repo", "--git-dir repo/.git", "--work-tree repo", "--namespace team"]) {
+    it.each([
+      "-c core.pager=cat",
+      "-ccore.pager=cat",
+      "--config-env core.pager=REVIEW_PAGER",
+      "--config-env=core.pager=REVIEW_PAGER",
+      "--exec-path /tmp/git-programs",
+      "--exec-path=/tmp/git-programs",
+    ])(`rejects program-running options after ${prefix}: %s`, (option) => {
+      const command = `git ${prefix} ${option} log`;
+      expect(isReadOnlyCommand(command)).toBe(false);
+      expect(classifyRow(row({ id: "global-option", workKind: "command", command }))).not.toBeNull();
+    });
+  }
+
+  it.each([
+    "git -C first -C second -c core.fsmonitor=/tmp/git-hook status",
+    "git --git-dir repo/.git --work-tree repo --namespace team -C repo --exec-path=/tmp/git-programs status",
+  ])("rejects program-running options after repeated or mixed operands: %s", (command) => {
+    expect(isReadOnlyCommand(command)).toBe(false);
+    expect(classifyRow(row({ id: "mixed-global-options", workKind: "command", command }))).not.toBeNull();
+  });
+
+  it.each([
+    "git -C repo status",
+    "git --git-dir repo/.git log",
+    "git --work-tree repo status",
+    "git --namespace team log",
+    "git -C first -C second status",
+    "git --git-dir repo/.git --work-tree repo --namespace team -C repo status",
+    "git -C '-c' status",
+    "git --git-dir '--config-env' log",
+    "git --work-tree '--exec-path' status",
+    "git --namespace '-c' log",
+    "git -C repo log -- -c --config-env --exec-path",
+  ])("preserves ordinary reads and literal operands: %s", (command) => {
+    expect(isReadOnlyCommand(command)).toBe(true);
+    expect(classifyRow(row({ id: "global-option-read", workKind: "command", command }))).toBeNull();
+  });
+});
+
 describe("the contract", () => {
   const levels: EnforcementLevel[] = ["instruct", "guard", "block"];
 
