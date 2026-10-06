@@ -22,15 +22,12 @@ import {
   defineCli,
   defineRpcContract,
   type BbPluginApi,
-  type PluginSettingDescriptor,
-  type PluginSettingsValues,
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
   DEFAULT_ENFORCEMENT,
   DELEGATE_TOOL,
   CONTRACT_PRESETS,
-  ENFORCEMENT_DESCRIPTIONS,
   ENFORCEMENT_LEVELS,
   PERMISSION_MODES,
   REASONING_LEVELS,
@@ -71,6 +68,13 @@ export { DELEGATE_TOOL };
 const STATE_CHANGED = "orchestrator-state";
 
 const STATE_KEY = "state";
+/**
+ * The global settings record: every thread-behaviour setting, plus the composer
+ * default. Stored here rather than as BB settings descriptors because a
+ * descriptor has one value per install, and these resolve per project; the
+ * editor is the plugin's own settings section, which picks the scope.
+ */
+const GLOBAL_SETTINGS_KEY = "settings";
 /** When the "new threads" default was last switched on; null while it is off. */
 const DEFAULT_KEY = "default";
 /** The stored worker execution every delegation defaults to. */
@@ -260,6 +264,17 @@ const stateSchema = z.object({
 export const WORKER_RETENTION = ["keep", "archive-checks", "archive-all"] as const;
 type WorkerRetention = (typeof WORKER_RETENTION)[number];
 
+/**
+ * One line per retention policy, so the settings row can explain every choice
+ * rather than only the one in force. Archiving hides a thread from the sidebar;
+ * it stays recoverable.
+ */
+export const WORKER_RETENTION_DESCRIPTIONS: Record<WorkerRetention, string> = {
+  keep: "Keep leaves every worker in the sidebar.",
+  "archive-checks": "Archive-checks archives check units once their verdict has been read.",
+  "archive-all": "Archive-all archives every worker once the orchestrator has read its result.",
+};
+
 /** A project id, as the scope RPCs take it. */
 const projectIdSchema = z.object({ projectId: z.string().min(1).max(120) });
 
@@ -287,6 +302,17 @@ const settingsViewSchema = z.object({
 });
 
 export type SettingsViewDto = z.infer<typeof settingsViewSchema>;
+
+/**
+ * One scope's settings: the values in force there, the globals they resolve
+ * over, and the fields a project overrides rather than inherits.
+ */
+const scopeSettingsSchema = z.object({
+  values: settingsViewSchema,
+  global: settingsViewSchema,
+  overridden: z.array(z.string()),
+});
+export type ScopeSettingsDto = z.infer<typeof scopeSettingsSchema>;
 
 /** The contract text, the project rules appended to it, and the room left. */
 const contractSchema = z.object({ text: z.string(), extra: z.string(), limit: z.number() });
@@ -346,25 +372,19 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: z.string().min(1).max(120), extra: z.string().max(EXTRA_INSTRUCTION_LIMIT) }).strict(),
     output: contractSchema,
   },
-  get_project_settings: {
-    input: projectIdSchema.strict(),
-    output: z.object({
-      values: settingsViewSchema,
-      overridden: z.array(z.string()),
-    }),
+  get_scope_settings: {
+    input: z.object({ projectId: z.string().min(1).max(120).nullable() }).strict(),
+    output: scopeSettingsSchema,
   },
-  set_project_setting: {
+  set_scope_setting: {
     input: z
       .object({
-        projectId: z.string().min(1).max(120),
+        projectId: z.string().min(1).max(120).nullable(),
         key: settingsKeySchema,
         value: z.union([z.string(), z.number(), z.boolean(), z.null()]),
       })
       .strict(),
-    output: z.object({
-      values: settingsViewSchema,
-      overridden: z.array(z.string()),
-    }),
+    output: scopeSettingsSchema,
   },
   clear_violations: {
     input: threadIdSchema.strict(),
@@ -472,77 +492,7 @@ function executionSources(exec: WorkerExecution): WorkerExecutionSources {
 export default async function plugin(bb: BbPluginApi) {
   const catalog = await loadWorkerCatalog(bb);
 
-  const SETTING_DESCRIPTORS = {
-    defaultForNewThreads: {
-      type: "boolean",
-      label: "Start new threads as orchestrators",
-      description:
-        "Threads you start from the composer begin in orchestrator mode. Threads already open, child workers and side chats are not affected, and you can still switch one thread on or off whenever you like.",
-      default: false,
-    },
-    enforcement: {
-      type: "select",
-      label: "How far the watchdog goes",
-      // One line per option, which BB's settings UI collapses into a paragraph
-      // and `bb plugin config` prints as written. A settings description is a
-      // single string, so a real list is not available here.
-      description: ENFORCEMENT_LEVELS.map((level) => ENFORCEMENT_DESCRIPTIONS[level]).join(" "),
-      options: [...ENFORCEMENT_LEVELS],
-      default: DEFAULT_ENFORCEMENT,
-    },
-    allowReadCommands: {
-      type: "boolean",
-      label: "Let the orchestrator read with shell commands",
-      description:
-        "While this is on, ls, cat, rg, git status, git diff and similar count as looking around rather than doing work. Turn it off and every command counts as doing the work itself.",
-      default: true,
-    },
-    maxNudges: {
-      type: "number",
-      label: "Reminders per thread",
-      description:
-        "How many times this plugin may prod one thread for either reason, doing work itself or leaving a worker unjudged. It is one budget shared by both gates, whichever spends it first; `bb orchestrator-mode status` reports the split. Violations keep being recorded after the cap, and only the reminders stop. 0 turns reminders off.",
-      default: 3,
-    },
-    maxParallelWorkers: {
-      type: "number",
-      label: "Most workers running at once",
-      description:
-        "Once this many workers are running, further delegations are refused and told why. Check units and fallbacks count too. 0 for no limit.",
-      default: 6,
-    },
-    maxDelegationsPerTurn: {
-      type: "number",
-      label: "Most workers per turn",
-      description:
-        "A delegation is refused once one turn has delegated this many, so a runaway fan-out stops instead of filling the sidebar. Check units and fallback retries are the plugin's own doing and do not count. 0 for no limit.",
-      default: 20,
-    },
-    workerRetention: {
-      type: "select",
-      label: "What happens to workers afterwards",
-      description:
-        "keep leaves every worker in the sidebar. archive-checks archives check units once their verdict has been read. archive-all archives every worker once the orchestrator has read its result. Archiving hides a thread from the sidebar, but it stays recoverable.",
-      options: [...WORKER_RETENTION],
-      default: "keep",
-    },
-    contractPreset: {
-      type: "select",
-      label: "What the orchestrator is told",
-      description:
-        "standard delegates the work and reviews it. delegate-only also hands over research, so it may not run commands at all. research-first asks for enough reading to write a brief that stands alone. review-heavy gives every unit an independent check unit before it is accepted. thorough is both: enough reading to brief well, and a check unit for every unit. Read the exact text with bb orchestrator-mode contract.",
-      options: [...CONTRACT_PRESETS],
-      default: "standard",
-    },
-  } satisfies Record<string, PluginSettingDescriptor>;
-
-  /**
-   * The resolved settings this plugin defines. Named here rather than published
-   * through `ReturnType` of the handle, so `applySettings` takes a real type.
-   */
-  type OrchestratorSettings = PluginSettingsValues<typeof SETTING_DESCRIPTORS>;
-
-  /** The settings that shape thread behaviour, after the global values are validated. */
+  /** The settings that shape thread behaviour, after a scope's values are validated. */
   interface SettingsView {
     enforcement: EnforcementLevel;
     allowReadCommands: boolean;
@@ -553,28 +503,82 @@ export default async function plugin(bb: BbPluginApi) {
     workerRetention: WorkerRetention;
   }
 
-  const settings = bb.settings.define(SETTING_DESCRIPTORS);
+  /** The global record: what every project inherits, plus the composer default. */
+  interface OrchestratorSettings extends SettingsView {
+    defaultForNewThreads: boolean;
+  }
+
+  /**
+   * What a fresh install starts from, and the value every stored field falls back
+   * to: a record missing a field, or carrying an unusable one, keeps the default
+   * instead of blanking it.
+   */
+  const DEFAULT_SETTINGS: OrchestratorSettings = {
+    defaultForNewThreads: false,
+    enforcement: DEFAULT_ENFORCEMENT,
+    allowReadCommands: true,
+    maxNudges: 3,
+    maxParallelWorkers: 6,
+    maxDelegationsPerTurn: 20,
+    contractPreset: "standard",
+    workerRetention: "keep",
+  };
+
+  /**
+   * The stored global record. Not a BB settings descriptor: a descriptor has one
+   * value per install and BB renders one form for it, while these resolve per
+   * project, so the plugin owns the record and the settings section renders the
+   * editor for whichever scope is selected.
+   */
+  let globalSettings: OrchestratorSettings = { ...DEFAULT_SETTINGS };
 
   /** In-memory mirror of the effective settings, for the sync configure path. */
   const live = {
-    defaultForNewThreads: false,
+    ...DEFAULT_SETTINGS,
     /**
      * When the default was last switched on. The dispatch hook only applies the
      * default to threads created at or after this moment, which is what keeps
      * "new threads" from meaning "every thread that happens to lack a mirror".
      */
     defaultEnabledAtMs: 0,
-    enforcement: DEFAULT_ENFORCEMENT as EnforcementLevel,
-    allowReadCommands: true,
-    maxNudges: 3,
-    contractPreset: "standard" as ContractPresetId,
-    workerRetention: "keep" as WorkerRetention,
-    /** Fan-out guardrails; 0 means no cap. */
-    maxParallelWorkers: 6,
-    maxDelegationsPerTurn: 20,
     /** Worker execution defaults; an absent field means "inherit". */
     worker: {} as WorkerConfig,
   };
+
+  /**
+   * The global record a stored value stands for. Every field is validated, so a
+   * hand-edited or older record keeps the default of any field it gets wrong.
+   */
+  function readGlobals(stored: unknown, base: SettingsView = DEFAULT_SETTINGS): OrchestratorSettings {
+    const record = stored !== null && typeof stored === "object" ? (stored as Record<string, unknown>) : {};
+    return {
+      ...sanitizedSettings(record, base),
+      defaultForNewThreads: record.defaultForNewThreads === true,
+    };
+  }
+
+  /** The global values in force, as the settings section reads them. */
+  function globalsView(): SettingsView {
+    // No field list to keep in step: everything `live` carries that is a setting
+    // is one this view returns, and only the bookkeeping keys are dropped.
+    const { defaultEnabledAtMs: _enabledAt, worker: _worker, ...settings } = live;
+    return settings;
+  }
+
+  /**
+   * Write the global record. Fields the caller names are validated against the
+   * values in force, so one bad value keeps its current one; the rest keep the
+   * stored value. This is the only global writer, so it is also where the
+   * composer strip and the settings section are told the values moved.
+   */
+  async function writeSettings(patch: Partial<OrchestratorSettings>): Promise<void> {
+    const next = readGlobals({ ...globalSettings, ...patch }, globalsView());
+    globalSettings = next;
+    await bb.storage.kv.set(GLOBAL_SETTINGS_KEY, next);
+    applySettings(next);
+    bb.log.info(`enforcement=${live.enforcement} default=${live.defaultForNewThreads}`);
+    bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
+  }
 
   /**
    * The worker execution this plugin configures, in the shape `threads.spawn`
@@ -633,8 +637,9 @@ export default async function plugin(bb: BbPluginApi) {
     return { ...exec, providerId: owner };
   }
 
+  /** Put a validated global record into the mirror the synchronous paths read. */
   function applySettings(values: OrchestratorSettings): void {
-    Object.assign(live, sanitizedSettings(values, live));
+    Object.assign(live, sanitizedSettings(values, DEFAULT_SETTINGS));
     live.defaultForNewThreads = values.defaultForNewThreads === true;
   }
 
@@ -781,11 +786,9 @@ export default async function plugin(bb: BbPluginApi) {
    * under the default from one that merely predates it.
    */
   async function setDefault(enabled: boolean): Promise<boolean> {
-    await settings.experimental_set({ defaultForNewThreads: enabled });
-    live.defaultForNewThreads = enabled;
     live.defaultEnabledAtMs = enabled ? Date.now() : 0;
+    await writeSettings({ defaultForNewThreads: enabled });
     await persistDefaultEnabledAt();
-    bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
     return enabled;
   }
 
@@ -879,7 +882,20 @@ export default async function plugin(bb: BbPluginApi) {
   /** The settings one project's threads run under: its overrides over the globals. */
   function settingsFor(projectId: string | null | undefined): SettingsView {
     const override = projectId === null || projectId === undefined ? undefined : projectSettings[projectId];
-    return override === undefined ? { ...live } : sanitizedSettings(override, live);
+    return override === undefined ? globalsView() : sanitizedSettings(override, globalsView());
+  }
+
+  /**
+   * One scope's settings as the settings section reads them: the effective values,
+   * the globals they resolve over, and the fields this scope overrides rather than
+   * inherits. Global scope overrides nothing.
+   */
+  function scopeSettings(projectId: string | null): ScopeSettingsDto {
+    return {
+      values: settingsFor(projectId),
+      global: globalsView(),
+      overridden: projectId === null ? [] : Object.keys(projectSettings[projectId] ?? {}),
+    };
   }
 
   /**
@@ -1006,7 +1022,8 @@ export default async function plugin(bb: BbPluginApi) {
     });
   }
 
-  applySettings(await settings.get());
+  globalSettings = readGlobals(await bb.storage.kv.get<unknown>(GLOBAL_SETTINGS_KEY));
+  applySettings(globalSettings);
   live.worker = storedWorkerConfig(await bb.storage.kv.get<unknown>(WORKER_KEY));
   await loadProjectOverrides();
   {
@@ -1014,33 +1031,15 @@ export default async function plugin(bb: BbPluginApi) {
     const storedAt =
       stored !== undefined && typeof stored.enabledAtMs === "number" ? stored.enabledAtMs : null;
     if (live.defaultForNewThreads) {
-      // A default switched on by an older build, or straight through settings,
-      // has no recorded moment: claim now, so only threads created from here
-      // on are caught by it.
+      // A default switched on by an older build, or during a crash between the
+      // settings write and this one, has no recorded moment: claim now, so only
+      // threads created from here on are caught by it.
       live.defaultEnabledAtMs = storedAt ?? Date.now();
       if (storedAt === null) await persistDefaultEnabledAt();
     } else {
       live.defaultEnabledAtMs = 0;
     }
   }
-  settings.onChange((next, prev) => {
-    const wasOn = prev.defaultForNewThreads === true;
-    const isOn = next.defaultForNewThreads === true;
-    applySettings(next);
-    if (isOn && !wasOn) {
-      live.defaultEnabledAtMs = Date.now();
-      void persistDefaultEnabledAt();
-    } else if (!isOn && wasOn) {
-      live.defaultEnabledAtMs = 0;
-      void persistDefaultEnabledAt();
-    }
-    bb.log.info(`enforcement=${live.enforcement} default=${live.defaultForNewThreads}`);
-    // Several settings change text the composer strip and the settings section
-    // render (the contract shape and the enforcement description above all), so
-    // a settings write has to wake them. Their own writes publish too; this
-    // covers a change made in BB's settings UI, which the plugin never sees.
-    bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
-  });
 
   // --- state store ---------------------------------------------------------
   //
@@ -2433,15 +2432,24 @@ export default async function plugin(bb: BbPluginApi) {
         limit: EXTRA_INSTRUCTION_LIMIT,
       };
     },
-    get_project_settings: async ({ projectId }) => ({
-      values: settingsFor(projectId),
-      overridden: Object.keys(projectSettings[projectId] ?? {}),
-    }),
-    set_project_setting: async ({ projectId, key, value }) => {
-      const current = { ...(projectSettings[projectId] ?? {}) };
-      if (value === null) delete current[key];
-      else Object.assign(current, { [key]: value });
-      return { values: await writeProjectSettings(projectId, current), overridden: Object.keys(projectSettings[projectId] ?? {}) };
+    get_scope_settings: async ({ projectId }) => scopeSettings(projectId),
+    set_scope_setting: async ({ projectId, key, value }) => {
+      if (projectId === null) {
+        // The global record always carries a value, so there is nothing to clear:
+        // an inherit click at that scope would have nowhere to fall back to.
+        if (value === null) {
+          throw new Error("The global scope has no inherited value to fall back to; send the value to store.");
+        }
+        // A computed key widens the literal to an index signature, which only the
+        // cast narrows back; the schema above already checked the key.
+        await writeSettings({ [key]: value } as Partial<OrchestratorSettings>);
+      } else {
+        const current = { ...(projectSettings[projectId] ?? {}) };
+        if (value === null) delete current[key];
+        else Object.assign(current, { [key]: value });
+        await writeProjectSettings(projectId, current);
+      }
+      return scopeSettings(projectId);
     },
     set_worker_execution: async (next) => setWorkerConfig(next),
     clear_violations: async ({ threadId }) => {
@@ -2460,6 +2468,37 @@ export default async function plugin(bb: BbPluginApi) {
     },
     json: { type: "boolean", description: "Emit machine-readable JSON" },
   } as const;
+
+  /**
+   * The settings flags a `scope` call names, in the stored shape. One mapping for
+   * both scopes, so a flag cannot mean one field at the global scope and another
+   * at a project's.
+   */
+  interface ScopeSettingsFlags {
+    enforcement?: EnforcementLevel;
+    "read-commands"?: "on" | "off";
+    "max-nudges"?: number;
+    "max-parallel"?: number;
+    "max-per-turn"?: number;
+    "contract-preset"?: ContractPresetId;
+    retention?: WorkerRetention;
+  }
+
+  function settingsPatch(options: ScopeSettingsFlags): Partial<OrchestratorSettings> {
+    return {
+      ...(options.enforcement === undefined ? {} : { enforcement: options.enforcement }),
+      ...(options["read-commands"] === undefined
+        ? {}
+        : { allowReadCommands: options["read-commands"] === "on" }),
+      ...(options["max-nudges"] === undefined ? {} : { maxNudges: options["max-nudges"] }),
+      ...(options["max-parallel"] === undefined ? {} : { maxParallelWorkers: options["max-parallel"] }),
+      ...(options["max-per-turn"] === undefined ? {} : { maxDelegationsPerTurn: options["max-per-turn"] }),
+      ...(options["contract-preset"] === undefined
+        ? {}
+        : { contractPreset: options["contract-preset"] }),
+      ...(options.retention === undefined ? {} : { workerRetention: options.retention }),
+    };
+  }
 
   function resolveThreadId(explicit: string | undefined, ctx: { threadId?: string }): string {
     const threadId = explicit?.trim() || ctx.threadId;
@@ -2596,9 +2635,14 @@ export default async function plugin(bb: BbPluginApi) {
           },
         }),
         scope: cliCommand({
-          summary: "Show or change what one project overrides, and what it inherits",
+          summary: "Show or change what one scope — the globals or one project — uses",
           options: {
-            project: { type: "string", description: "Project id (required for every verb except list)" },
+            global: {
+              type: "boolean",
+              description:
+                "Read or write the global values every project inherits; the settings section's Global scope",
+            },
+            project: { type: "string", description: "Project id to read or write its overrides" },
             inherit: {
               type: "enum",
               values: [...SETTINGS_KEYS],
@@ -2660,6 +2704,13 @@ export default async function plugin(bb: BbPluginApi) {
             const projectOption = input.options.project;
             const projectId =
               typeof projectOption === "string" && projectOption.trim() !== "" ? projectOption.trim() : undefined;
+            const global = input.options.global === true;
+            if (global && projectId !== undefined) {
+              throw new PluginCliError(
+                "--global reads and writes the values every project inherits, so it cannot be combined with --project.",
+                { code: "conflicting_scope" },
+              );
+            }
             const list = async () => {
               const ids = new Set([
                 ...Object.keys(projectSettings),
@@ -2681,7 +2732,59 @@ export default async function plugin(bb: BbPluginApi) {
                     )
                     .join("\n"));
             };
-            if (projectId === undefined || projectId === "") return list();
+            if (projectId === undefined || projectId === "") {
+              if (!global) return list();
+              // The global worker execution and the global rules have their own
+              // commands; a flag for either here would write a second copy of the
+              // same value, and `--inherit` has nothing above the globals to fall
+              // back to.
+              const misplaced: string[] = [
+                ...(["inherit", "worker-provider", "worker-model", "rules"] as const).filter(
+                  (flag) => input.options[flag] !== undefined,
+                ),
+                ...(["inherit-all", "clear-worker", "clear-rules"] as const).filter(
+                  (flag) => input.options[flag] === true,
+                ),
+              ];
+              if (misplaced.length > 0) {
+                throw new PluginCliError(
+                  `--global writes the values every project inherits; ${misplaced.map((flag) => `--${flag}`).join(", ")} ${misplaced.length === 1 ? "belongs" : "belong"} to one project.`,
+                  {
+                    code: "project_only_flag",
+                    hint: "The global worker execution is `bb orchestrator-mode worker`; the global rules are `bb orchestrator-mode contract --rules <text>`.",
+                  },
+                );
+              }
+              const patch = settingsPatch(input.options);
+              if (Object.keys(patch).length > 0) await writeSettings(patch);
+              const values = globalsView();
+              // One binding for the JSON field and the line that prints it, so the
+              // two cannot describe different executions.
+              const worker = describeWorkerExecution(workerDefaults());
+              return render(
+                input.options.json,
+                {
+                  scope: "global",
+                  values,
+                  worker,
+                  rules: extraInstructions,
+                  newThreads: live.defaultForNewThreads,
+                  contract: await contractText(null, null),
+                },
+                [
+                  "global — what every project inherits",
+                  `  enforcement:          ${values.enforcement}`,
+                  `  read commands:        ${values.allowReadCommands ? "allowed" : "all commands are work"}`,
+                  `  reminders per thread: ${values.maxNudges}`,
+                  `  fan-out cap:          ${values.maxParallelWorkers === 0 ? "none" : `${values.maxParallelWorkers} in flight`}, ${values.maxDelegationsPerTurn === 0 ? "none" : `${values.maxDelegationsPerTurn} per turn`}`,
+                  `  contract shape:       ${values.contractPreset}`,
+                  `  worker retention:     ${values.workerRetention}`,
+                  `  workers run as:       ${worker}${describeFallback(live.worker.fallback)}${describePresets(live.worker.presets)}`,
+                  `  rules:                ${extraInstructions === "" ? "none" : `${extraInstructions.length} characters`}`,
+                  `  new threads default:  ${live.defaultForNewThreads ? "on" : "off"}`,
+                ].join("\n"),
+              );
+            }
 
             if (input.options["inherit-all"] === true) {
               await writeProjectRules(projectId, "");
@@ -2693,27 +2796,7 @@ export default async function plugin(bb: BbPluginApi) {
               delete current[input.options.inherit];
               await writeProjectSettings(projectId, current);
             }
-            const patch: Partial<OrchestratorSettings> = {
-              ...(input.options.enforcement === undefined
-                ? {}
-                : { enforcement: input.options.enforcement as EnforcementLevel }),
-              ...(input.options["read-commands"] === undefined
-                ? {}
-                : { allowReadCommands: input.options["read-commands"] === "on" }),
-              ...(input.options["max-nudges"] === undefined ? {} : { maxNudges: input.options["max-nudges"] }),
-              ...(input.options["max-parallel"] === undefined
-                ? {}
-                : { maxParallelWorkers: input.options["max-parallel"] }),
-              ...(input.options["max-per-turn"] === undefined
-                ? {}
-                : { maxDelegationsPerTurn: input.options["max-per-turn"] }),
-              ...(input.options["contract-preset"] === undefined
-                ? {}
-                : { contractPreset: input.options["contract-preset"] as ContractPresetId }),
-              ...(input.options.retention === undefined
-                ? {}
-                : { workerRetention: input.options.retention as WorkerRetention }),
-            };
+            const patch = settingsPatch(input.options);
             if (Object.keys(patch).length > 0) {
               await writeProjectSettings(projectId, { ...(projectSettings[projectId] ?? {}), ...patch });
             }

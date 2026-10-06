@@ -90,7 +90,6 @@ async function load(
   };
   const host = createFakePluginHost({
     pluginId: "orchestrator-mode",
-    settings,
     sdk: {
       providers: {
         models: async ({ providerId }: { providerId?: string } = {}) => {
@@ -168,6 +167,11 @@ async function load(
   }
   for (const [key, value] of Object.entries(seedKv ?? {})) {
     await host.bb.storage.kv.set(key, value);
+  }
+  // The plugin owns the global settings record in KV rather than through BB
+  // settings descriptors, so the values a test names seed that record.
+  if (Object.keys(settings).length > 0) {
+    await host.bb.storage.kv.set("settings", settings);
   }
   await plugin(host.bb);
   // Loading reads the provider catalog once. No test asserts on that, and every
@@ -1809,6 +1813,43 @@ describe("rpc", () => {
     expect(await harness.behavior.callRpc("get_default")).toEqual({ enabled: true });
   });
 
+  it("reads and writes one scope's settings, and refuses to clear the global record", async () => {
+    const { bb, harness } = await load({ enforcement: "instruct", maxNudges: 5 });
+    const globals = {
+      enforcement: "instruct",
+      allowReadCommands: true,
+      maxNudges: 5,
+      maxParallelWorkers: 6,
+      maxDelegationsPerTurn: 20,
+      contractPreset: "standard",
+      workerRetention: "keep",
+    };
+    expect(await harness.behavior.callRpc("get_scope_settings", { projectId: null })).toEqual({
+      values: globals,
+      global: globals,
+      overridden: [],
+    });
+
+    const written = (await harness.behavior.callRpc("set_scope_setting", {
+      projectId: null,
+      key: "maxParallelWorkers",
+      value: 2,
+    })) as { values: { maxParallelWorkers: number }; overridden: string[] };
+    expect(written.values.maxParallelWorkers).toBe(2);
+    expect(written.overridden).toEqual([]);
+    // Stored, not just mirrored: the next read and a thread's own view both see it.
+    expect(await bb.storage.kv.get("settings")).toMatchObject({ maxParallelWorkers: 2 });
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      maxParallelWorkers: number;
+    };
+    expect(state.maxParallelWorkers).toBe(2);
+
+    // The global record has nothing above it, so there is no inherit to fall back to.
+    await expect(
+      harness.behavior.callRpc("set_scope_setting", { projectId: null, key: "maxNudges", value: null }),
+    ).rejects.toThrow(/no inherited value/);
+  });
+
   it("clears the violation record", async () => {
     const { harness } = await load({ enforcement: "guard" });
     await arm(harness);
@@ -2504,5 +2545,34 @@ describe("project scopes", () => {
     expect(cleared.stdout).toContain("inherits the global rules");
     const empty = await harness.behavior.runCli(["scope"]);
     expect(empty.stdout).toContain("no project overrides");
+  });
+
+  it("writes the global record from the scope command, and refuses project-only flags there", async () => {
+    const { harness } = await load({ enforcement: "instruct" });
+    await enable(harness, THREAD);
+    harness.inspection.sdk.stub("threads.get", async () => threadIn(PROJECT));
+
+    const written = await harness.behavior.runCli([
+      "scope", "--global", "--read-commands", "off", "--max-parallel", "3",
+    ]);
+    expect(written.exitCode).toBe(0);
+    expect(written.stdout).toContain("global — what every project inherits");
+    expect(written.stdout).toContain("enforcement:          instruct");
+    expect(written.stdout).toContain("read commands:        all commands are work");
+    expect(written.stdout).toContain("fan-out cap:          3 in flight, 20 per turn");
+
+    // A project that overrides nothing now reads what the record was set to.
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as OrchestratorStateDto;
+    expect(state.allowReadCommands).toBe(false);
+    expect(state.maxParallelWorkers).toBe(3);
+
+    // The global worker execution and rules have their own commands; naming one
+    // here would write a second copy of the same value.
+    const refused = await harness.behavior.runCli(["scope", "--global", "--rules", "Prefer the repo skill copies."]);
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr).toContain("orchestrator-mode contract");
+    const both = await harness.behavior.runCli(["scope", "--global", "--project", PROJECT, "--max-parallel", "1"]);
+    expect(both.exitCode).not.toBe(0);
+    expect(both.stderr).toContain("--global");
   });
 });

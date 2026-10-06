@@ -86,10 +86,10 @@ it when you cannot judge a unit from its report alone.
 
 ## Choosing the worker's execution
 
-Workers run on the provider, model and access the plugin's Workers section names,
-falling back to this project's remembered defaults. Override those for one unit
-with `provider`, `model`, `reasoning` and `permissionMode`. Give a hard unit a
-stronger model and a mechanical one a cheaper model.
+Workers run on the provider, model and access the settings section's worker rows
+name, falling back to this project's remembered defaults. Override those for one
+unit with `provider`, `model`, `reasoning` and `permissionMode`. Give a hard unit
+a stronger model and a mechanical one a cheaper model.
 
 `preset` names a kind of work the plugin has a saved setup for, such as `build`,
 `review` or `research`. Your own arguments beat the preset for that unit.

@@ -14,7 +14,7 @@ Give each unit of work to a worker, with a watchdog for direct work.
 ![Plugin SDK ≥ 0.5.29](https://img.shields.io/badge/plugin%20sdk-%E2%89%A5%200.5.29-0f766e)
 ![TypeScript strict](https://img.shields.io/badge/TypeScript-strict-3178c6?logo=typescript&logoColor=white)
 
-[Features](#features) · [Install](#install) · [How it works](#how-it-works) · [CLI](#cli) · [Settings](#settings) · [Development](#development)
+[Features](#features) · [Install](#install) · [How it works](#how-it-works) · [CLI](#cli) · [Scope](#scope) · [Settings](#settings) · [Development](#development)
 
 <br>
 
@@ -134,7 +134,7 @@ Open a thread and use **Orchestrator mode** in the composer to enable it.
 | **Composer `+` menu → Orchestrator mode** | The same toggle, including compact layouts. |
 | **Strip above the input** | Enforcement level, recent violations and a **Turn off** button. |
 | **Root new-thread composer** | Set whether qualifying new threads start as orchestrators. |
-| **Settings → Installed plugins → Orchestrator Mode** | Set enforcement, read-only command handling and the nudge cap. |
+| **Settings → Installed plugins → Orchestrator Mode** | Every setting, one scope at a time: Global, or the project the selector names. |
 
 ## How it works
 
@@ -173,8 +173,9 @@ session timing in more detail.
 ## Worker execution
 
 Workers run on the project's remembered provider and model unless you give them
-their own. **Settings → Installed plugins → Orchestrator Mode → Worker
-execution** has two choices, each a visible pair rather than a switch:
+their own. **Settings → Installed plugins → Orchestrator Mode** → the scope you
+want → **Which provider and model workers use** has two choices, each a visible
+pair rather than a switch:
 
 - **Workers run on** `Inherit` (the project's remembered provider and model) or
   `Custom` (the provider, model, reasoning level and service tier you pick with
@@ -350,7 +351,7 @@ bb orchestrator-mode off
 | `status [--thread <id>] [--json]` | Show mode, enforcement, violations, nudges and delegations. |
 | `on [--thread <id>] [--enforcement instruct\|guard\|block] [--json]` | Enable the thread, with an optional enforcement override. |
 | `off [--thread <id>] [--json]` | Disable the thread and clear its enforcement override. |
-| `scope [--project <id>] [--enforcement <level>] [--read-commands on\|off] [--max-nudges <n>] [--max-parallel <n>] [--max-per-turn <n>] [--contract-preset <name>] [--retention <policy>] [--worker-provider <id>] [--worker-model <id>] [--clear-worker] [--rules <text>] [--clear-rules] [--inherit <key>] [--inherit-all] [--json]` | Show what each project overrides and what it inherits. With `--project`, write this project's overrides: settings, worker execution and appended rules. Without it, list every project that has any. |
+| `scope [--global \| --project <id>] [--enforcement <level>] [--read-commands on\|off] [--max-nudges <n>] [--max-parallel <n>] [--max-per-turn <n>] [--contract-preset <name>] [--retention <policy>] [--worker-provider <id>] [--worker-model <id>] [--clear-worker] [--rules <text>] [--clear-rules] [--inherit <key>] [--inherit-all] [--json]` | With `--global`, read or write the record every project inherits (settings only; the worker execution and rules have their own commands). With `--project`, read or write that project's overrides: settings, worker execution and appended rules. Without either, list every project that has any. |
 | `contract [--thread <id>] [--rules <text>] [--clear-rules] [--json]` | Print the exact instructions this thread receives, or set and clear the project rules appended to them. |
 | `violations [--thread <id>] [--clear] [--json]` | List violations, or clear them and reset correction counters. |
 | `default [on\|off] [--json]` | Show or set the default for new threads. |
@@ -379,47 +380,56 @@ execution arguments are optional and fall back to a preset, then the
 bundled [skill](skills/orchestrator-mode/SKILL.md) explains the mode, delegation
 and CLI; enabled sessions receive the contract directly.
 
-## Project scopes
+## Scope
 
 Every setting, the worker execution, the execution presets and the appended rules
-resolve in four layers, highest first:
+resolve in layers, highest first:
 
 1. **The thread.** Its own on/off switch and enforcement override, as before.
 2. **The project.** Whatever that project overrides under **Settings → Installed
-   plugins → Orchestrator Mode → Workers → Scope**.
-3. **Global.** The plugin settings and the worker execution configured for every
-   project, which is what the descriptor form above the section edits.
-4. **The descriptor default**, when nothing names a value at all.
+   plugins → Orchestrator Mode**, with **Scope** set to that project.
+3. **Global.** The record every project inherits, edited with **Scope** set to
+   Global or `bb orchestrator-mode scope --global`.
+4. **The built-in default**, when nothing names a value at all.
 
 A project that overrides nothing inherits everything, so an install that never
-touches the selector behaves exactly as it did before. Two values stay global on
-purpose: `defaultForNewThreads` is a composer default rather than thread
-behaviour, and `defaultEnabledAtMs` is bookkeeping for it. The selector lists
-Global plus every project; the rows below it show each field's effective value,
-whether it is overridden, and the Inherit action that hands it back.
+touches the selector behaves exactly as it did before. The selector lists Global
+plus every project; the rows below it show each field's effective value, whether
+it is overridden, and the Inherit action that hands it back. `defaultForNewThreads`
+stays global on purpose — it is a composer default rather than thread behaviour,
+and its row appears only in Global scope. `defaultEnabledAtMs` is bookkeeping for it.
 
 ```sh
 bb orchestrator-mode scope                                     # every project that overrides anything
+bb orchestrator-mode scope --global --max-parallel 2           # the record every project inherits
+bb orchestrator-mode scope --global --read-commands off        # ...for read-only shell commands
 bb orchestrator-mode scope --project <id> --max-parallel 2     # cap fan-out for one project
 bb orchestrator-mode scope --project <id> --contract-preset thorough --rules "Never touch generated/."
 bb orchestrator-mode scope --project <id> --inherit maxNudges  # one field back to the global value
 bb orchestrator-mode scope --project <id> --inherit-all        # this project inherits everything again
 ```
 
+The global worker execution is `bb orchestrator-mode worker`, and the global
+rules are `bb orchestrator-mode contract --rules`, so `scope --global` refuses
+their flags rather than writing a second copy of the same value.
+
 `status --thread` names the scope it resolved and which fields the project
 overrides, so a surprising cap or contract can be traced to the layer that set it.
 
 ## Settings
 
-`bb plugin config orchestrator-mode`, or **Settings → Installed plugins →
-Orchestrator Mode**.
+The plugin renders this surface itself: **Settings → Installed plugins →
+Orchestrator Mode → Settings**. It is not BB's settings form, because a
+descriptor setting holds one value per install and these resolve per project.
+The values are stored by the plugin, and change only through this section, the
+CLI, and the composer toggles.
 
 <details>
 <summary><b>All settings</b></summary>
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `defaultForNewThreads` | `false` | Enable qualifying root threads created while the default is on, at a user-initiated dispatch. |
+| `defaultForNewThreads` | `false` | Enable qualifying root threads created while the default is on, at a user-initiated dispatch. Global only. |
 | `enforcement` | `guard` | `instruct`: contract only. `guard`: record and correct. `block`: also stop. A thread override takes precedence. |
 | `allowReadCommands` | `true` | Treat recognised read-only shell commands as exploration; when off, all commands count as work. |
 | `maxNudges` | `3` | Corrective messages per enablement, for direct work and for unjudged workers. It is one budget shared by both gates, whichever spends it first, and `bb orchestrator-mode status` reports the split; non-negative numbers are rounded down. `0` disables nudges. Recording and `block` stops continue after the cap. |
@@ -428,9 +438,10 @@ Orchestrator Mode**.
 | `maxParallelWorkers` | `6` | Refuse a delegation while this many workers are running. `0` removes the cap. |
 | `maxDelegationsPerTurn` | `20` | Refuse a delegation once a turn has delegated this many. `0` removes the cap. |
 
-The worker execution above is stored by the plugin rather than set here, so it
-can use BB's own provider and model picker. See
-[Worker execution](#worker-execution).
+Every row except `defaultForNewThreads` is read and written in the selected
+scope, and the defaults above are the built-in record a fresh install starts
+from. The worker execution and the presets are stored by the plugin too, so they
+can use BB's own provider and model picker. See [Worker execution](#worker-execution).
 
 Re-enabling an already enabled thread preserves its nudge count. Disabling it
 or clearing violations resets the correction counters.

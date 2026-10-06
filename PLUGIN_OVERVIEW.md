@@ -27,12 +27,12 @@ not see the parent's conversation. You can wait for its result, delegate
 without waiting, or request a hidden worker. Waiting defaults to 900 seconds;
 a timeout leaves the worker running.
 
-Workers run on the project's remembered provider and model unless the **Worker
-execution** settings section gives them their own, using BB's own provider and
-model picker: picking a provider scopes the models to it, and a single
-delegation can override the result in the tool call. The same section can name a
-provider and model to retry a failed worker on, once. An id the catalog does not
-offer is refused with the alternatives named.
+Workers run on the project's remembered provider and model unless the settings
+section's **Which provider and model workers use** gives them their own, using
+BB's own provider and model picker: picking a provider scopes the models to it,
+and a single delegation can override the result in the tool call. The same
+section can name a provider and model to retry a failed worker on, once. An id
+the catalog does not offer is refused with the alternatives named.
 
 Every delegation is also meant to end in a verdict: the orchestrator records one
 per worker with `orchestrator_review`, and a turn that ends with unjudged

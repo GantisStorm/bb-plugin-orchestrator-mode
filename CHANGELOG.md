@@ -6,12 +6,36 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- The settings section is scoped end to end. **Settings → Installed plugins →
+  Orchestrator Mode → Settings** now opens with **Scope**, and everything below it —
+  enforcement, read-only commands, the reminder and fan-out caps, the contract shape, the
+  worker retention policy, the worker execution, the execution presets and the appended
+  rules — reads and writes the selected scope. Global is the record every project
+  inherits; a project stores only what it changes, and Inherit hands a field back.
+  `bb orchestrator-mode scope --global` reads and writes the global record for scripts,
+  and refuses the flags whose global values have their own commands (`worker`, `contract
+  --rules`). The plugin renders this surface itself and stores the values in its own KV
+  record, because a BB settings descriptor holds one value per install and these resolve
+  per project; `bb plugin config orchestrator-mode` no longer lists them. Existing
+  installs carry the same defaults, so nothing visible changes until a value is edited.
+  `defaultForNewThreads` stays global — it is a composer default, not thread behaviour —
+  and its row appears only in Global scope.
+
+- Settings rows explain every choice, not only the one in force: enforcement, read-only
+  commands, the contract shapes, the worker retention policies and the new-thread default
+  each list what every option does, and the numeric rows carry the description the
+  descriptor form used to hold. A `select` cannot explain the options it is not on, so the
+  row carries the list; the option's own name is emphasised where the sentence already
+  starts with it.
+
 ### Added
 
 - Per-project configuration. The plugin settings, the worker execution, the execution
-  presets and the appended rules now resolve thread → project → global → descriptor
-  default, and **Settings → Installed plugins → Orchestrator Mode → Workers** gains a
-  scope selector listing Global plus every project, with each field showing whether it
+  presets and the appended rules now resolve thread → project → global → built-in
+  default, and **Settings → Installed plugins → Orchestrator Mode** gains a scope
+  selector listing Global plus every project, with each field showing whether it
   is overridden and an Inherit action that hands it back. A project that overrides
   nothing behaves exactly as before. `bb orchestrator-mode scope` reads and writes the
   same overrides, and `status --thread` names the scope and the overridden fields, so a
