@@ -27,6 +27,7 @@ bb orchestrator-mode violations [--thread <id>] [--clear] [--json]
 bb orchestrator-mode default [on|off] [--json]
 bb orchestrator-mode worker [--provider <id>] [--model <id>] [--preset <name>] [--json]
 bb orchestrator-mode contract [--thread <id>] [--rules <text>] [--clear-rules] [--json]
+bb orchestrator-mode scope [--project <id>] [--max-parallel <n>] [--inherit <key>] [--inherit-all] [--json]
 ```
 
 `--thread` defaults to the thread running the command, so an agent can inspect

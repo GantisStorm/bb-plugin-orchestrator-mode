@@ -75,6 +75,10 @@ const STATE_KEY = "state";
 const DEFAULT_KEY = "default";
 /** The stored worker execution every delegation defaults to. */
 const WORKER_KEY = "worker";
+/** Per-project overrides, keyed by project id: settings, worker execution, appended rules. */
+const PROJECT_SETTINGS_KEY = "project_settings";
+const PROJECT_WORKER_KEY = "project_worker";
+const PROJECT_RULES_KEY = "project_rules";
 /** The stored project rules appended to the contract. */
 const CONTRACT_KEY = "contract";
 /**
@@ -248,6 +252,42 @@ const stateSchema = z.object({
   reviewed: z.number(),
 });
 
+/**
+ * What to do with a worker whose result the orchestrator has read. Archiving is
+ * recoverable and only ever hides a worker from the sidebar, so it stays opt-in:
+ * a default that tidied the sidebar would also hide the evidence.
+ */
+export const WORKER_RETENTION = ["keep", "archive-checks", "archive-all"] as const;
+type WorkerRetention = (typeof WORKER_RETENTION)[number];
+
+/** A project id, as the scope RPCs take it. */
+const projectIdSchema = z.object({ projectId: z.string().min(1).max(120) });
+
+/** The settings keys a project may override; `defaultForNewThreads` is deliberately absent. */
+const SETTINGS_KEYS = [
+  "enforcement",
+  "allowReadCommands",
+  "maxNudges",
+  "maxParallelWorkers",
+  "maxDelegationsPerTurn",
+  "contractPreset",
+  "workerRetention",
+] as const;
+const settingsKeySchema = z.enum(SETTINGS_KEYS);
+
+/** The effective settings one project's threads run under. */
+const settingsViewSchema = z.object({
+  enforcement: enforcementSchema,
+  allowReadCommands: z.boolean(),
+  maxNudges: z.number(),
+  maxParallelWorkers: z.number(),
+  maxDelegationsPerTurn: z.number(),
+  contractPreset: z.enum(CONTRACT_PRESETS),
+  workerRetention: z.enum(WORKER_RETENTION),
+});
+
+export type SettingsViewDto = z.infer<typeof settingsViewSchema>;
+
 /** The contract text, the project rules appended to it, and the room left. */
 const contractSchema = z.object({ text: z.string(), extra: z.string(), limit: z.number() });
 export type ContractDto = z.infer<typeof contractSchema>;
@@ -290,19 +330,47 @@ export const rpcContract = defineRpcContract({
     input: workerConfigSchema.nullable(),
     output: workerConfigSchema,
   },
+  get_project_worker: {
+    input: projectIdSchema.strict(),
+    output: workerConfigSchema,
+  },
+  set_project_worker: {
+    input: z.object({ projectId: z.string().min(1).max(120), config: workerConfigSchema.nullable() }).strict(),
+    output: workerConfigSchema,
+  },
+  get_project_rules: {
+    input: projectIdSchema.strict(),
+    output: contractSchema,
+  },
+  set_project_rules: {
+    input: z.object({ projectId: z.string().min(1).max(120), extra: z.string().max(EXTRA_INSTRUCTION_LIMIT) }).strict(),
+    output: contractSchema,
+  },
+  get_project_settings: {
+    input: projectIdSchema.strict(),
+    output: z.object({
+      values: settingsViewSchema,
+      overridden: z.array(z.string()),
+    }),
+  },
+  set_project_setting: {
+    input: z
+      .object({
+        projectId: z.string().min(1).max(120),
+        key: settingsKeySchema,
+        value: z.union([z.string(), z.number(), z.boolean(), z.null()]),
+      })
+      .strict(),
+    output: z.object({
+      values: settingsViewSchema,
+      overridden: z.array(z.string()),
+    }),
+  },
   clear_violations: {
     input: threadIdSchema.strict(),
     output: stateSchema,
   },
 });
-
-/**
- * What to do with a worker whose result the orchestrator has read. Archiving is
- * recoverable and only ever hides a worker from the sidebar, so it stays opt-in:
- * a default that tidied the sidebar would also hide the evidence.
- */
-const WORKER_RETENTION = ["keep", "archive-checks", "archive-all"] as const;
-type WorkerRetention = (typeof WORKER_RETENTION)[number];
 
 /**
  * Thrown when a delegation would exceed a fan-out cap. A distinct type because
@@ -474,6 +542,17 @@ export default async function plugin(bb: BbPluginApi) {
    */
   type OrchestratorSettings = PluginSettingsValues<typeof SETTING_DESCRIPTORS>;
 
+  /** The settings that shape thread behaviour, after the global values are validated. */
+  interface SettingsView {
+    enforcement: EnforcementLevel;
+    allowReadCommands: boolean;
+    maxNudges: number;
+    maxParallelWorkers: number;
+    maxDelegationsPerTurn: number;
+    contractPreset: ContractPresetId;
+    workerRetention: WorkerRetention;
+  }
+
   const settings = bb.settings.define(SETTING_DESCRIPTORS);
 
   /** In-memory mirror of the effective settings, for the sync configure path. */
@@ -555,20 +634,41 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   function applySettings(values: OrchestratorSettings): void {
+    Object.assign(live, sanitizedSettings(values, live));
     live.defaultForNewThreads = values.defaultForNewThreads === true;
-    live.enforcement = isEnforcementLevel(values.enforcement)
-      ? values.enforcement
-      : DEFAULT_ENFORCEMENT;
-    live.allowReadCommands = values.allowReadCommands !== false;
-    live.maxNudges = capOf(values.maxNudges, 3);
-    live.maxParallelWorkers = capOf(values.maxParallelWorkers, 6);
-    live.maxDelegationsPerTurn = capOf(values.maxDelegationsPerTurn, 20);
-    live.contractPreset = isOneOf(CONTRACT_PRESETS, values.contractPreset)
-      ? values.contractPreset
-      : "standard";
-    live.workerRetention = isOneOf(WORKER_RETENTION, values.workerRetention)
-      ? values.workerRetention
-      : "keep";
+  }
+
+  /**
+   * One validator for the global settings and every project override: a field the
+   * caller names and this module accepts replaces the base value, and anything
+   * unusable leaves the base in place. `defaultForNewThreads` is absent on purpose —
+   * it is a composer default, not thread behaviour, so it stays global.
+   */
+  function sanitizedSettings(
+    values: Partial<OrchestratorSettings>,
+    base: SettingsView,
+  ): SettingsView {
+    return {
+      enforcement: isEnforcementLevel(values.enforcement) ? values.enforcement : base.enforcement,
+      allowReadCommands:
+        values.allowReadCommands === undefined ? base.allowReadCommands : values.allowReadCommands === true,
+      maxNudges:
+        values.maxNudges === undefined ? base.maxNudges : capOf(values.maxNudges, base.maxNudges),
+      maxParallelWorkers:
+        values.maxParallelWorkers === undefined
+          ? base.maxParallelWorkers
+          : capOf(values.maxParallelWorkers, base.maxParallelWorkers),
+      maxDelegationsPerTurn:
+        values.maxDelegationsPerTurn === undefined
+          ? base.maxDelegationsPerTurn
+          : capOf(values.maxDelegationsPerTurn, base.maxDelegationsPerTurn),
+      contractPreset: isOneOf(CONTRACT_PRESETS, values.contractPreset)
+        ? values.contractPreset
+        : base.contractPreset,
+      workerRetention: isOneOf(WORKER_RETENTION, values.workerRetention)
+        ? values.workerRetention
+        : base.workerRetention,
+    };
   }
 
   /** A fan-out cap: a non-negative whole number, or the fallback when unusable. */
@@ -767,29 +867,148 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
+   * Per-project overrides, held in memory beside the globals for the same reason:
+   * `bb.agents.configure` is synchronous and cannot await a read. A project with no
+   * record inherits every field, so an install that never scopes anything behaves
+   * exactly as before.
+   */
+  const projectSettings: Record<string, Partial<OrchestratorSettings>> = {};
+  const projectWorker: Record<string, WorkerConfig> = {};
+  const projectRules: Record<string, string> = {};
+
+  /** The settings one project's threads run under: its overrides over the globals. */
+  function settingsFor(projectId: string | null | undefined): SettingsView {
+    const override = projectId === null || projectId === undefined ? undefined : projectSettings[projectId];
+    return override === undefined ? { ...live } : sanitizedSettings(override, live);
+  }
+
+  /**
+   * The worker configuration a project's delegations use. Merged per field, and per
+   * kind for presets, so a project can change one thing without restating the rest.
+   */
+  function workerFor(projectId: string | null | undefined): WorkerConfig {
+    const override = projectId === null || projectId === undefined ? undefined : projectWorker[projectId];
+    if (override === undefined) return live.worker;
+    const fallback = { ...live.worker.fallback, ...override.fallback };
+    return {
+      ...live.worker,
+      ...override,
+      ...(Object.keys(fallback).length === 0 ? {} : { fallback }),
+      presets: { ...(live.worker.presets ?? {}), ...(override.presets ?? {}) },
+    };
+  }
+
+  /** The appended project rules for one project, or the global ones when it has none. */
+  function rulesFor(projectId: string | null | undefined): string {
+    const stored = projectId === null || projectId === undefined ? undefined : projectRules[projectId];
+    return stored ?? extraInstructions;
+  }
+
+  /** Store the settings overrides for one project. A field removed here inherits again. */
+  async function writeProjectSettings(projectId: string, next: Partial<OrchestratorSettings>): Promise<SettingsView> {
+    if (Object.keys(next).length === 0) delete projectSettings[projectId];
+    else projectSettings[projectId] = next;
+    await bb.storage.kv.set(PROJECT_SETTINGS_KEY, projectSettings);
+    bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
+    return settingsFor(projectId);
+  }
+
+  /** Store one project's worker configuration. Null hands it back to the global value. */
+  async function writeProjectWorker(projectId: string, next: WorkerConfig | null): Promise<WorkerConfig> {
+    if (next === null || Object.keys(next).length === 0) delete projectWorker[projectId];
+    else
+      projectWorker[projectId] = {
+        ...reconcile(executionOf(next)),
+        ...(next.fallback === undefined ? {} : { fallback: reconcile(next.fallback) }),
+        ...(next.presets === undefined
+          ? {}
+          : {
+              presets: Object.fromEntries(
+                Object.entries(next.presets).map(([name, preset]) => [name, reconcile(preset)]),
+              ),
+            }),
+      };
+    await bb.storage.kv.set(PROJECT_WORKER_KEY, projectWorker);
+    bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
+    return workerFor(projectId);
+  }
+
+  /** Store one project's appended rules. An empty string hands it back to the global value. */
+  async function writeProjectRules(projectId: string, next: string): Promise<string> {
+    const text = next.trim();
+    if (text.length > EXTRA_INSTRUCTION_LIMIT) {
+      throw new Error(
+        `Project rules are capped at ${EXTRA_INSTRUCTION_LIMIT} characters so the contract stays inside the ${INSTRUCTION_LIMIT}-character limit; that text is ${text.length}.`,
+      );
+    }
+    if (text === "") delete projectRules[projectId];
+    else projectRules[projectId] = text;
+    await bb.storage.kv.set(PROJECT_RULES_KEY, projectRules);
+    bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
+    return text;
+  }
+
+  /** Load every project override once, before any thread can be governed by it. */
+  async function loadProjectOverrides(): Promise<void> {
+    const storedSettings = await bb.storage.kv.get<unknown>(PROJECT_SETTINGS_KEY);
+    if (storedSettings !== null && typeof storedSettings === "object") {
+      for (const [projectId, value] of Object.entries(storedSettings as Record<string, unknown>)) {
+        if (value === null || typeof value !== "object") continue;
+        projectSettings[projectId] = value as Partial<OrchestratorSettings>;
+      }
+    }
+    const storedWorker = await bb.storage.kv.get<unknown>(PROJECT_WORKER_KEY);
+    if (storedWorker !== null && typeof storedWorker === "object") {
+      for (const [projectId, value] of Object.entries(storedWorker as Record<string, unknown>)) {
+        if (value === null || typeof value !== "object") continue;
+        projectWorker[projectId] = storedWorkerConfig(value);
+      }
+    }
+    const storedRules = await bb.storage.kv.get<unknown>(PROJECT_RULES_KEY);
+    if (storedRules !== null && typeof storedRules === "object") {
+      for (const [projectId, value] of Object.entries(storedRules as Record<string, unknown>)) {
+        if (typeof value === "string" && value.trim() !== "") projectRules[projectId] = value;
+      }
+    }
+  }
+
+  /** The project a thread belongs to, or null when the thread cannot be read. */
+  async function projectOfThread(threadId: string): Promise<string | null> {
+    try {
+      const thread = await bb.sdk.threads.get({ threadId });
+      return typeof thread.projectId === "string" ? thread.projectId : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * The exact text `bb.agents.configure` injects for one thread. Pass a null
    * thread for the text a thread that has not run yet would receive. Exposed so
    * the contract can be read instead of guessed at.
    */
-  async function contractText(threadId: string | null): Promise<string> {
+  async function contractText(threadId: string | null, projectId?: string | null): Promise<string> {
     const state = threadId === null ? undefined : await getState(threadId);
-    const enforcement = effectiveEnforcement(state);
+    const project = projectId === undefined && threadId !== null ? await projectOfThread(threadId) : projectId ?? null;
+    const settings = settingsFor(project);
+    const enforcement = effectiveEnforcement(state) ?? settings.enforcement;
     const reminders =
       state === undefined || state.violations.length === 0
         ? undefined
         : state.violations.slice(-5).map((violation) => violation.detail);
     return buildInstructions({
-      enforcement,
-      allowReadCommands: live.allowReadCommands,
+      enforcement: enforcement ?? settings.enforcement,
+      allowReadCommands: settings.allowReadCommands,
       reminders,
-      workerConfig: live.worker,
-      extra: extraInstructions,
-      preset: live.contractPreset,
+      workerConfig: workerFor(project),
+      extra: rulesFor(project),
+      preset: settings.contractPreset,
     });
   }
 
   applySettings(await settings.get());
   live.worker = storedWorkerConfig(await bb.storage.kv.get<unknown>(WORKER_KEY));
+  await loadProjectOverrides();
   {
     const stored = await bb.storage.kv.get<{ enabledAtMs?: unknown }>(DEFAULT_KEY);
     const storedAt =
@@ -1084,16 +1303,23 @@ export default async function plugin(bb: BbPluginApi) {
     return out;
   }
 
-  function effectiveEnforcement(state: ThreadState | undefined): EnforcementLevel {
-    return state?.enforcement ?? live.enforcement;
+  function effectiveEnforcement(
+    state: ThreadState | undefined,
+    settings: SettingsView = settingsFor(null),
+  ): EnforcementLevel {
+    return state?.enforcement ?? settings.enforcement;
   }
 
-  function toDto(threadId: string, state: ThreadState | undefined): OrchestratorStateDto {
+  function toDto(
+    threadId: string,
+    state: ThreadState | undefined,
+    settings: SettingsView = settingsFor(null),
+  ): OrchestratorStateDto {
     const base = state ?? emptyState(Date.now());
     return {
       enabled: state?.enabled ?? false,
       enforcement: base.enforcement,
-      effectiveEnforcement: effectiveEnforcement(state),
+      effectiveEnforcement: effectiveEnforcement(state, settings),
       enabledAt: base.enabledAt,
       violations: base.violations.slice(-MAX_VIOLATIONS),
       delegations: trimDelegations(base.delegations),
@@ -1101,11 +1327,11 @@ export default async function plugin(bb: BbPluginApi) {
       violationNudges: base.violationNudges,
       reviewNudges: base.reviewNudges,
       defaultForNewThreads: live.defaultForNewThreads,
-      allowReadCommands: live.allowReadCommands,
-      maxNudges: live.maxNudges,
+      allowReadCommands: settings.allowReadCommands,
+      maxNudges: settings.maxNudges,
       workerExecution: workerDefaults(),
-      maxParallelWorkers: live.maxParallelWorkers,
-      maxDelegationsPerTurn: live.maxDelegationsPerTurn,
+      maxParallelWorkers: settings.maxParallelWorkers,
+      maxDelegationsPerTurn: settings.maxDelegationsPerTurn,
       unreviewed: unreviewedOf(base.delegations).length,
       reviewed: base.delegations.filter((delegation) => delegation.verdict != null).length,
     };
@@ -1367,12 +1593,14 @@ export default async function plugin(bb: BbPluginApi) {
       }
 
       // A named preset must be stored: silently ignoring one would leave the
-      // orchestrator believing it had asked for a different model.
+      // orchestrator believing it had asked for a different model. The project's
+      // worker configuration is the one that applies, global values under it.
+      const workerConfig = workerFor(projectId);
       let presetExec: WorkerExecution = {};
       if (preset !== undefined) {
-        const stored = live.worker.presets?.[preset];
+        const stored = workerConfig.presets?.[preset];
         if (stored === undefined) {
-          const available = Object.keys(live.worker.presets ?? {});
+          const available = Object.keys(workerConfig.presets ?? {});
           throw new Error(
             `No \`${preset}\` worker preset is stored.${available.length === 0 ? " This plugin has no presets configured." : ` Stored presets: ${available.join(", ")}.`}`,
           );
@@ -1400,7 +1628,7 @@ export default async function plugin(bb: BbPluginApi) {
         options: { brief?: string; verifierFor?: string; pluginInitiated?: boolean } = {},
       ): Promise<string> {
         const countPerTurn = options.pluginInitiated !== true;
-        await assertWithinBudget(orchestratorId, countPerTurn);
+        await assertWithinBudget(orchestratorId, countPerTurn, targetProjectId);
         try {
           const spawned = await bb.sdk.threads.spawn({
             projectId: targetProjectId,
@@ -1572,7 +1800,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
 
       const timeoutMs = Math.min(Math.max(timeoutSeconds ?? 900, 10), 3600) * 1000;
-      const fallback = live.worker.fallback;
+      const fallback = workerConfig.fallback;
       let workerId: string;
       try {
         workerId = await spawnWorker(workerExec, workerTitle);
@@ -1690,7 +1918,10 @@ export default async function plugin(bb: BbPluginApi) {
     const mirror = readMirror(context.pluginMetadata as Record<string, unknown>);
     const enabled = mirror !== null && mirror.enabled;
     if (!enabled) return { tools: [], skills: [] };
-    const enforcement = mirror?.enforcement ?? live.enforcement;
+    // The context carries the project, so a session's contract is the one resolved
+    // for the project it belongs to rather than the plugin-wide default.
+    const settings = settingsFor(context.project.id);
+    const enforcement = mirror?.enforcement ?? settings.enforcement;
     const state = cache?.[context.thread.id];
     const reminders =
       state === undefined || state.violations.length === 0
@@ -1701,11 +1932,11 @@ export default async function plugin(bb: BbPluginApi) {
       skills: [],
       instructions: buildInstructions({
         enforcement,
-        allowReadCommands: live.allowReadCommands,
+        allowReadCommands: settings.allowReadCommands,
         reminders,
-        workerConfig: live.worker,
-        extra: extraInstructions,
-        preset: live.contractPreset,
+        workerConfig: workerFor(context.project.id),
+        extra: rulesFor(context.project.id),
+        preset: settings.contractPreset,
       }),
     };
   });
@@ -1799,6 +2030,9 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function scan(threadId: string): Promise<void> {
+    // Resolved once per scan: the project a thread belongs to cannot change
+    // mid-scan, and the classifier reads two values from it per row.
+    const scanSettings = settingsFor(await projectOfThread(threadId));
     const state = await getState(threadId);
     if (state === undefined || !state.enabled) return;
     const enforcement = effectiveEnforcement(state);
@@ -1848,7 +2082,7 @@ export default async function plugin(bb: BbPluginApi) {
         // Turns that ran before the session could gain the contract are never
         // judged, only recorded.
         if (turnId !== null && graceTurnIds.includes(turnId)) continue;
-        const violation = classifyRow(row, { allowReadCommands: live.allowReadCommands });
+        const violation = classifyRow(row, { allowReadCommands: scanSettings.allowReadCommands });
         if (violation !== null) {
           fresh.push(violation);
           if (seq >= liveSeq) {
@@ -1907,7 +2141,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     if (state.lastNudgeTurnId === liveTurnKey) return;
-    if (state.nudgeCount >= live.maxNudges) return;
+    if (state.nudgeCount >= settingsFor(await projectOfThread(threadId)).maxNudges) return;
     const text = buildNudge(violations, enforcement);
     try {
       await bb.sdk.threads.send({
@@ -2004,16 +2238,17 @@ export default async function plugin(bb: BbPluginApi) {
    * retention that only worked for waited delegations would be a trap.
    */
   async function maybeArchive(ownerThreadId: string, workerId: string): Promise<void> {
-    if (live.workerRetention === "keep") return;
+    const retention = settingsFor(await projectOfThread(ownerThreadId)).workerRetention;
+    if (retention === "keep") return;
     const state = await getState(ownerThreadId);
     const delegation = state?.delegations.find((entry) => entry.threadId === workerId);
     if (delegation === undefined) return;
-    if (live.workerRetention === "archive-checks" && delegation.verifierFor === undefined) {
+    if (retention === "archive-checks" && delegation.verifierFor === undefined) {
       return;
     }
     try {
       await bb.sdk.threads.archive({ threadId: workerId });
-      bb.log.info(`archived worker ${workerId} (retention: ${live.workerRetention})`);
+      bb.log.info(`archived worker ${workerId} (retention: ${retention})`);
     } catch (cause) {
       bb.log.warn(`could not archive worker ${workerId}: ${String(cause)}`);
     }
@@ -2027,7 +2262,9 @@ export default async function plugin(bb: BbPluginApi) {
   async function assertWithinBudget(
     threadId: string,
     countPerTurn: boolean,
+    projectId: string,
   ): Promise<void> {
+    const settings = settingsFor(projectId);
     // Inside the write queue, and counting the claims already in flight: a check
     // that reads the state beside another claim lets two simultaneous
     // delegations both pass their cap.
@@ -2035,28 +2272,28 @@ export default async function plugin(bb: BbPluginApi) {
       const state = await getState(threadId);
       if (state === undefined) return;
       const pending = pendingClaims.get(threadId) ?? { parallel: 0, turn: 0 };
-      if (live.maxParallelWorkers > 0) {
+      if (settings.maxParallelWorkers > 0) {
         const inFlight =
           state.delegations.filter((delegation) => delegation.status === null).length + pending.parallel;
-        if (inFlight >= live.maxParallelWorkers) {
+        if (inFlight >= settings.maxParallelWorkers) {
           throw new WorkerBudgetError(
-            `${inFlight} workers are still running and this plugin caps parallel workers at ${live.maxParallelWorkers}. Wait for one to finish, or raise maxParallelWorkers (0 removes the cap).`,
+            `${inFlight} workers are still running and this plugin caps parallel workers at ${settings.maxParallelWorkers}. Wait for one to finish, or raise maxParallelWorkers (0 removes the cap).`,
           );
         }
       }
       // The per-turn cap governs what the orchestrator chose to fan out. A check
       // unit or a fallback retry is this plugin's own decision, and counting it
       // would let a tight cap silently defeat `verify: true`.
-      if (countPerTurn && live.maxDelegationsPerTurn > 0) {
+      if (countPerTurn && settings.maxDelegationsPerTurn > 0) {
         // Until the first dispatch of a session there is no turn yet, so the
         // window starts when the mode was enabled rather than being ignored.
         const enabledAtMs = state.enabledAt === null ? 0 : Date.parse(state.enabledAt);
         const since = Math.max(state.turnStartedAt, Number.isNaN(enabledAtMs) ? 0 : enabledAtMs);
         const thisTurn =
           state.delegations.filter((delegation) => delegation.createdAt >= since).length + pending.turn;
-        if (thisTurn >= live.maxDelegationsPerTurn) {
+        if (thisTurn >= settings.maxDelegationsPerTurn) {
           throw new WorkerBudgetError(
-            `This turn has delegated ${thisTurn} workers and this plugin caps a turn at ${live.maxDelegationsPerTurn}. Fold what came back into a report, or raise maxDelegationsPerTurn (0 removes the cap).`,
+            `This turn has delegated ${thisTurn} workers and this plugin caps a turn at ${settings.maxDelegationsPerTurn}. Fold what came back into a report, or raise maxDelegationsPerTurn (0 removes the cap).`,
           );
         }
       }
@@ -2069,7 +2306,7 @@ export default async function plugin(bb: BbPluginApi) {
    * gate is closed: not enabled, instruct level, nothing unjudged, already
    * reminded for this set, or out of reminders.
    */
-  function reviewNudgeMarker(state: ThreadState): string | undefined {
+  function reviewNudgeMarker(state: ThreadState, maxNudges: number): string | undefined {
     if (!state.enabled) return undefined;
     if (effectiveEnforcement(state) === "instruct") return undefined;
     const unreviewed = unreviewedOf(state.delegations);
@@ -2079,7 +2316,7 @@ export default async function plugin(bb: BbPluginApi) {
       .sort()
       .join(",");
     if (state.lastReviewNudge === marker) return undefined;
-    if (state.nudgeCount >= live.maxNudges) return undefined;
+    if (state.nudgeCount >= maxNudges) return undefined;
     return marker;
   }
 
@@ -2096,9 +2333,10 @@ export default async function plugin(bb: BbPluginApi) {
    * by gate.
    */
   async function checkReviews(threadId: string): Promise<void> {
+    const maxNudges = settingsFor(await projectOfThread(threadId)).maxNudges;
     // Cheap guard first: an unrelated idle event should not cost a thread read.
     const before = await getState(threadId);
-    if (reviewNudgeMarker(before ?? emptyState(Date.now())) === undefined) return;
+    if (reviewNudgeMarker(before ?? emptyState(Date.now()), maxNudges) === undefined) return;
     try {
       const thread = await bb.sdk.threads.get({ threadId });
       if (thread.status !== "idle" && thread.status !== "error") return;
@@ -2110,7 +2348,7 @@ export default async function plugin(bb: BbPluginApi) {
     // must not both send a reminder and spend two of the budget.
     let claimed: { titles: string[]; count: number; marker: string; enforcement: EnforcementLevel } | undefined;
     await mutateState(threadId, (current) => {
-      const marker = reviewNudgeMarker(current);
+      const marker = reviewNudgeMarker(current, maxNudges);
       if (marker === undefined) return current;
       const unreviewed = unreviewedOf(current.delegations);
       claimed = {
@@ -2160,10 +2398,11 @@ export default async function plugin(bb: BbPluginApi) {
   // --- RPC -----------------------------------------------------------------
 
   bb.rpc.register(rpcContract, {
-    get_state: async ({ threadId }) => toDto(threadId, await getState(threadId)),
+    get_state: async ({ threadId }) =>
+      toDto(threadId, await getState(threadId), settingsFor(await projectOfThread(threadId))),
     set_enabled: async ({ threadId, enabled, enforcement }) => {
       const state = await setEnabled(threadId, enabled, enforcement ?? null);
-      return toDto(threadId, state);
+      return toDto(threadId, state, settingsFor(await projectOfThread(threadId)));
     },
     get_default: async () => ({ enabled: live.defaultForNewThreads }),
     set_default: async ({ enabled }) => ({ enabled: await setDefault(enabled) }),
@@ -2179,10 +2418,35 @@ export default async function plugin(bb: BbPluginApi) {
       return { text: await contractText(null), extra: stored, limit: EXTRA_INSTRUCTION_LIMIT };
     },
     get_worker_execution: async () => live.worker,
+    get_project_worker: async ({ projectId }) => workerFor(projectId),
+    set_project_worker: async ({ projectId, config }) => writeProjectWorker(projectId, config),
+    get_project_rules: async ({ projectId }) => ({
+      text: await contractText(null, projectId),
+      extra: rulesFor(projectId),
+      limit: EXTRA_INSTRUCTION_LIMIT,
+    }),
+    set_project_rules: async ({ projectId, extra }) => {
+      await writeProjectRules(projectId, extra);
+      return {
+        text: await contractText(null, projectId),
+        extra: rulesFor(projectId),
+        limit: EXTRA_INSTRUCTION_LIMIT,
+      };
+    },
+    get_project_settings: async ({ projectId }) => ({
+      values: settingsFor(projectId),
+      overridden: Object.keys(projectSettings[projectId] ?? {}),
+    }),
+    set_project_setting: async ({ projectId, key, value }) => {
+      const current = { ...(projectSettings[projectId] ?? {}) };
+      if (value === null) delete current[key];
+      else Object.assign(current, { [key]: value });
+      return { values: await writeProjectSettings(projectId, current), overridden: Object.keys(projectSettings[projectId] ?? {}) };
+    },
     set_worker_execution: async (next) => setWorkerConfig(next),
     clear_violations: async ({ threadId }) => {
       const state = await clearViolations(threadId);
-      return toDto(threadId, state);
+      return toDto(threadId, state, settingsFor(await projectOfThread(threadId)));
     },
   });
 
@@ -2245,9 +2509,14 @@ export default async function plugin(bb: BbPluginApi) {
     return parts.length === 0 ? "project default (no worker override)" : parts.join(", ");
   }
 
-  function describeState(threadId: string, state: OrchestratorStateDto): string {
+  function describeState(
+    threadId: string,
+    state: OrchestratorStateDto,
+    scope: { projectId: string; overridden: readonly string[] } | null = null,
+  ): string {
     const lines = [
       `thread ${threadId}`,
+      `  scope:             ${scope === null ? "global" : `project ${scope.projectId}${scope.overridden.length === 0 ? " (inherits everything)" : ` (overrides: ${scope.overridden.join(", ")})`}`}`,
       `  orchestrator mode: ${state.enabled ? "ON" : "off"}`,
       `  enforcement:       ${state.effectiveEnforcement}${
         state.enforcement === null ? " (plugin default)" : " (thread override)"
@@ -2282,8 +2551,11 @@ export default async function plugin(bb: BbPluginApi) {
           options: threadOption,
           async run(input, ctx) {
             const threadId = resolveThreadId(input.options.thread, ctx);
-            const state = toDto(threadId, await getState(threadId));
-            return render(input.options.json, state, describeState(threadId, state));
+            const projectId = await projectOfThread(threadId);
+            const state = toDto(threadId, await getState(threadId), settingsFor(projectId));
+            const scope =
+              projectId === null ? null : { projectId, overridden: Object.keys(projectSettings[projectId] ?? {}) };
+            return render(input.options.json, state, describeState(threadId, state, scope));
           },
         }),
         on: cliCommand({
@@ -2304,7 +2576,7 @@ export default async function plugin(bb: BbPluginApi) {
                 : (input.options.enforcement as EnforcementLevel);
             const state = await setEnabled(threadId, true, enforcement);
             await syncMirror(threadId, true, state.enforcement);
-            const dto = toDto(threadId, state);
+            const dto = toDto(threadId, state, settingsFor(await projectOfThread(threadId)));
             return render(
               input.options.json,
               dto,
@@ -2319,8 +2591,170 @@ export default async function plugin(bb: BbPluginApi) {
           async run(input, ctx) {
             const threadId = resolveThreadId(input.options.thread, ctx);
             const state = await setEnabled(threadId, false, null);
-            const dto = toDto(threadId, state);
+            const dto = toDto(threadId, state, settingsFor(await projectOfThread(threadId)));
             return render(input.options.json, dto, `Orchestrator mode off for ${threadId}.`);
+          },
+        }),
+        scope: cliCommand({
+          summary: "Show or change what one project overrides, and what it inherits",
+          options: {
+            project: { type: "string", description: "Project id (required for every verb except list)" },
+            inherit: {
+              type: "enum",
+              values: [...SETTINGS_KEYS],
+              description: "Clear one settings override, so the project inherits it again",
+            },
+            "inherit-all": {
+              type: "boolean",
+              description: "Clear every override for this project: settings, worker execution and rules",
+            },
+            enforcement: {
+              type: "enum",
+              values: [...ENFORCEMENT_LEVELS],
+              description: "Write this project's enforcement override",
+            },
+            "read-commands": {
+              type: "enum",
+              values: ["on", "off"],
+              description: "Write this project's read-only command allowance",
+            },
+            "max-nudges": {
+              type: "integer",
+              min: 0,
+              max: 1000,
+              description: "Write this project's reminder cap",
+            },
+            "max-parallel": {
+              type: "integer",
+              min: 0,
+              max: 1000,
+              description: "Write this project's parallel worker cap",
+            },
+            "max-per-turn": {
+              type: "integer",
+              min: 0,
+              max: 1000,
+              description: "Write this project's per-turn delegation cap",
+            },
+            "contract-preset": {
+              type: "enum",
+              values: [...CONTRACT_PRESETS],
+              description: "Write this project's contract shape",
+            },
+            retention: {
+              type: "enum",
+              values: [...WORKER_RETENTION],
+              description: "Write this project's worker retention policy",
+            },
+            "worker-provider": { type: "string", description: "Write this project's worker provider" },
+            "worker-model": { type: "string", description: "Write this project's worker model" },
+            "clear-worker": {
+              type: "boolean",
+              description: "Clear this project's worker execution, so it inherits the global one",
+            },
+            rules: { type: "string", description: "Write this project's appended rules" },
+            "clear-rules": { type: "boolean", description: "Clear this project's appended rules" },
+            json: { type: "boolean", description: "Emit machine-readable JSON" },
+          },
+          async run(input) {
+            const projectOption = input.options.project;
+            const projectId =
+              typeof projectOption === "string" && projectOption.trim() !== "" ? projectOption.trim() : undefined;
+            const list = async () => {
+              const ids = new Set([
+                ...Object.keys(projectSettings),
+                ...Object.keys(projectWorker),
+                ...Object.keys(projectRules),
+              ]);
+              const rows = [...ids].sort().map((id) => ({
+                projectId: id,
+                overridden: Object.keys(projectSettings[id] ?? {}),
+                worker: projectWorker[id] === undefined ? null : describeWorkerExecution(workerFor(id)),
+                rules: projectRules[id] === undefined ? null : projectRules[id],
+              }));
+              return render(input.options.json, rows, rows.length === 0
+                ? "no project overrides; every project inherits the global configuration"
+                : rows
+                    .map(
+                      (row) =>
+                        `${row.projectId}\n  settings: ${row.overridden.length === 0 ? "inherits" : row.overridden.join(", ")}\n  workers:  ${row.worker ?? "inherits"}\n  rules:    ${row.rules === null ? "inherits" : `${row.rules.length} chars`}`,
+                    )
+                    .join("\n"));
+            };
+            if (projectId === undefined || projectId === "") return list();
+
+            if (input.options["inherit-all"] === true) {
+              await writeProjectRules(projectId, "");
+              await writeProjectWorker(projectId, null);
+              await writeProjectSettings(projectId, {});
+            }
+            if (input.options.inherit !== undefined) {
+              const current = { ...(projectSettings[projectId] ?? {}) };
+              delete current[input.options.inherit];
+              await writeProjectSettings(projectId, current);
+            }
+            const patch: Partial<OrchestratorSettings> = {
+              ...(input.options.enforcement === undefined
+                ? {}
+                : { enforcement: input.options.enforcement as EnforcementLevel }),
+              ...(input.options["read-commands"] === undefined
+                ? {}
+                : { allowReadCommands: input.options["read-commands"] === "on" }),
+              ...(input.options["max-nudges"] === undefined ? {} : { maxNudges: input.options["max-nudges"] }),
+              ...(input.options["max-parallel"] === undefined
+                ? {}
+                : { maxParallelWorkers: input.options["max-parallel"] }),
+              ...(input.options["max-per-turn"] === undefined
+                ? {}
+                : { maxDelegationsPerTurn: input.options["max-per-turn"] }),
+              ...(input.options["contract-preset"] === undefined
+                ? {}
+                : { contractPreset: input.options["contract-preset"] as ContractPresetId }),
+              ...(input.options.retention === undefined
+                ? {}
+                : { workerRetention: input.options.retention as WorkerRetention }),
+            };
+            if (Object.keys(patch).length > 0) {
+              await writeProjectSettings(projectId, { ...(projectSettings[projectId] ?? {}), ...patch });
+            }
+            const workerPatch = {
+              ...(input.options["worker-provider"] === undefined
+                ? {}
+                : { providerId: input.options["worker-provider"] }),
+              ...(input.options["worker-model"] === undefined ? {} : { model: input.options["worker-model"] }),
+            };
+            if (Object.keys(workerPatch).length > 0) {
+              await writeProjectWorker(projectId, { ...(projectWorker[projectId] ?? {}), ...workerPatch });
+            }
+            if (input.options["clear-worker"] === true) await writeProjectWorker(projectId, null);
+            if (input.options.rules !== undefined) await writeProjectRules(projectId, input.options.rules);
+            if (input.options["clear-rules"] === true) await writeProjectRules(projectId, "");
+
+            const values = settingsFor(projectId);
+            const view = {
+              projectId,
+              overridden: Object.keys(projectSettings[projectId] ?? {}),
+              values,
+              worker: describeWorkerExecution(workerFor(projectId)),
+              rules: projectRules[projectId] ?? null,
+              contract: await contractText(null, projectId),
+            };
+            return render(
+              input.options.json,
+              view,
+              [
+                `project ${projectId}`,
+                `  settings overridden: ${view.overridden.length === 0 ? "none (inherits the globals)" : view.overridden.join(", ")}`,
+                `  enforcement:         ${values.enforcement}${view.overridden.includes("enforcement") ? " (project)" : " (global)"}`,
+                `  read commands:       ${values.allowReadCommands ? "allowed" : "all commands are work"}${view.overridden.includes("allowReadCommands") ? " (project)" : " (global)"}`,
+                `  reminders per thread: ${values.maxNudges}${view.overridden.includes("maxNudges") ? " (project)" : " (global)"}`,
+                `  fan-out cap:         ${values.maxParallelWorkers === 0 ? "none" : `${values.maxParallelWorkers} in flight`}, ${values.maxDelegationsPerTurn === 0 ? "none" : `${values.maxDelegationsPerTurn} per turn`}`,
+                `  contract shape:      ${values.contractPreset}${view.overridden.includes("contractPreset") ? " (project)" : " (global)"}`,
+                `  worker retention:    ${values.workerRetention}${view.overridden.includes("workerRetention") ? " (project)" : " (global)"}`,
+                `  workers run as:      ${view.worker}`,
+                `  project rules:       ${view.rules === null ? "inherits the global rules" : `${view.rules.length} characters`}`,
+              ].join("\n"),
+            );
           },
         }),
         contract: cliCommand({
@@ -2370,7 +2804,11 @@ export default async function plugin(bb: BbPluginApi) {
             const threadId = resolveThreadId(input.options.thread, ctx);
             if (input.options.clear === true) {
               const state = await clearViolations(threadId);
-              return render(input.options.json, toDto(threadId, state), `Cleared for ${threadId}.`);
+              return render(
+                input.options.json,
+                toDto(threadId, state, settingsFor(await projectOfThread(threadId))),
+                `Cleared for ${threadId}.`,
+              );
             }
             const state = await getState(threadId);
             const violations = state?.violations ?? [];

@@ -350,6 +350,7 @@ bb orchestrator-mode off
 | `status [--thread <id>] [--json]` | Show mode, enforcement, violations, nudges and delegations. |
 | `on [--thread <id>] [--enforcement instruct\|guard\|block] [--json]` | Enable the thread, with an optional enforcement override. |
 | `off [--thread <id>] [--json]` | Disable the thread and clear its enforcement override. |
+| `scope [--project <id>] [--enforcement <level>] [--read-commands on\|off] [--max-nudges <n>] [--max-parallel <n>] [--max-per-turn <n>] [--contract-preset <name>] [--retention <policy>] [--worker-provider <id>] [--worker-model <id>] [--clear-worker] [--rules <text>] [--clear-rules] [--inherit <key>] [--inherit-all] [--json]` | Show what each project overrides and what it inherits. With `--project`, write this project's overrides: settings, worker execution and appended rules. Without it, list every project that has any. |
 | `contract [--thread <id>] [--rules <text>] [--clear-rules] [--json]` | Print the exact instructions this thread receives, or set and clear the project rules appended to them. |
 | `violations [--thread <id>] [--clear] [--json]` | List violations, or clear them and reset correction counters. |
 | `default [on\|off] [--json]` | Show or set the default for new threads. |
@@ -377,6 +378,36 @@ execution arguments are optional and fall back to a preset, then the
 [worker execution](#worker-execution), then the project defaults. The
 bundled [skill](skills/orchestrator-mode/SKILL.md) explains the mode, delegation
 and CLI; enabled sessions receive the contract directly.
+
+## Project scopes
+
+Every setting, the worker execution, the execution presets and the appended rules
+resolve in four layers, highest first:
+
+1. **The thread.** Its own on/off switch and enforcement override, as before.
+2. **The project.** Whatever that project overrides under **Settings → Installed
+   plugins → Orchestrator Mode → Workers → Scope**.
+3. **Global.** The plugin settings and the worker execution configured for every
+   project, which is what the descriptor form above the section edits.
+4. **The descriptor default**, when nothing names a value at all.
+
+A project that overrides nothing inherits everything, so an install that never
+touches the selector behaves exactly as it did before. Two values stay global on
+purpose: `defaultForNewThreads` is a composer default rather than thread
+behaviour, and `defaultEnabledAtMs` is bookkeeping for it. The selector lists
+Global plus every project; the rows below it show each field's effective value,
+whether it is overridden, and the Inherit action that hands it back.
+
+```sh
+bb orchestrator-mode scope                                     # every project that overrides anything
+bb orchestrator-mode scope --project <id> --max-parallel 2     # cap fan-out for one project
+bb orchestrator-mode scope --project <id> --contract-preset thorough --rules "Never touch generated/."
+bb orchestrator-mode scope --project <id> --inherit maxNudges  # one field back to the global value
+bb orchestrator-mode scope --project <id> --inherit-all        # this project inherits everything again
+```
+
+`status --thread` names the scope it resolved and which fields the project
+overrides, so a surprising cap or contract can be traced to the layer that set it.
 
 ## Settings
 

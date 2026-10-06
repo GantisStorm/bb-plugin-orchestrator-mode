@@ -8,6 +8,16 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ### Added
 
+- Per-project configuration. The plugin settings, the worker execution, the execution
+  presets and the appended rules now resolve thread → project → global → descriptor
+  default, and **Settings → Installed plugins → Orchestrator Mode → Workers** gains a
+  scope selector listing Global plus every project, with each field showing whether it
+  is overridden and an Inherit action that hands it back. A project that overrides
+  nothing behaves exactly as before. `bb orchestrator-mode scope` reads and writes the
+  same overrides, and `status --thread` names the scope and the overridden fields, so a
+  surprising cap or contract is traceable to the layer that set it. `defaultForNewThreads`
+  stays global: it is a composer default, not thread behaviour.
+
 - `contractPreset: "thorough"` composes the `research-first` reading requirement with `review-heavy`'s mandatory check unit and verdict, for work whose result is expensive to get wrong. The contract budget test covers it with every other preset, and it keeps honouring the read-only command allowance that `delegate-only` withdraws.
 - The contract names the worker execution presets you have actually stored (`Saved worker
   kinds: build, review; name one as \`preset\` for a unit of that kind.`), and says nothing when
