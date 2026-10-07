@@ -353,6 +353,7 @@ describe("the settings section", () => {
       contractPreset: "standard",
       workerRetention: "keep",
       workerWorkspace: "shared",
+      childMessageDelivery: "queued",
     };
     const projectWorker: Record<string, WorkerConfig> = {};
     const projectRules: Record<string, string> = {};
@@ -560,6 +561,33 @@ describe("the settings section", () => {
       projectId: null,
       key: "contractPreset",
       value: "delegate-only",
+    });
+  });
+
+  it("lets a project override queued child messages and inherit the global policy again", async () => {
+    const rpc = makeSettingsRpc();
+    const slot = mountSettings(rpc);
+    await flush();
+    const query = within(slot.container);
+    expect((query.getByLabelText("Child messages") as HTMLSelectElement).value).toBe("queued");
+    await act(async () => {
+      fireEvent.change(query.getByLabelText("Scope"), { target: { value: "proj_alpha" } });
+    });
+    await flush();
+    expect(query.getByRole("option", { name: "Inherit (queued until turn ends)" })).toBeTruthy();
+    await act(async () => {
+      fireEvent.change(query.getByLabelText("Child messages"), { target: { value: "immediate" } });
+    });
+    await flush();
+    expect(rpc.inputsOf("set_scope_setting").at(-1)).toEqual({
+      projectId: "proj_alpha", key: "childMessageDelivery", value: "immediate",
+    });
+    await act(async () => {
+      fireEvent.change(query.getByLabelText("Child messages"), { target: { value: "" } });
+    });
+    await flush();
+    expect(rpc.inputsOf("set_scope_setting").at(-1)).toEqual({
+      projectId: "proj_alpha", key: "childMessageDelivery", value: null,
     });
   });
 

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createFakePluginHost,
   makeMessageDispatchHookContext,
+  makeQueueEntry,
   makePluginAgentConfigurationContext,
   makeThreadResponse,
   type FakePluginHarness,
@@ -405,6 +406,137 @@ describe("the dispatch checkpoint", () => {
   it("always proceeds", async () => {
     const { harness } = await load();
     await expect(dispatch(harness, THREAD)).resolves.toEqual({ action: "proceed" });
+  });
+
+  it("queues child messages instead of interrupting the active orchestrator", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    const decision = await dispatch(harness, THREAD, { status: "active" }, {
+      initiator: "agent",
+      senderThreadId: WORKER,
+      attempt: "join-turn",
+    });
+    expect(decision).toMatchObject({ action: "wait" });
+  });
+
+  it("holds messages from multiple children and releases each retry when the orchestrator is idle", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
+      makeThreadResponse({ id: threadId, parentThreadId: THREAD }),
+    );
+    for (const senderThreadId of [WORKER, "th_worker_2"]) {
+      const context = { initiator: "agent", senderThreadId };
+      await expect(dispatch(harness, THREAD, { status: "active" }, {
+        ...context, attempt: "join-turn",
+      })).resolves.toMatchObject({ action: "wait" });
+      await expect(dispatch(harness, THREAD, { status: "idle" }, {
+        ...context, attempt: "start-turn",
+        queuedMessages: [makeQueueEntry({ threadId: THREAD, initiator: "agent", senderThreadId })],
+      })).resolves.toEqual({ action: "proceed" });
+    }
+    expect(sentTexts).toEqual([]);
+  });
+
+  it.each([
+    { initiator: "user", senderThreadId: null },
+    { initiator: "system", senderThreadId: null },
+    { initiator: "agent", senderThreadId: null },
+    { initiator: "agent", senderThreadId: "th_unrelated" },
+  ])("lets $initiator messages from $senderThreadId reach the running turn", async (context) => {
+    const { harness } = await load();
+    await enable(harness);
+    await expect(dispatch(harness, THREAD, { status: "active" }, {
+      ...context, attempt: "join-turn",
+    })).resolves.toEqual({ action: "proceed" });
+  });
+
+  it("does not hold a queued group that includes a user message", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    await expect(dispatch(harness, THREAD, { status: "active" }, {
+      initiator: "mixed",
+      senderThreadId: "mixed",
+      attempt: "join-turn",
+      queuedMessages: [
+        makeQueueEntry({ threadId: THREAD, initiator: "agent", senderThreadId: WORKER }),
+        makeQueueEntry({ threadId: THREAD, initiator: "user", senderThreadId: null }),
+      ],
+    })).resolves.toEqual({ action: "proceed" });
+  });
+
+  it("does not hold a group that includes an unrelated agent", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    await expect(dispatch(harness, THREAD, { status: "active" }, {
+      initiator: "agent",
+      senderThreadId: "mixed",
+      attempt: "join-turn",
+      queuedMessages: [WORKER, "th_unrelated"].map((senderThreadId) =>
+        makeQueueEntry({ threadId: THREAD, initiator: "agent", senderThreadId }),
+      ),
+    })).resolves.toEqual({ action: "proceed" });
+  });
+
+  it("proceeds if a child's relationship can no longer be read", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    harness.inspection.sdk.stub("threads.get", async () => { throw new Error("thread deleted"); });
+    await expect(dispatch(harness, THREAD, { status: "active" }, {
+      initiator: "agent", senderThreadId: WORKER, attempt: "join-turn",
+    })).resolves.toEqual({ action: "proceed" });
+  });
+
+  it("releases waiting child messages when orchestrator mode is turned off", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    await harness.behavior.callRpc("set_enabled", { threadId: THREAD, enabled: false });
+    await expect(dispatch(harness, THREAD, { status: "active" }, {
+      initiator: "agent", senderThreadId: WORKER, attempt: "join-turn",
+      queuedMessages: [makeQueueEntry({ threadId: THREAD, initiator: "agent", senderThreadId: WORKER })],
+    })).resolves.toEqual({ action: "proceed" });
+  });
+
+  it("honours immediate delivery globally and a project's queued override", async () => {
+    const { harness } = await load({ childMessageDelivery: "immediate" });
+    await enable(harness);
+    const context = { initiator: "agent", senderThreadId: WORKER, attempt: "join-turn" };
+    await expect(dispatch(harness, THREAD, { status: "active" }, context))
+      .resolves.toEqual({ action: "proceed" });
+    await harness.behavior.callRpc("set_scope_setting", {
+      projectId: makeMessageDispatchHookContext().project.id, key: "childMessageDelivery", value: "queued",
+    });
+    await expect(dispatch(harness, THREAD, { status: "active" }, context))
+      .resolves.toMatchObject({ action: "wait" });
+    await harness.behavior.callRpc("set_scope_setting", {
+      projectId: makeMessageDispatchHookContext().project.id, key: "childMessageDelivery", value: null,
+    });
+    await expect(dispatch(harness, THREAD, { status: "active" }, context))
+      .resolves.toEqual({ action: "proceed" });
+  });
+
+  it("keeps the per-turn delegation budget through waits and steering messages", async () => {
+    const { bb, harness } = await load({}, {
+      [THREAD]: { enabled: true, turnStartedAt: 777 },
+    });
+    await dispatch(harness, THREAD, { status: "active" }, {
+      initiator: "agent", senderThreadId: WORKER, attempt: "join-turn",
+    });
+    await dispatch(harness, THREAD, { status: "active" }, {
+      initiator: "user", senderThreadId: null, attempt: "join-turn",
+    });
+    const state = await bb.storage.kv.get<Record<string, { turnStartedAt: number }>>("state");
+    expect(state?.[THREAD]?.turnStartedAt).toBe(777);
+    await dispatch(harness, THREAD, { status: "idle" }, { attempt: "start-turn" });
+    const updated = await bb.storage.kv.get<Record<string, { turnStartedAt: number }>>("state");
+    expect(updated?.[THREAD]?.turnStartedAt).toBeGreaterThan(777);
+  });
+
+  it("configures child message delivery through the scope CLI", async () => {
+    const { harness } = await load();
+    const result = await harness.behavior.runCli(["scope", "--global", "--child-messages", "immediate", "--json"]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).values.childMessageDelivery).toBe("immediate");
   });
 
   it("mirrors authoritative state onto the thread before the turn", async () => {
@@ -2184,6 +2316,7 @@ describe("rpc", () => {
       contractPreset: "standard",
       workerRetention: "keep",
       workerWorkspace: "shared",
+      childMessageDelivery: "queued",
     };
     expect(await harness.behavior.callRpc("get_scope_settings", { projectId: null })).toEqual({
       values: globals,

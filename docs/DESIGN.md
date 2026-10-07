@@ -23,6 +23,28 @@ State is bounded: the store retains at most 300 threads by last touch time,
 IDs per thread. These are working records, not a permanent audit archive.
 Deleted threads lose their stored state.
 
+## Child message queue
+
+`childMessageDelivery` defaults to `queued` and resolves through Global/Project
+settings. The dispatch hook returns `wait` for messages from direct children
+of an enabled, active orchestrator. It verifies each sender's current parent
+through `threads.get`, including every sender in a grouped queue re-attempt.
+Groups containing a user, a system notice or an unrelated sender proceed.
+Lookup errors fail open, as other dispatch-checkpoint errors do.
+
+BB owns the durable queue, retrying and grouping. The plugin keeps no message
+copies, timers or queue claims. A retry on an idle thread proceeds; disabling
+the mode or choosing `immediate` also releases the hold on recheck. BB's manual
+Send-now operation bypasses plugin policy. Only `start-turn` attempts reset the
+per-turn delegation budget; waits and `join-turn` attempts retain it.
+
+Automatic child system notices use BB's separate parent-system delivery path,
+including when a notice was queued for a pending interaction. That path bypasses
+`message.dispatch`, so this policy currently applies to direct child messages.
+BB's grouping envelope also requires one sender per group, so reports from
+different children remain separate dispatches. Tool results returned by
+synchronous delegation are unaffected.
+
 ## Session timing and grace turns
 
 Enabling a thread seeds the watchdog's timeline sequence from the existing

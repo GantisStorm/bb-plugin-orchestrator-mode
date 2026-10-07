@@ -317,6 +317,7 @@ const SETTINGS_KEYS = [
   "contractPreset",
   "workerRetention",
   "workerWorkspace",
+  "childMessageDelivery",
 ] as const;
 const settingsKeySchema = z.enum(SETTINGS_KEYS);
 
@@ -330,6 +331,7 @@ const settingsViewSchema = z.object({
   contractPreset: z.enum(CONTRACT_PRESETS),
   workerRetention: z.enum(WORKER_RETENTION),
   workerWorkspace: z.enum(WORKER_WORKSPACES),
+  childMessageDelivery: z.enum(["queued", "immediate"]),
 });
 
 export type SettingsViewDto = z.infer<typeof settingsViewSchema>;
@@ -533,6 +535,7 @@ export default async function plugin(bb: BbPluginApi) {
     contractPreset: ContractPresetId;
     workerRetention: WorkerRetention;
     workerWorkspace: WorkerWorkspace;
+    childMessageDelivery: "queued" | "immediate";
   }
 
   /** The global record: what every project inherits, plus the composer default. */
@@ -559,6 +562,7 @@ export default async function plugin(bb: BbPluginApi) {
     contractPreset: "standard",
     workerRetention: "keep",
     workerWorkspace: "shared",
+    childMessageDelivery: "queued",
   };
 
   /**
@@ -714,6 +718,10 @@ export default async function plugin(bb: BbPluginApi) {
       workerWorkspace: isOneOf(WORKER_WORKSPACES, values.workerWorkspace)
         ? values.workerWorkspace
         : base.workerWorkspace,
+      childMessageDelivery:
+        values.childMessageDelivery === "queued" || values.childMessageDelivery === "immediate"
+          ? values.childMessageDelivery
+          : base.childMessageDelivery,
     };
   }
 
@@ -2163,9 +2171,45 @@ export default async function plugin(bb: BbPluginApi) {
       }
       await syncMirror(threadId, state.enabled, state.enforcement);
       if (state.enabled) {
+        const settings = settingsFor(ctx.project.id);
+        if (
+          settings.childMessageDelivery === "queued" &&
+          (ctx.attempt === "join-turn" || ctx.thread.status === "active")
+        ) {
+          const messages = ctx.queuedMessages.length > 0 ? ctx.queuedMessages : [ctx];
+          // A mixed group may contain a user message or an unrelated sender.
+          // Decide for the whole group without delaying either of those.
+          const senders = new Set<string>();
+          for (const message of messages) {
+            if (
+              message.initiator !== "agent" ||
+              message.senderThreadId === null ||
+              message.senderThreadId === "mixed"
+            ) {
+              senders.clear();
+              break;
+            }
+            senders.add(message.senderThreadId);
+          }
+          if (senders.size > 0) {
+            const children = await Promise.all(
+              [...senders].map(async (senderThreadId) =>
+                (await bb.sdk.threads.get({ threadId: senderThreadId })).parentThreadId === threadId,
+              ),
+            );
+            if (children.every(Boolean)) {
+              return {
+                action: "wait" as const,
+                reason: "Child messages are queued until the orchestrator finishes its current turn.",
+              };
+            }
+          }
+        }
         // A dispatch is where a new turn begins, so this is where the per-turn
         // delegation budget starts counting.
-        await mutateState(threadId, (current) => ({ ...current, turnStartedAt: Date.now() }));
+        if (ctx.attempt === "start-turn") {
+          await mutateState(threadId, (current) => ({ ...current, turnStartedAt: Date.now() }));
+        }
         scheduleScan(threadId, 0);
       }
     } catch (cause) {
@@ -2668,6 +2712,7 @@ export default async function plugin(bb: BbPluginApi) {
     "contract-preset"?: ContractPresetId;
     retention?: WorkerRetention;
     "worker-workspace"?: WorkerWorkspace;
+    "child-messages"?: "queued" | "immediate";
   }
 
   function settingsPatch(options: ScopeSettingsFlags): Partial<OrchestratorSettings> {
@@ -2686,6 +2731,9 @@ export default async function plugin(bb: BbPluginApi) {
       ...(options["worker-workspace"] === undefined
         ? {}
         : { workerWorkspace: options["worker-workspace"] }),
+      ...(options["child-messages"] === undefined
+        ? {}
+        : { childMessageDelivery: options["child-messages"] }),
     };
   }
 
@@ -2887,6 +2935,11 @@ export default async function plugin(bb: BbPluginApi) {
               values: ["on", "off"],
               description: "Write that scope's read-only command allowance",
             },
+            "child-messages": {
+              type: "enum",
+              values: ["queued", "immediate"],
+              description: "Queue child messages until the orchestrator's turn ends, or deliver immediately",
+            },
             "max-nudges": {
               type: "integer",
               min: 0,
@@ -3010,6 +3063,7 @@ export default async function plugin(bb: BbPluginApi) {
                   `  contract shape:       ${values.contractPreset}`,
                   `  worker retention:     ${values.workerRetention}`,
                   `  worker workspace:     ${values.workerWorkspace}`,
+                  `  child messages:       ${values.childMessageDelivery}`,
                   `  workers run as:       ${worker}${describeFallback(live.worker.fallback)}${describePresets(live.worker.presets)}`,
                   `  rules:                ${extraInstructions === "" ? "none" : `${extraInstructions.length} characters`}`,
                   `  new threads default:  ${live.defaultForNewThreads ? "on" : "off"}`,
@@ -3066,6 +3120,7 @@ export default async function plugin(bb: BbPluginApi) {
                 `  contract shape:      ${values.contractPreset}${view.overridden.includes("contractPreset") ? " (project)" : " (global)"}`,
                 `  worker retention:    ${values.workerRetention}${view.overridden.includes("workerRetention") ? " (project)" : " (global)"}`,
                 `  worker workspace:    ${values.workerWorkspace}${view.overridden.includes("workerWorkspace") ? " (project)" : " (global)"}`,
+                `  child messages:      ${values.childMessageDelivery}${view.overridden.includes("childMessageDelivery") ? " (project)" : " (global)"}`,
                 `  workers run as:      ${view.worker}`,
                 `  project rules:       ${view.rules === null ? "inherits the global rules" : `${view.rules.length} characters`}`,
               ].join("\n"),

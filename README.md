@@ -275,6 +275,40 @@ the project default when delegating to `acp-omp`.
 
 ## Reviewing worker output
 
+### Queueing child messages
+
+With orchestrator mode on, direct messages from child threads wait in BB's
+persistent queue while the orchestrator is working. When its turn ends, BB
+rechecks the queue and releases waiting messages as the orchestrator becomes
+idle. Messages to an idle orchestrator
+arrive immediately. User messages and messages from unrelated threads are
+not held by this policy.
+
+**Settings → Installed plugins → Orchestrator Mode → Child messages** defaults
+to **queued until turn ends**. Select **immediate** to allow child messages
+into a running turn. The setting supports Global and Project scopes:
+
+```sh
+bb orchestrator-mode scope --global --child-messages queued
+bb orchestrator-mode scope --project <id> --child-messages immediate
+bb orchestrator-mode scope --project <id> --inherit childMessageDelivery
+```
+
+The messages stay visible in BB's queue, with their content and sender
+preserved. You can use **Send now** to override the wait. Turning orchestrator
+mode off or selecting immediate delivery releases the plugin's hold on the
+next queue recheck.
+
+BB's automatic child completion, failure and attention notices bypass the
+plugin dispatch hook. Those notices keep BB's own delivery behavior; extending
+this policy to them requires support in BB core. BB also requires queued groups
+to share a sender, so combining reports from several children into one dispatch
+requires a core change. This setting controls when messages are delivered;
+it preserves BB's queue order and existing groups. Results returned by a waiting
+`orchestrator_delegate` call also return directly through that tool.
+
+### Verdicts and verification
+
 Every delegation is meant to end in a verdict, and the plugin checks for one.
 The orchestrator records it with the `orchestrator_review` tool, one call per
 worker whose result it used, with `accepted` or `rejected` and a line of notes.

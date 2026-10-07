@@ -29,12 +29,25 @@ bb orchestrator-mode default [on|off] [--json]
 bb orchestrator-mode worker [--provider <id>] [--model <id>] [--preset <name>] [--json]
 bb orchestrator-mode contract [--thread <id>] [--rules <text>] [--clear-rules] [--json]
 bb orchestrator-mode scope [--project <id>] [--max-parallel <n>] [--inherit <key>] [--inherit-all] [--json]
+bb orchestrator-mode scope --global|--project <id> [--child-messages queued|immediate] [--json]
 ```
 
 `--thread` defaults to the thread running the command, so an agent can inspect
 or change its own mode. Running turns receive a message when the mode changes.
 Session configuration is refreshed when the provider session is next
 constructed, but resuming may retain its original tool list.
+
+Direct messages from child threads queue by default until the orchestrator's
+current turn ends. BB retains their content and sender and releases messages
+as the orchestrator becomes idle. BB requires one sender per queued group,
+so reports from different children remain separate dispatches. Send now overrides the hold. The
+`childMessageDelivery` scope setting selects `queued` or `immediate`; use
+`--inherit childMessageDelivery` to clear a project's override. User messages,
+unrelated senders and idle orchestrators proceed immediately. Automatic child
+completion/failure/attention notices use BB's separate system delivery path
+and cannot be held by this plugin; waiting delegation tool results also return
+directly. Finish the current turn after delegating async work so queued child
+messages can reach you.
 
 ## Enforcement levels
 

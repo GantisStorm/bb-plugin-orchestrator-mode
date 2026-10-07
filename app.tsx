@@ -607,6 +607,23 @@ function ScopeSettings() {
           "Reminders per thread",
           "How many times this plugin may prod one thread. One budget covers both gates: doing the work itself, and leaving a worker unjudged. `bb orchestrator-mode status` reports the split. 0 turns reminders off, and violations are still recorded.",
         )}
+        {enumRow(
+          "childMessageDelivery",
+          "Child messages",
+          "When messages from child threads reach an orchestrator. BB's automatic completion notices use its own delivery path.",
+          [
+            {
+              value: "queued",
+              label: "queued until turn ends",
+              help: "Keeps child messages in BB's queue while the orchestrator is working, then releases them as the orchestrator becomes idle.",
+            },
+            {
+              value: "immediate",
+              label: "immediate",
+              help: "Lets each child message reach the running turn as it arrives.",
+            },
+          ],
+        )}
         {numberRow(
           "maxParallelWorkers",
           "Workers running at once",

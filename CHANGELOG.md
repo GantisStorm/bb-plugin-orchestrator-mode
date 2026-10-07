@@ -6,6 +6,18 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ## Unreleased
 
+### Added
+
+- Queue direct child messages while an orchestrator turn is running, using
+  BB's persistent queue and delivery when idle. Global/Project settings
+  and `scope --child-messages queued|immediate` control the policy. Automatic
+  child system notices still use BB's separate delivery path.
+
+### Fixed
+
+- Preserve the per-turn delegation budget when messages join a running turn
+  or wait in the queue; reset it only when a new turn starts.
+
 ## 0.1.3 - 2026-10-07
 
 ### Fixed
