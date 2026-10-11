@@ -1605,7 +1605,7 @@ export default async function plugin(bb: BbPluginApi) {
       .enum(WORKER_PRESETS)
       .optional()
       .describe(
-        "A named execution preset stored in the plugin settings, applied under this call's own arguments. Ask for one that is stored; the error names the ones that are.",
+        "A named execution preset stored in the plugin settings. Under the default `pinned` it is the only way to give this unit a different execution, because raw `model`, `provider` and `reasoning` are refused; under `flexible` this call's own arguments apply on top of it. Ask for one that is stored; the error names the ones that are.",
       ),
     verify: z
       .boolean()

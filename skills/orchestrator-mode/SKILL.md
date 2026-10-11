@@ -153,11 +153,12 @@ and a mechanical one a cheaper one. A refusal names the policy; re-delegate
 without the argument rather than asking for it again.
 
 `preset` names a kind of work the plugin has a saved setup for, such as `build`,
-`review` or `research`. Under `flexible` your own arguments beat the preset for
-that unit; under the default `pinned` the preset is how a unit gets a different
-execution, because raw `model`, `provider` and `reasoning` are refused. Naming
-one also titles the child `BUILD:`, `REVIEW:` or `RESEARCH:`, so the sidebar shows
-what it is doing.
+`review` or `research` when one of those is stored: the contract lists the stored
+kinds, and one that is not stored is refused rather than ignored. Under
+`flexible` your own arguments beat the preset for that unit; under the default
+`pinned` the preset is how a unit gets a different execution, because raw
+`model`, `provider` and `reasoning` are refused. Naming one also titles the child
+`BUILD:`, `REVIEW:` or `RESEARCH:`, so the sidebar shows what it is doing.
 
 `workspace` picks where the unit runs. `shared` (the default) uses the checkout
 you are in, so its edits are visible to you immediately. `worktree` gives the

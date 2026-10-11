@@ -1498,8 +1498,13 @@ export function buildInstructions(input: InstructionInput): string {
   // The names come from the shared list so this sentence cannot drift from the
   // runtime refusal that enforces it.
   const refusedArgs = PINNED_DELEGATION_FIELDS.map((field) => `\`${field}\``);
+  // A single-entry shared list would otherwise render "pass  or `model`", so the
+  // disjunction is built rather than assumed.
+  const refusedList = refusedArgs.length > 1
+    ? `${refusedArgs.slice(0, -1).join(", ")} or ${refusedArgs[refusedArgs.length - 1]}`
+    : refusedArgs[0];
   const modelBudget = pinnedPolicy
-    ? `${workerBudget(input.workerConfig)} Every worker runs on that execution${savedKinds.length === 0 ? "" : ", or on a stored kind it names as \`preset\`"}: do not pass ${refusedArgs.slice(0, -1).join(", ")} or ${refusedArgs[refusedArgs.length - 1]} on a delegation.${savedPresets}`
+    ? `${workerBudget(input.workerConfig)} Every worker runs on that execution${savedKinds.length === 0 ? "" : ", or on a stored kind it names as \`preset\`"}: do not pass ${refusedList} on a delegation.${savedPresets}`
     : `${workerBudget(input.workerConfig)} Override per delegation with \`model\`,
 \`provider\` (alias \`providerId\`), \`reasoning\` and \`permissionMode\`. Give a hard unit a stronger
 model, a mechanical one a cheaper one.${savedPresets}`;
