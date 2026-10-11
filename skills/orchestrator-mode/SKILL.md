@@ -153,7 +153,9 @@ and a mechanical one a cheaper one. A refusal names the policy; re-delegate
 without the argument rather than asking for it again.
 
 `preset` names a kind of work the plugin has a saved setup for, such as `build`,
-`review` or `research`. Your own arguments beat the preset for that unit. Naming
+`review` or `research`. Under `flexible` your own arguments beat the preset for
+that unit; under the default `pinned` the preset is how a unit gets a different
+execution, because raw `model`, `provider` and `reasoning` are refused. Naming
 one also titles the child `BUILD:`, `REVIEW:` or `RESEARCH:`, so the sidebar shows
 what it is doing.
 

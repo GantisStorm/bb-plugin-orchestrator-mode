@@ -31,6 +31,7 @@ import {
   DEFAULT_ENFORCEMENT,
   DELEGATE_TOOL,
   ENFORCEMENT_LEVELS,
+  PINNED_DELEGATION_FIELDS,
   PERMISSION_MODES,
   REASONING_LEVELS,
   REVIEW_TOOL,
@@ -1756,14 +1757,17 @@ export default async function plugin(bb: BbPluginApi) {
     // ruled out, and both the tool and the CLI delegate command route through
     // this handler.
     if (settingsFor(projectId).workerModelPolicy === "pinned") {
-      const asked = [
-        model === undefined ? null : "`model`",
-        pinnedProvider === undefined ? null : "`provider`",
-        reasoning === undefined ? null : "`reasoning`",
-      ].filter((part): part is string => part !== null);
+      // Field names come from the shared list, so the refusal cannot drift from
+      // the contract prose that promises it. The provider alias reports the
+      // spelling the caller actually passed: naming `provider` on a
+      // `providerId`-only call sends the orchestrator to the wrong argument.
+      const passedArgs = { model, provider: provider ?? providerId, reasoning };
+      const asked = PINNED_DELEGATION_FIELDS
+        .filter((field) => passedArgs[field] !== undefined)
+        .map((field) => `\`${field === "provider" && provider === undefined ? "providerId" : field}\``);
       if (asked.length > 0) {
         throw new Error(
-          `This project pins worker execution, so ${asked.join(", ")} cannot be set on a delegation. Workers run on the stored execution, or on a stored kind named as \`preset\`. Ask the user to switch the model policy to \`flexible\` to let a unit choose its own.`,
+          `This scope's worker model policy is \`pinned\`, so ${asked.join(", ")} cannot be set on a delegation. Workers run on the stored execution, or on a stored kind named as \`preset\`. Ask the user to switch the model policy to \`flexible\` to let a unit choose its own.`,
         );
       }
     }

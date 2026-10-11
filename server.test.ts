@@ -1553,7 +1553,7 @@ describe("the delegation tool", () => {
         { task: "The hard unit", model: "claude-opus-5-5", waitForResult: false },
         { threadId: THREAD, projectId: "proj_1" },
       ),
-    ).rejects.toThrow(/pins worker execution, so `model` cannot be set/);
+    ).rejects.toThrow(/worker model policy is `pinned`, so `model` cannot be set/);
     expect(spawned).toHaveLength(0);
   });
 
@@ -1566,7 +1566,20 @@ describe("the delegation tool", () => {
         : { task: "The hard unit", reasoning: "max" as const, waitForResult: false };
     await expect(
       harness.behavior.callAgentTool(DELEGATE_TOOL, args, { threadId: THREAD, projectId: "proj_1" }),
-    ).rejects.toThrow(new RegExp(`pins worker execution, so \`${field}\` cannot be set`));
+    ).rejects.toThrow(new RegExp(`worker model policy is \`pinned\`, so \`${field}\` cannot be set`));
+    expect(spawned).toHaveLength(0);
+  });
+
+  it("names the provider alias the caller actually passed", async () => {
+    const { harness } = await load({}, undefined, PIN_CATALOG);
+    await enable(harness);
+    await expect(
+      harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task: "The hard unit", providerId: "grok", waitForResult: false },
+        { threadId: THREAD, projectId: "proj_1" },
+      ),
+    ).rejects.toThrow(/`providerId` cannot be set/);
     expect(spawned).toHaveLength(0);
   });
 

@@ -117,6 +117,14 @@ export const WORKER_MODEL_POLICIES = ["pinned", "flexible"] as const;
 export type WorkerModelPolicy = (typeof WORKER_MODEL_POLICIES)[number];
 
 /**
+ * The delegation arguments a pinned scope refuses, in the order the contract
+ * prose and the runtime refusal name them. Shared so the two halves cannot
+ * drift: a field the runtime blocks while the prose omits it is a dead end the
+ * orchestrator cannot see.
+ */
+export const PINNED_DELEGATION_FIELDS = ["model", "provider", "reasoning"] as const;
+
+/**
  * What the plugin stores for workers: the execution every delegation starts on,
  * plus the one to retry with when a worker fails.
  *
@@ -1486,13 +1494,16 @@ export function buildInstructions(input: InstructionInput): string {
    * execution is the only one, plus any stored kind, because naming a raw model
    * is what moves a worker off that execution.
    */
-  const pinned = input.modelPolicy !== "flexible";
-  const modelBudget = pinned
-    ? `${workerBudget(input.workerConfig)} Every worker runs on that execution${savedKinds.length === 0 ? "" : ", or on a stored kind it names as \`preset\`"}: do not pass \`model\`, \`provider\` or \`reasoning\` on a delegation.${savedPresets}`
+  const pinnedPolicy = input.modelPolicy !== "flexible";
+  // The names come from the shared list so this sentence cannot drift from the
+  // runtime refusal that enforces it.
+  const refusedArgs = PINNED_DELEGATION_FIELDS.map((field) => `\`${field}\``);
+  const modelBudget = pinnedPolicy
+    ? `${workerBudget(input.workerConfig)} Every worker runs on that execution${savedKinds.length === 0 ? "" : ", or on a stored kind it names as \`preset\`"}: do not pass ${refusedArgs.slice(0, -1).join(", ")} or ${refusedArgs[refusedArgs.length - 1]} on a delegation.${savedPresets}`
     : `${workerBudget(input.workerConfig)} Override per delegation with \`model\`,
 \`provider\` (alias \`providerId\`), \`reasoning\` and \`permissionMode\`. Give a hard unit a stronger
 model, a mechanical one a cheaper one.${savedPresets}`;
-  const pinLine = pinned
+  const pinLine = pinnedPolicy
     ? ""
     : "   Pin with `--provider <id> --model <id>`; pinning does not require turning this mode off.\n";
 
