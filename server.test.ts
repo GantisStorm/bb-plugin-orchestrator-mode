@@ -73,6 +73,8 @@ let sentTexts: string[] = [];
 let stoppedThreads: string[] = [];
 let archivedThreads: string[] = [];
 let spawned: Record<string, unknown>[] = [];
+/** Children the fake host reports for any parent, as `threads.list` would. */
+let childThreads: { id: string }[] = [];
 
 /** Every loaded host, disposed after each test so no scan timer leaks into the next. */
 const hosts: FakePluginHarness[] = [];
@@ -194,6 +196,7 @@ async function load(
           return current;
         },
         timeline: async () => ({ rows: timelineRows, maxSeq: timelineMaxSeq }),
+        list: async () => childThreads,
         get: async ({ threadId }: { threadId: string }) =>
           makeThreadResponse({
             id: threadId,
@@ -250,6 +253,7 @@ beforeEach(() => {
   stoppedThreads = [];
   archivedThreads = [];
   spawned = [];
+  childThreads = [];
 });
 
 afterEach(async () => {
@@ -1022,6 +1026,61 @@ describe("the watchdog", () => {
     };
     expect(state.violations).toHaveLength(1);
     expect(state.nudgeCount).toBe(1);
+  });
+
+  it("treats a correction to a real child as coordination, not direct work", async () => {
+    const { bb, harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    // No delegation row exists for this child: the exemption has to come from
+    // the parent/child relationship, which is the only thing that says this
+    // orchestrator owns the thread it is correcting.
+    childThreads = [{ id: WORKER }];
+    timelineRows = [
+      ...timelineRows,
+      workRow({
+        id: "row_tell_child",
+        workKind: "command",
+        turnId: "turn_2",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 4,
+        command: `bb thread tell ${WORKER} 'HOLD: do not change the schema yet'`,
+      }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    // Await the scan cursor rather than a guessed delay. There is no nudge to
+    // wait for when the row is exempt, and the cursor is the real signal that
+    // the scan finished.
+    await vi.waitFor(async () => {
+      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+    });
+
+    expect(sentTexts).toEqual([]);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({ violations: [] });
+  });
+
+  it("still records a correction sent to a thread that is not its child", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    timelineRows = [
+      ...timelineRows,
+      workRow({
+        id: "row_tell_stranger",
+        workKind: "command",
+        turnId: "turn_2",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 4,
+        command: "bb thread tell thr_stranger 'HOLD: do not change the schema yet'",
+      }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+
+    await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      violations: unknown[];
+    };
+    expect(state.violations).toHaveLength(1);
   });
 
   it("stops the turn in block mode", async () => {

@@ -109,6 +109,13 @@ export const MAX_STATE_BYTES = 196_608;
 const MAX_VIOLATIONS = 100;
 const MAX_SEEN_ROWS = 500;
 const MAX_DELEGATIONS = 50;
+/**
+ * One page of a thread's children, read to keep the `bb thread tell` exemption
+ * covering children this plugin did not itself delegate. It bounds a scan's
+ * read; a parent with more children than this under-exempts rather than paging
+ * the host inside a dispatch hook.
+ */
+const MAX_CHILD_THREADS = 200;
 
 /** UTF-8 bytes of a JSON value, the unit the store's size budget is measured in. */
 const utf8Encoder = new TextEncoder();
@@ -2328,8 +2335,19 @@ export default async function plugin(bb: BbPluginApi) {
     // Incremental responses carry row patches instead of full rows. Nested
     // rows keep work visible after a completed turn collapses to a summary.
     const rows = asScanRows(timeline.delta?.upsertRows ?? timeline.rows);
-    // A worker may have been recorded while the timeline request was in flight.
-    const workerThreadIds = (await getState(threadId))?.delegations.map((worker) => worker.threadId) ?? [];
+    // A worker may have been recorded while the timeline request was in flight,
+    // and a child can exist without a delegation row of its own: the classifier
+    // exempts `bb thread tell` for either, because a correction sent to a thread
+    // this orchestrator owns is coordination, not work. One page is read, and a
+    // failed read leaves the delegation record as the only source rather than
+    // throwing out of a dispatch hook.
+    const workerThreadIds = [...new Set([
+      ...((await getState(threadId))?.delegations.map((worker) => worker.threadId) ?? []),
+      ...(await bb.sdk.threads
+        .list({ parentThreadId: threadId, limit: MAX_CHILD_THREADS })
+        .then((children) => children.flatMap((child) => (typeof child.id === "string" ? [child.id] : [])))
+        .catch(() => [] as string[])),
+    ])];
     const enabledAtMs = state.enabledAt === null ? 0 : Date.parse(state.enabledAt);
     // A missing or malformed maxSeq must not poison the cursor: Math.max(2, undefined) is NaN, which persists as null.
     const reportedMaxSeq = typeof timeline.maxSeq === "number" && Number.isFinite(timeline.maxSeq) ? timeline.maxSeq : 0;
