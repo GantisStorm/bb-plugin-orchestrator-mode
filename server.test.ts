@@ -73,8 +73,17 @@ let sentTexts: string[] = [];
 let stoppedThreads: string[] = [];
 let archivedThreads: string[] = [];
 let spawned: Record<string, unknown>[] = [];
-/** Children the fake host reports for any parent, as `threads.list` would. */
-let childThreads: { id: string }[] = [];
+/**
+ * Threads `threads.list` can return. A child is found by `parentThreadId`, a
+ * fork by `sourceThreadId` (its parent is null). A hidden thread is returned
+ * only when the caller passes `includeHidden`.
+ */
+let childThreads: {
+  id: string;
+  parentThreadId?: string | null;
+  sourceThreadId?: string | null;
+  hidden?: boolean;
+}[] = [];
 
 /** Every loaded host, disposed after each test so no scan timer leaks into the next. */
 const hosts: FakePluginHarness[] = [];
@@ -196,7 +205,17 @@ async function load(
           return current;
         },
         timeline: async () => ({ rows: timelineRows, maxSeq: timelineMaxSeq }),
-        list: async () => childThreads,
+        list: async (args: {
+          parentThreadId?: string;
+          sourceThreadId?: string;
+          includeHidden?: boolean;
+        } = {}) =>
+          childThreads.filter((child) => {
+            if (child.hidden === true && args.includeHidden !== true) return false;
+            if (args.parentThreadId !== undefined && child.parentThreadId !== args.parentThreadId) return false;
+            if (args.sourceThreadId !== undefined && child.sourceThreadId !== args.sourceThreadId) return false;
+            return true;
+          }),
         get: async ({ threadId }: { threadId: string }) =>
           makeThreadResponse({
             id: threadId,
@@ -1034,7 +1053,7 @@ describe("the watchdog", () => {
     // No delegation row exists for this child: the exemption has to come from
     // the parent/child relationship, which is the only thing that says this
     // orchestrator owns the thread it is correcting.
-    childThreads = [{ id: WORKER }];
+    childThreads = [{ id: WORKER, parentThreadId: THREAD }];
     timelineRows = [
       ...timelineRows,
       workRow({
@@ -1057,6 +1076,102 @@ describe("the watchdog", () => {
 
     expect(sentTexts).toEqual([]);
     expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({ violations: [] });
+    // Both ownership pages, including hidden threads. A scan that asks for only
+    // the visible children misses a fork and a worker kept out of the sidebar.
+    const lists = harness.inspection.sdk.callsTo("threads.list").map((call) => call[0]);
+    expect(lists).toEqual(expect.arrayContaining([
+      { parentThreadId: THREAD, includeHidden: true, limit: 200 },
+      { sourceThreadId: THREAD, includeHidden: true, limit: 200 },
+    ]));
+  });
+
+  it("treats a correction to an unrecorded fork as coordination", async () => {
+    const { bb, harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    // A fork stores the source on `sourceThreadId` and leaves `parentThreadId`
+    // null, so the parent page cannot see it. No delegation row either.
+    childThreads = [{ id: "th_fork", parentThreadId: null, sourceThreadId: THREAD }];
+    timelineRows = [
+      ...timelineRows,
+      workRow({
+        id: "row_tell_fork",
+        workKind: "command",
+        turnId: "turn_2",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 4,
+        command: "bb thread tell th_fork 'HOLD: do not change the schema yet'",
+      }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    await vi.waitFor(async () => {
+      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+    });
+
+    expect(sentTexts).toEqual([]);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({ violations: [] });
+  });
+
+  it("treats a correction to an unrecorded hidden child as coordination", async () => {
+    const { bb, harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    // Hidden, and not in the delegation record. The parent page returns it only
+    // when the scan asks for hidden threads.
+    childThreads = [{ id: "th_hidden", parentThreadId: THREAD, hidden: true }];
+    timelineRows = [
+      ...timelineRows,
+      workRow({
+        id: "row_tell_hidden",
+        workKind: "command",
+        turnId: "turn_2",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 4,
+        command: "bb thread tell th_hidden 'HOLD: do not change the schema yet'",
+      }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    await vi.waitFor(async () => {
+      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+    });
+
+    expect(sentTexts).toEqual([]);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({ violations: [] });
+  });
+
+  it("keeps a recorded hidden delegation exempt when the child pages omit it", async () => {
+    const { bb, harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    // The worker was spawned hidden and the list pages do not return it. The
+    // delegation record is the remaining reason a correction is coordination.
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Review the implementation", hidden: true, waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    childThreads = [];
+    timelineRows = [
+      ...timelineRows,
+      workRow({
+        id: "row_tell_recorded_hidden",
+        workKind: "command",
+        turnId: "turn_2",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 4,
+        command: `bb thread tell ${WORKER} 'HOLD: do not change the schema yet'`,
+      }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    await vi.waitFor(async () => {
+      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+    });
+
+    expect(sentTexts).toEqual([]);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      violations: [],
+      delegations: [{ threadId: WORKER }],
+    });
   });
 
   it("still records a correction sent to a thread that is not its child", async () => {

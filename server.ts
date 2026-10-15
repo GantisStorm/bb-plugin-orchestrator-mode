@@ -111,10 +111,11 @@ const MAX_VIOLATIONS = 100;
 const MAX_SEEN_ROWS = 500;
 const MAX_DELEGATIONS = 50;
 /**
- * One page of a thread's children, read to keep the `bb thread tell` exemption
- * covering children this plugin did not itself delegate. It bounds a scan's
- * read; a parent with more children than this under-exempts rather than paging
- * the host inside a dispatch hook.
+ * One page each of a thread's children and of its forks, read so the
+ * `bb thread tell` exemption covers threads this plugin did not itself
+ * delegate. Hidden threads count: a worker kept out of the sidebar is still
+ * owned. The cap bounds each read; a parent with more than this under-exempts
+ * rather than paging the host from a scan.
  */
 const MAX_CHILD_THREADS = 200;
 
@@ -2340,17 +2341,36 @@ export default async function plugin(bb: BbPluginApi) {
     // rows keep work visible after a completed turn collapses to a summary.
     const rows = asScanRows(timeline.delta?.upsertRows ?? timeline.rows);
     // A worker may have been recorded while the timeline request was in flight,
-    // and a child can exist without a delegation row of its own: the classifier
-    // exempts `bb thread tell` for either, because a correction sent to a thread
-    // this orchestrator owns is coordination, not work. One page is read, and a
-    // failed read leaves the delegation record as the only source rather than
-    // throwing out of a dispatch hook.
+    // and a thread this orchestrator owns can exist without a delegation row.
+    // A child keeps `parentThreadId`; a fork keeps `sourceThreadId` and a null
+    // parent. Hidden threads are included, because a worker kept out of the
+    // sidebar is still owned. The classifier exempts `bb thread tell` for any
+    // of them: a correction sent to a thread this orchestrator owns is
+    // coordination, not work. Each read is one page, and a failed read
+    // contributes nothing, so the scan keeps the delegation record and the
+    // page that did succeed instead of throwing out of the scan.
+    async function listedIds(
+      filter: { parentThreadId: string } | { sourceThreadId: string },
+    ): Promise<string[]> {
+      try {
+        const children = await bb.sdk.threads.list({
+          ...filter,
+          includeHidden: true,
+          limit: MAX_CHILD_THREADS,
+        });
+        return children.flatMap((child) => (typeof child.id === "string" ? [child.id] : []));
+      } catch {
+        return [];
+      }
+    }
+    const [childIds, forkIds] = await Promise.all([
+      listedIds({ parentThreadId: threadId }),
+      listedIds({ sourceThreadId: threadId }),
+    ]);
     const workerThreadIds = [...new Set([
       ...((await getState(threadId))?.delegations.map((worker) => worker.threadId) ?? []),
-      ...(await bb.sdk.threads
-        .list({ parentThreadId: threadId, limit: MAX_CHILD_THREADS })
-        .then((children) => children.flatMap((child) => (typeof child.id === "string" ? [child.id] : [])))
-        .catch(() => [] as string[])),
+      ...childIds,
+      ...forkIds,
     ])];
     const enabledAtMs = state.enabledAt === null ? 0 : Date.parse(state.enabledAt);
     // A missing or malformed maxSeq must not poison the cursor: Math.max(2, undefined) is NaN, which persists as null.
