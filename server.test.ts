@@ -73,6 +73,17 @@ let sentTexts: string[] = [];
 let stoppedThreads: string[] = [];
 let archivedThreads: string[] = [];
 let spawned: Record<string, unknown>[] = [];
+/**
+ * Threads `threads.list` can return. A child is found by `parentThreadId`, a
+ * fork by `sourceThreadId` (its parent is null). A hidden thread is returned
+ * only when the caller passes `includeHidden`.
+ */
+let childThreads: {
+  id: string;
+  parentThreadId?: string | null;
+  sourceThreadId?: string | null;
+  hidden?: boolean;
+}[] = [];
 
 /** Every loaded host, disposed after each test so no scan timer leaks into the next. */
 const hosts: FakePluginHarness[] = [];
@@ -194,6 +205,17 @@ async function load(
           return current;
         },
         timeline: async () => ({ rows: timelineRows, maxSeq: timelineMaxSeq }),
+        list: async (args: {
+          parentThreadId?: string;
+          sourceThreadId?: string;
+          includeHidden?: boolean;
+        } = {}) =>
+          childThreads.filter((child) => {
+            if (child.hidden === true && args.includeHidden !== true) return false;
+            if (args.parentThreadId !== undefined && child.parentThreadId !== args.parentThreadId) return false;
+            if (args.sourceThreadId !== undefined && child.sourceThreadId !== args.sourceThreadId) return false;
+            return true;
+          }),
         get: async ({ threadId }: { threadId: string }) =>
           makeThreadResponse({
             id: threadId,
@@ -250,6 +272,7 @@ beforeEach(() => {
   stoppedThreads = [];
   archivedThreads = [];
   spawned = [];
+  childThreads = [];
 });
 
 afterEach(async () => {
@@ -1024,6 +1047,157 @@ describe("the watchdog", () => {
     expect(state.nudgeCount).toBe(1);
   });
 
+  it("treats a correction to a real child as coordination, not direct work", async () => {
+    const { bb, harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    // No delegation row exists for this child: the exemption has to come from
+    // the parent/child relationship, which is the only thing that says this
+    // orchestrator owns the thread it is correcting.
+    childThreads = [{ id: WORKER, parentThreadId: THREAD }];
+    timelineRows = [
+      ...timelineRows,
+      workRow({
+        id: "row_tell_child",
+        workKind: "command",
+        turnId: "turn_2",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 4,
+        command: `bb thread tell ${WORKER} 'HOLD: do not change the schema yet'`,
+      }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    // Await the scan cursor rather than a guessed delay. There is no nudge to
+    // wait for when the row is exempt, and the cursor is the real signal that
+    // the scan finished.
+    await vi.waitFor(async () => {
+      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+    });
+
+    expect(sentTexts).toEqual([]);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({ violations: [] });
+    // Both ownership pages, including hidden threads. A scan that asks for only
+    // the visible children misses a fork and a worker kept out of the sidebar.
+    const lists = harness.inspection.sdk.callsTo("threads.list").map((call) => call[0]);
+    expect(lists).toEqual(expect.arrayContaining([
+      { parentThreadId: THREAD, includeHidden: true, limit: 200 },
+      { sourceThreadId: THREAD, includeHidden: true, limit: 200 },
+    ]));
+  });
+
+  it("treats a correction to an unrecorded fork as coordination", async () => {
+    const { bb, harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    // A fork stores the source on `sourceThreadId` and leaves `parentThreadId`
+    // null, so the parent page cannot see it. No delegation row either.
+    childThreads = [{ id: "th_fork", parentThreadId: null, sourceThreadId: THREAD }];
+    timelineRows = [
+      ...timelineRows,
+      workRow({
+        id: "row_tell_fork",
+        workKind: "command",
+        turnId: "turn_2",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 4,
+        command: "bb thread tell th_fork 'HOLD: do not change the schema yet'",
+      }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    await vi.waitFor(async () => {
+      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+    });
+
+    expect(sentTexts).toEqual([]);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({ violations: [] });
+  });
+
+  it("treats a correction to an unrecorded hidden child as coordination", async () => {
+    const { bb, harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    // Hidden, and not in the delegation record. The parent page returns it only
+    // when the scan asks for hidden threads.
+    childThreads = [{ id: "th_hidden", parentThreadId: THREAD, hidden: true }];
+    timelineRows = [
+      ...timelineRows,
+      workRow({
+        id: "row_tell_hidden",
+        workKind: "command",
+        turnId: "turn_2",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 4,
+        command: "bb thread tell th_hidden 'HOLD: do not change the schema yet'",
+      }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    await vi.waitFor(async () => {
+      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+    });
+
+    expect(sentTexts).toEqual([]);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({ violations: [] });
+  });
+
+  it("keeps a recorded hidden delegation exempt when the child pages omit it", async () => {
+    const { bb, harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    // The worker was spawned hidden and the list pages do not return it. The
+    // delegation record is the remaining reason a correction is coordination.
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Review the implementation", hidden: true, waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    childThreads = [];
+    timelineRows = [
+      ...timelineRows,
+      workRow({
+        id: "row_tell_recorded_hidden",
+        workKind: "command",
+        turnId: "turn_2",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 4,
+        command: `bb thread tell ${WORKER} 'HOLD: do not change the schema yet'`,
+      }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    await vi.waitFor(async () => {
+      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+    });
+
+    expect(sentTexts).toEqual([]);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      violations: [],
+      delegations: [{ threadId: WORKER }],
+    });
+  });
+
+  it("still records a correction sent to a thread that is not its child", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    timelineRows = [
+      ...timelineRows,
+      workRow({
+        id: "row_tell_stranger",
+        workKind: "command",
+        turnId: "turn_2",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 4,
+        command: "bb thread tell thr_stranger 'HOLD: do not change the schema yet'",
+      }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+
+    await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      violations: unknown[];
+    };
+    expect(state.violations).toHaveLength(1);
+  });
+
   it("stops the turn in block mode", async () => {
     const { harness } = await load({ enforcement: "block" });
     await arm(harness);
@@ -1391,7 +1565,7 @@ describe("the delegation tool", () => {
   });
 
   it.each(["provider", "providerId"])("pins %s and the model before starting a worker", async (field) => {
-    const { harness } = await load({}, undefined, PIN_CATALOG);
+    const { harness } = await load({ workerModelPolicy: "flexible" }, undefined, PIN_CATALOG);
     await enable(harness);
     await harness.behavior.callAgentTool(
       DELEGATE_TOOL,
@@ -1421,7 +1595,7 @@ describe("the delegation tool", () => {
     { providerId: "grok" },
     { model: "grok-test-model" },
   ])("supports an individual worker pin: %j", async (pins) => {
-    const { harness } = await load({}, undefined, PIN_CATALOG);
+    const { harness } = await load({ workerModelPolicy: "flexible" }, undefined, PIN_CATALOG);
     await enable(harness);
     await harness.behavior.callAgentTool(
       DELEGATE_TOOL,
@@ -1435,7 +1609,7 @@ describe("the delegation tool", () => {
   });
 
   it.each(["provider", "providerId"])("normalises whitespace in %s and model pins", async (field) => {
-    const { harness } = await load({}, undefined, PIN_CATALOG);
+    const { harness } = await load({ workerModelPolicy: "flexible" }, undefined, PIN_CATALOG);
     await enable(harness);
     await harness.behavior.callAgentTool(
       DELEGATE_TOOL,
@@ -1464,7 +1638,7 @@ describe("the delegation tool", () => {
   });
 
   it("does not fall back to an unpinned worker when BB rejects the pins", async () => {
-    const { harness } = await load({}, undefined, PIN_CATALOG);
+    const { harness } = await load({ workerModelPolicy: "flexible" }, undefined, PIN_CATALOG);
     await enable(harness);
     harness.inspection.sdk.stub("threads.spawn", async () => {
       throw new Error("requested provider/model unavailable");
@@ -1481,6 +1655,80 @@ describe("the delegation tool", () => {
     expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
       delegations: [],
     });
+  });
+
+  it("refuses a raw model pin under the pinned default", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await enable(harness);
+    // The default is pinned, so a delegation cannot move a worker off the scope's
+    // execution — not even upward.
+    await expect(
+      harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task: "The hard unit", model: "claude-opus-5-5", waitForResult: false },
+        { threadId: THREAD, projectId: "proj_1" },
+      ),
+    ).rejects.toThrow(/worker model policy is `pinned`, so `model` cannot be set/);
+    expect(spawned).toHaveLength(0);
+  });
+
+  it.each(["provider", "reasoning"])("refuses a raw %s pin under the pinned default", async (field) => {
+    const { harness } = await load({}, undefined, PIN_CATALOG);
+    await enable(harness);
+    const args =
+      field === "provider"
+        ? { task: "The hard unit", provider: "grok", waitForResult: false }
+        : { task: "The hard unit", reasoning: "max" as const, waitForResult: false };
+    await expect(
+      harness.behavior.callAgentTool(DELEGATE_TOOL, args, { threadId: THREAD, projectId: "proj_1" }),
+    ).rejects.toThrow(new RegExp(`worker model policy is \`pinned\`, so \`${field}\` cannot be set`));
+    expect(spawned).toHaveLength(0);
+  });
+
+  it("names the provider alias the caller actually passed", async () => {
+    const { harness } = await load({}, undefined, PIN_CATALOG);
+    await enable(harness);
+    await expect(
+      harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task: "The hard unit", providerId: "grok", waitForResult: false },
+        { threadId: THREAD, projectId: "proj_1" },
+      ),
+    ).rejects.toThrow(/`providerId` cannot be set/);
+    expect(spawned).toHaveLength(0);
+  });
+
+  it("still runs a stored preset under the pinned default", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      presets: { research: { model: "claude-opus-5-5" } },
+    });
+    await enable(harness);
+    // A kind the user saved is their own choice, so pinned leaves it reachable.
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Research it", preset: "research", waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned[0]).toMatchObject({ model: "claude-opus-5-5" });
+  });
+
+  it("lets a scope opt into flexible, and then a delegation picks its own model", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await enable(harness);
+    await harness.behavior.callRpc("set_scope_setting", {
+      projectId: "proj_1",
+      key: "workerModelPolicy",
+      value: "flexible",
+    });
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "The hard unit", model: "claude-opus-5-5", waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned[0]).toMatchObject({ model: "claude-opus-5-5" });
   });
 
   it("returns immediately when asked not to wait", async () => {
@@ -1596,7 +1844,7 @@ describe("the delegation tool", () => {
   });
 
   it("lets one delegation override the stored worker execution", async () => {
-    const { harness } = await load({}, undefined, CATALOG);
+    const { harness } = await load({ workerModelPolicy: "flexible" }, undefined, CATALOG);
     await harness.behavior.callRpc("set_worker_execution", {
       providerId: "acp-omp",
       model: "command-code/deepseek/deepseek-v4.1-flash-fast",
@@ -1836,7 +2084,7 @@ describe("the delegation tool", () => {
   });
 
   it("refuses a worker model the catalog does not offer", async () => {
-    const { harness } = await load({}, undefined, CATALOG);
+    const { harness } = await load({ workerModelPolicy: "flexible" }, undefined, CATALOG);
     await enable(harness);
     await expect(
       harness.behavior.callAgentTool(
@@ -2381,7 +2629,7 @@ describe("the delegation tool", () => {
   });
 
   it("lets a call's own arguments beat the preset", async () => {
-    const { harness } = await load({}, undefined, CATALOG);
+    const { harness } = await load({ workerModelPolicy: "flexible" }, undefined, CATALOG);
     await harness.behavior.callRpc("set_worker_execution", {
       providerId: "acp-omp",
       model: "command-code/deepseek/deepseek-v4.1-flash-fast",
@@ -2638,6 +2886,7 @@ describe("rpc", () => {
       maxParallelWorkers: 8,
       maxDelegationsPerTurn: 20,
       contractPreset: "standard",
+      workerModelPolicy: "pinned",
       workerRetention: "keep",
       workerWorkspace: "shared",
       childMessageDelivery: "queued",
@@ -3043,7 +3292,7 @@ describe("cli", () => {
   });
 
   it("pins the requested provider and model through CLI delegation", async () => {
-    const { harness } = await load({}, undefined, PIN_CATALOG);
+    const { harness } = await load({ workerModelPolicy: "flexible" }, undefined, PIN_CATALOG);
     await enable(harness);
     const result = await harness.behavior.runCli([
       "delegate", "--task", "Probe the contract and scope",
@@ -3060,7 +3309,7 @@ describe("cli", () => {
   });
 
   it.each(["--provider-id", "--providerId"])("accepts the %s CLI alias", async (flag) => {
-    const { harness } = await load({}, undefined, PIN_CATALOG);
+    const { harness } = await load({ workerModelPolicy: "flexible" }, undefined, PIN_CATALOG);
     await enable(harness);
     const result = await harness.behavior.runCli([
       "delegate", "--task", "Probe the scope", flag, "grok",
@@ -3071,7 +3320,7 @@ describe("cli", () => {
   });
 
   it("accepts matching provider aliases after trimming", async () => {
-    const { harness } = await load({}, undefined, PIN_CATALOG);
+    const { harness } = await load({ workerModelPolicy: "flexible" }, undefined, PIN_CATALOG);
     await enable(harness);
     await harness.behavior.callAgentTool(DELEGATE_TOOL, {
       task: "Probe matching aliases", provider: " grok ", providerId: "grok",
@@ -3081,7 +3330,7 @@ describe("cli", () => {
   });
 
   it("refuses conflicting provider aliases without spawning", async () => {
-    const { harness } = await load({}, undefined, PIN_CATALOG);
+    const { harness } = await load({ workerModelPolicy: "flexible" }, undefined, PIN_CATALOG);
     await enable(harness);
     await expect(harness.behavior.callAgentTool(DELEGATE_TOOL, {
       task: "Probe conflicting aliases", provider: "grok", providerId: "other",
@@ -3091,7 +3340,7 @@ describe("cli", () => {
   });
 
   it.each(["provider", "providerId"])("does not retarget an unknown %s to the model owner", async (field) => {
-    const { harness } = await load({}, undefined, PIN_CATALOG);
+    const { harness } = await load({ workerModelPolicy: "flexible" }, undefined, PIN_CATALOG);
     await enable(harness);
     await expect(harness.behavior.callAgentTool(DELEGATE_TOOL, {
       task: "Probe unknown pins", [field]: "other", model: "grok-test-model",
@@ -3101,7 +3350,7 @@ describe("cli", () => {
   });
 
   it.each(["provider", "providerId"])("refuses a model incompatible with the pinned %s", async (field) => {
-    const { harness } = await load({}, undefined, {
+    const { harness } = await load({ workerModelPolicy: "flexible" }, undefined, {
       providers: [...CATALOG.providers!, ...PIN_CATALOG.providers!],
       models: { ...CATALOG.models, ...PIN_CATALOG.models },
     });

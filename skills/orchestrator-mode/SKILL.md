@@ -145,14 +145,20 @@ it when you cannot judge a unit from its report alone.
 ## Choosing the worker's execution
 
 Workers run on the provider, model and access the settings section's worker rows
-name, falling back to this project's remembered defaults. Override those for one
-unit with `provider`, `model`, `reasoning` and `permissionMode`. Give a hard unit
-a stronger model and a mechanical one a cheaper model.
+name, falling back to this project's remembered defaults. The scope is pinned by
+default, so a delegation must not pass `provider`, `model` or `reasoning`: every
+worker runs on what the settings say. Only when the user switches the scope to
+`flexible` do those three work, and then a hard unit may take a stronger model
+and a mechanical one a cheaper one. A refusal names the policy; re-delegate
+without the argument rather than asking for it again.
 
 `preset` names a kind of work the plugin has a saved setup for, such as `build`,
-`review` or `research`. Your own arguments beat the preset for that unit. Naming
-one also titles the child `BUILD:`, `REVIEW:` or `RESEARCH:`, so the sidebar shows
-what it is doing.
+`review` or `research` when one of those is stored: the contract lists the stored
+kinds, and one that is not stored is refused rather than ignored. Under
+`flexible` your own arguments beat the preset for that unit; under the default
+`pinned` the preset is how a unit gets a different execution, because raw
+`model`, `provider` and `reasoning` are refused. Naming one also titles the child
+`BUILD:`, `REVIEW:` or `RESEARCH:`, so the sidebar shows what it is doing.
 
 `workspace` picks where the unit runs. `shared` (the default) uses the checkout
 you are in, so its edits are visible to you immediately. `worktree` gives the

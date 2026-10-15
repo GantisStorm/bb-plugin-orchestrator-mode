@@ -31,10 +31,12 @@ import {
   DEFAULT_ENFORCEMENT,
   DELEGATE_TOOL,
   ENFORCEMENT_LEVELS,
+  PINNED_DELEGATION_FIELDS,
   PERMISSION_MODES,
   REASONING_LEVELS,
   REVIEW_TOOL,
   REVIEW_VERDICTS,
+  WORKER_MODEL_POLICIES,
   WORKER_PRESETS,
   SERVICE_TIERS,
   EXTRA_INSTRUCTION_LIMIT,
@@ -62,6 +64,7 @@ import {
   type WorkRowLike,
   type WorkerExecution,
   type WorkerModelOption,
+  type WorkerModelPolicy,
 } from "./shared";
 
 export { DELEGATE_TOOL };
@@ -107,6 +110,14 @@ export const MAX_STATE_BYTES = 196_608;
 const MAX_VIOLATIONS = 100;
 const MAX_SEEN_ROWS = 500;
 const MAX_DELEGATIONS = 50;
+/**
+ * One page each of a thread's children and of its forks, read so the
+ * `bb thread tell` exemption covers threads this plugin did not itself
+ * delegate. Hidden threads count: a worker kept out of the sidebar is still
+ * owned. The cap bounds each read; a parent with more than this under-exempts
+ * rather than paging the host from a scan.
+ */
+const MAX_CHILD_THREADS = 200;
 
 /** UTF-8 bytes of a JSON value, the unit the store's size budget is measured in. */
 const utf8Encoder = new TextEncoder();
@@ -305,6 +316,18 @@ export const WORKER_RETENTION_DESCRIPTIONS: Record<WorkerRetention, string> = {
   "archive-all": "Archive-all archives every worker once the orchestrator has read its result.",
 };
 
+/**
+ * One line per model policy, for the settings row. Pinned is the default: an
+ * orchestrator that reaches for a stronger model than the scope wants is the
+ * reason this setting exists.
+ */
+export const WORKER_MODEL_POLICY_DESCRIPTIONS: Record<WorkerModelPolicy, string> = {
+  pinned:
+    "Pinned holds every worker on the execution below, or on a stored kind it names as a preset: a delegation that passes `model`, `provider` or `reasoning` is refused. Use it so no unit is upgraded or downgraded behind your back.",
+  flexible:
+    "Flexible lets a delegation set its own `model`, `provider` and `reasoning`, so the orchestrator can give a hard unit a stronger model. The contract tells it to.",
+};
+
 /** A project id, as the scope RPCs take it. */
 const projectIdSchema = z.object({ projectId: z.string().min(1).max(120) });
 
@@ -316,6 +339,7 @@ const SETTINGS_KEYS = [
   "maxParallelWorkers",
   "maxDelegationsPerTurn",
   "contractPreset",
+  "workerModelPolicy",
   "workerRetention",
   "workerWorkspace",
   "childMessageDelivery",
@@ -330,6 +354,7 @@ const settingsViewSchema = z.object({
   maxParallelWorkers: z.number(),
   maxDelegationsPerTurn: z.number(),
   contractPreset: z.enum(CONTRACT_PRESETS),
+  workerModelPolicy: z.enum(WORKER_MODEL_POLICIES),
   workerRetention: z.enum(WORKER_RETENTION),
   workerWorkspace: z.enum(WORKER_WORKSPACES),
   childMessageDelivery: z.enum(["queued", "immediate"]),
@@ -534,6 +559,7 @@ export default async function plugin(bb: BbPluginApi) {
     maxParallelWorkers: number;
     maxDelegationsPerTurn: number;
     contractPreset: ContractPresetId;
+    workerModelPolicy: WorkerModelPolicy;
     workerRetention: WorkerRetention;
     workerWorkspace: WorkerWorkspace;
     childMessageDelivery: "queued" | "immediate";
@@ -561,6 +587,7 @@ export default async function plugin(bb: BbPluginApi) {
     maxParallelWorkers: 8,
     maxDelegationsPerTurn: 20,
     contractPreset: "standard",
+    workerModelPolicy: "pinned",
     workerRetention: "keep",
     workerWorkspace: "shared",
     childMessageDelivery: "queued",
@@ -713,6 +740,9 @@ export default async function plugin(bb: BbPluginApi) {
       contractPreset: isOneOf(CONTRACT_PRESETS, values.contractPreset)
         ? values.contractPreset
         : base.contractPreset,
+      workerModelPolicy: isOneOf(WORKER_MODEL_POLICIES, values.workerModelPolicy)
+        ? values.workerModelPolicy
+        : base.workerModelPolicy,
       workerRetention: isOneOf(WORKER_RETENTION, values.workerRetention)
         ? values.workerRetention
         : base.workerRetention,
@@ -1069,6 +1099,7 @@ export default async function plugin(bb: BbPluginApi) {
       workerConfig: workerFor(project),
       extra: rulesFor(project),
       preset: settings.contractPreset,
+      modelPolicy: settings.workerModelPolicy,
       workspace: settings.workerWorkspace,
     });
   }
@@ -1575,7 +1606,7 @@ export default async function plugin(bb: BbPluginApi) {
       .enum(WORKER_PRESETS)
       .optional()
       .describe(
-        "A named execution preset stored in the plugin settings, applied under this call's own arguments. Ask for one that is stored; the error names the ones that are.",
+        "A named execution preset stored in the plugin settings. Under the default `pinned` it is the only way to give this unit a different execution, because raw `model`, `provider` and `reasoning` are refused; under `flexible` this call's own arguments apply on top of it. Ask for one that is stored; the error names the ones that are.",
       ),
     verify: z
       .boolean()
@@ -1721,6 +1752,26 @@ export default async function plugin(bb: BbPluginApi) {
     // orchestrator believing it had asked for a different model. The project's
     // worker configuration is the one that applies, global values under it.
     const workerConfig = workerFor(projectId);
+    const pinnedProvider = provider ?? providerId;
+    // A pinned scope runs every worker on the stored execution, or on a stored
+    // kind it names: refusing here beats spawning a worker on a model the scope
+    // ruled out, and both the tool and the CLI delegate command route through
+    // this handler.
+    if (settingsFor(projectId).workerModelPolicy === "pinned") {
+      // Field names come from the shared list, so the refusal cannot drift from
+      // the contract prose that promises it. The provider alias reports the
+      // spelling the caller actually passed: naming `provider` on a
+      // `providerId`-only call sends the orchestrator to the wrong argument.
+      const passedArgs = { model, provider: provider ?? providerId, reasoning };
+      const asked = PINNED_DELEGATION_FIELDS
+        .filter((field) => passedArgs[field] !== undefined)
+        .map((field) => `\`${field === "provider" && provider === undefined ? "providerId" : field}\``);
+      if (asked.length > 0) {
+        throw new Error(
+          `This scope's worker model policy is \`pinned\`, so ${asked.join(", ")} cannot be set on a delegation. Workers run on the stored execution, or on a stored kind named as \`preset\`. Ask the user to switch the model policy to \`flexible\` to let a unit choose its own.`,
+        );
+      }
+    }
     let presetExec: WorkerExecution = {};
     if (preset !== undefined) {
       const stored = workerConfig.presets?.[preset];
@@ -1736,7 +1787,6 @@ export default async function plugin(bb: BbPluginApi) {
     // Per-delegation arguments win over a preset, which wins over the worker
     // settings; a field none of them names is left out so the worker resolves
     // the project default.
-    const pinnedProvider = provider ?? providerId;
     if (provider !== undefined && providerId !== undefined && provider !== providerId) {
       throw new Error("provider and providerId must match when both are supplied.");
     }
@@ -2124,6 +2174,7 @@ export default async function plugin(bb: BbPluginApi) {
         workerConfig: workerFor(context.project.id),
         extra: rulesFor(context.project.id),
         preset: settings.contractPreset,
+        modelPolicy: settings.workerModelPolicy,
         workspace: settings.workerWorkspace,
       }),
     };
@@ -2289,8 +2340,38 @@ export default async function plugin(bb: BbPluginApi) {
     // Incremental responses carry row patches instead of full rows. Nested
     // rows keep work visible after a completed turn collapses to a summary.
     const rows = asScanRows(timeline.delta?.upsertRows ?? timeline.rows);
-    // A worker may have been recorded while the timeline request was in flight.
-    const workerThreadIds = (await getState(threadId))?.delegations.map((worker) => worker.threadId) ?? [];
+    // A worker may have been recorded while the timeline request was in flight,
+    // and a thread this orchestrator owns can exist without a delegation row.
+    // A child keeps `parentThreadId`; a fork keeps `sourceThreadId` and a null
+    // parent. Hidden threads are included, because a worker kept out of the
+    // sidebar is still owned. The classifier exempts `bb thread tell` for any
+    // of them: a correction sent to a thread this orchestrator owns is
+    // coordination, not work. Each read is one page, and a failed read
+    // contributes nothing, so the scan keeps the delegation record and the
+    // page that did succeed instead of throwing out of the scan.
+    async function listedIds(
+      filter: { parentThreadId: string } | { sourceThreadId: string },
+    ): Promise<string[]> {
+      try {
+        const children = await bb.sdk.threads.list({
+          ...filter,
+          includeHidden: true,
+          limit: MAX_CHILD_THREADS,
+        });
+        return children.flatMap((child) => (typeof child.id === "string" ? [child.id] : []));
+      } catch {
+        return [];
+      }
+    }
+    const [childIds, forkIds] = await Promise.all([
+      listedIds({ parentThreadId: threadId }),
+      listedIds({ sourceThreadId: threadId }),
+    ]);
+    const workerThreadIds = [...new Set([
+      ...((await getState(threadId))?.delegations.map((worker) => worker.threadId) ?? []),
+      ...childIds,
+      ...forkIds,
+    ])];
     const enabledAtMs = state.enabledAt === null ? 0 : Date.parse(state.enabledAt);
     // A missing or malformed maxSeq must not poison the cursor: Math.max(2, undefined) is NaN, which persists as null.
     const reportedMaxSeq = typeof timeline.maxSeq === "number" && Number.isFinite(timeline.maxSeq) ? timeline.maxSeq : 0;
@@ -2730,6 +2811,7 @@ export default async function plugin(bb: BbPluginApi) {
     "max-parallel"?: number;
     "max-per-turn"?: number;
     "contract-preset"?: ContractPresetId;
+    "model-policy"?: WorkerModelPolicy;
     retention?: WorkerRetention;
     "worker-workspace"?: WorkerWorkspace;
     "child-messages"?: "queued" | "immediate";
@@ -2747,6 +2829,9 @@ export default async function plugin(bb: BbPluginApi) {
       ...(options["contract-preset"] === undefined
         ? {}
         : { contractPreset: options["contract-preset"] }),
+      ...(options["model-policy"] === undefined
+        ? {}
+        : { workerModelPolicy: options["model-policy"] }),
       ...(options.retention === undefined ? {} : { workerRetention: options.retention }),
       ...(options["worker-workspace"] === undefined
         ? {}
@@ -2983,6 +3068,12 @@ export default async function plugin(bb: BbPluginApi) {
               values: [...CONTRACT_PRESETS],
               description: "Write that scope's contract level: standard, review-heavy, or delegate-only",
             },
+            "model-policy": {
+              type: "enum",
+              values: [...WORKER_MODEL_POLICIES],
+              description:
+                "Write that scope's worker model policy: pinned (the default) holds every worker on the stored execution or a stored preset, flexible lets a delegation choose its own",
+            },
             retention: {
               type: "enum",
               values: [...WORKER_RETENTION],
@@ -3081,6 +3172,7 @@ export default async function plugin(bb: BbPluginApi) {
                   `  reminders per thread: ${values.maxNudges}`,
                   `  fan-out cap:          ${values.maxParallelWorkers === 0 ? "none" : `${values.maxParallelWorkers} in flight`}, ${values.maxDelegationsPerTurn === 0 ? "none" : `${values.maxDelegationsPerTurn} per turn`}`,
                   `  contract shape:       ${values.contractPreset}`,
+                  `  worker model policy:  ${values.workerModelPolicy}`,
                   `  worker retention:     ${values.workerRetention}`,
                   `  worker workspace:     ${values.workerWorkspace}`,
                   `  child messages:       ${values.childMessageDelivery}`,
@@ -3138,6 +3230,7 @@ export default async function plugin(bb: BbPluginApi) {
                 `  reminders per thread: ${values.maxNudges}${view.overridden.includes("maxNudges") ? " (project)" : " (global)"}`,
                 `  fan-out cap:         ${values.maxParallelWorkers === 0 ? "none" : `${values.maxParallelWorkers} in flight`}, ${values.maxDelegationsPerTurn === 0 ? "none" : `${values.maxDelegationsPerTurn} per turn`}`,
                 `  contract shape:      ${values.contractPreset}${view.overridden.includes("contractPreset") ? " (project)" : " (global)"}`,
+                `  worker model policy: ${values.workerModelPolicy}${view.overridden.includes("workerModelPolicy") ? " (project)" : " (global)"}`,
                 `  worker retention:    ${values.workerRetention}${view.overridden.includes("workerRetention") ? " (project)" : " (global)"}`,
                 `  worker workspace:    ${values.workerWorkspace}${view.overridden.includes("workerWorkspace") ? " (project)" : " (global)"}`,
                 `  child messages:      ${values.childMessageDelivery}${view.overridden.includes("childMessageDelivery") ? " (project)" : " (global)"}`,
