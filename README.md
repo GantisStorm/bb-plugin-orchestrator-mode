@@ -195,6 +195,15 @@ pair rather than a switch:
   a delegation that passes `model`, `provider` or `reasoning` is refused, and the
   contract stops inviting one. Flexible lets the orchestrator ask for a stronger
   or cheaper model for a single unit instead.
+- **Orchestrator subagents** `Read-only` (default), `All` or `None`. Read-only
+  lets the orchestrator start the providers' own reading agents (OMP's scout,
+  security-reviewer, reviewer, librarian and seance; Claude Code's Explore and
+  Plan) and counts any other subagent, such as OMP's `task`, as direct work.
+  `None` counts every subagent; `All` judges none of them.
+- **Worker subagents** `Blocked` (default) or `Allowed`. Blocked injects a rule
+  into every worker this plugin spawns: do the unit yourself, start no subagents,
+  and say so when the unit is too big. A BB plugin cannot remove a provider's own
+  subagent tool, so this is an instruction, not a watchdog.
 
 ### Where workers run
 

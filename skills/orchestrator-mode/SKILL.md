@@ -30,6 +30,7 @@ bb orchestrator-mode worker [--provider <id>] [--model <id>] [--preset <name>] [
 bb orchestrator-mode contract [--thread <id>] [--rules <text>] [--clear-rules] [--json]
 bb orchestrator-mode scope [--project <id>] [--max-parallel <n>] [--inherit <key>] [--inherit-all] [--json]
 bb orchestrator-mode scope --global|--project <id> [--child-messages queued|immediate] [--json]
+bb orchestrator-mode scope --global|--project <id> [--orchestrator-subagents read-only|all|none] [--worker-subagents blocked|allowed]
 ```
 
 `--thread` defaults to the thread running the command, so an agent can inspect
@@ -79,6 +80,12 @@ output redirects and mutating `find` actions (`-delete`, `-exec`, `-fprint`)
 still count as work. Creating images counts as work and must be
 delegated; inspecting images is allowed. Git commands that create or delete
 branches or tags, change remotes, or rewrite reflogs also count as work.
+
+Your provider's own subagents follow the scope's **Orchestrator subagents**
+policy. Under the default `read-only` you may start reading agents (OMP's scout,
+security-reviewer, reviewer, librarian, seance; Claude Code's Explore and Plan);
+starting an editing one, such as OMP's `task`, is direct work. Delegate that unit
+with `orchestrator_delegate` instead.
 
 ## Delegating
 

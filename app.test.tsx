@@ -355,6 +355,8 @@ describe("the settings section", () => {
       workerRetention: "keep",
       workerWorkspace: "shared",
       childMessageDelivery: "queued",
+      orchestratorSubagents: "read-only",
+      workerSubagents: "blocked",
     };
     const projectWorker: Record<string, WorkerConfig> = {};
     const projectRules: Record<string, string> = {};
@@ -584,6 +586,47 @@ describe("the settings section", () => {
       projectId: null,
       key: "workerModelPolicy",
       value: "flexible",
+    });
+  });
+
+  it("writes the orchestrator and worker subagent policies from the scope editor", async () => {
+    const rpc = makeSettingsRpc();
+    const slot = mountSettings(rpc);
+    await flush();
+    const query = within(slot.container);
+
+    // Read-only first, and none last: the value a scope that never opened the row
+    // keeps is the one the row shows when it opens.
+    const orchestrator = query.getByLabelText("Orchestrator subagents") as HTMLSelectElement;
+    expect(Array.from(orchestrator.options, (option) => option.textContent)).toEqual([
+      "read-only",
+      "all",
+      "none",
+    ]);
+    await act(async () => {
+      fireEvent.change(orchestrator, { target: { value: "none" } });
+    });
+    await flush();
+    expect(rpc.calls.filter((call) => call.method === "set_scope_setting").at(-1)?.input).toEqual({
+      projectId: null,
+      key: "orchestratorSubagents",
+      value: "none",
+    });
+
+    // The worker policy keeps its own key, one row further down.
+    const worker = query.getByLabelText("Worker subagents") as HTMLSelectElement;
+    expect(Array.from(worker.options, (option) => option.textContent)).toEqual([
+      "blocked",
+      "allowed",
+    ]);
+    await act(async () => {
+      fireEvent.change(worker, { target: { value: "allowed" } });
+    });
+    await flush();
+    expect(rpc.calls.filter((call) => call.method === "set_scope_setting").at(-1)?.input).toEqual({
+      projectId: null,
+      key: "workerSubagents",
+      value: "allowed",
     });
   });
 

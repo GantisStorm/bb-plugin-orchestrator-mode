@@ -135,6 +135,8 @@ describe("startup readiness", () => {
       }
       expect((await host.harness.behavior.runCli(["worker", "--model", "gone"])).exitCode).not.toBe(0);
       await host.harness.behavior.callRpc("set_enabled", { threadId: "parent", enabled: true });
+      // Pinned (the default) refuses a `model` argument before the catalog is consulted.
+      await host.harness.behavior.callRpc("set_scope_setting", { projectId: null, key: "workerModelPolicy", value: "flexible" });
       await expect(host.harness.behavior.callAgentTool(DELEGATE_TOOL, { task: "Probe", model: "gone", waitForResult: false }, { threadId: "parent", projectId: "project" })).rejects.toThrow(/Unknown worker model/);
       expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
     } finally {

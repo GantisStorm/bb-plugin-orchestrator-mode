@@ -4,6 +4,7 @@ import {
   EXTRA_INSTRUCTION_LIMIT,
   INSTRUCTION_LIMIT,
   CONTRACT_PRESETS,
+  ORCHESTRATOR_SUBAGENT_POLICIES,
   WORKER_MODEL_POLICIES,
   buildInstructions,
   buildNudge,
@@ -508,9 +509,8 @@ describe("direct-work classification", () => {
     expect(classifyRow(row({ id: "r7", workKind: "tool", toolName: null }))).toBeNull();
   });
 
-  it("allows delegation, questions, planning and research", () => {
+  it("allows coordination, questions, planning and research", () => {
     for (const workKind of [
-      "delegation",
       "workflow",
       "question",
       "form",
@@ -523,6 +523,32 @@ describe("direct-work classification", () => {
     ]) {
       expect(classifyRow(row({ id: `ok-${workKind}`, workKind }))).toBeNull();
     }
+  });
+
+  // OMP's subagent tool reaches the timeline as a generic tool row; the agents it
+  // starts are in its `tasks` arguments. Claude Code and Codex use delegation rows.
+  const omp = (id: string, ...agents: (string | undefined)[]) =>
+    row({ id, workKind: "tool", toolName: "other", toolArgs: { tasks: agents.map((agent) => (agent === undefined ? { task: "t" } : { agent, task: "t" })) } });
+
+  it("lets the orchestrator start read-only subagents and flags editing ones by default", () => {
+    expect(classifyRow(omp("scout", "scout"))).toBeNull();
+    expect(classifyRow(omp("task", "task"))?.detail).toBe("started subagent `task` itself");
+    expect(classifyRow(omp("mixed", "scout", "task", "sonic"))?.detail).toBe("started subagent `task`, `sonic` itself");
+    expect(classifyRow(omp("unnamed", undefined))?.detail).toBe("started subagent `task` itself");
+    expect(classifyRow(row({ id: "explore", workKind: "delegation", subagentType: "Explore" }))).toBeNull();
+    expect(classifyRow(row({ id: "general", workKind: "delegation", subagentType: "general-purpose" }))).not.toBeNull();
+    expect(classifyRow(row({ id: "untyped", workKind: "delegation", subagentType: null }))).not.toBeNull();
+  });
+
+  it("follows the scope's subagent policy", () => {
+    expect(classifyRow(omp("all", "task"), { subagents: "all" })).toBeNull();
+    expect(classifyRow(row({ id: "all-native", workKind: "delegation" }), { subagents: "all" })).toBeNull();
+    expect(classifyRow(omp("none", "scout"), { subagents: "none" })?.detail).toBe("started subagent `scout` itself");
+  });
+
+  it("judges a tool row without subagent tasks by its name, as before", () => {
+    expect(classifyRow(row({ id: "plain", workKind: "tool", toolName: "other", toolArgs: { path: "a" } }))).toBeNull();
+    expect(classifyRow(row({ id: "strings", workKind: "tool", toolName: "other", toolArgs: { tasks: ["a"] } }))).toBeNull();
   });
 
   it("ignores rows that are not work", () => {
@@ -688,6 +714,7 @@ describe("the contract", () => {
        for (const preset of CONTRACT_PRESETS) {
         for (const workspace of ["shared", "worktree", "mixed"] as const) {
         for (const modelPolicy of WORKER_MODEL_POLICIES) {
+        for (const subagents of ORCHESTRATOR_SUBAGENT_POLICIES) {
         const text = buildInstructions({
           enforcement,
           allowReadCommands,
@@ -709,6 +736,7 @@ describe("the contract", () => {
           preset,
           workspace,
           modelPolicy,
+          subagents,
         });
         expect(text.length).toBeLessThanOrEqual(INSTRUCTION_LIMIT);
         // The clamp exists so the tail — what to do when delegation is impossible —
@@ -718,6 +746,7 @@ describe("the contract", () => {
         // the mechanism that makes room. Growing the contract means trimming it,
         // and this is the assertion that says so.
         expect(text).toContain(appended);
+        }
         }
         }
        }

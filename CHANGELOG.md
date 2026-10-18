@@ -19,6 +19,14 @@ All notable changes to Orchestrator Mode are documented here. The format follows
   delegation pass `model`, `provider` and `reasoning` and keeps the contract's
   "give a hard unit a stronger model" advice. `Pinned` refuses those three and
   says so in the contract, while leaving stored presets reachable.
+- Add subagent policies — **Orchestrator subagents** (`read-only` default,
+  `all`, `none`; `scope --orchestrator-subagents`) and **Worker subagents**
+  (`blocked` default, `allowed`; `scope --worker-subagents`). The watchdog now
+  judges a provider's own subagents (OMP's `task` tool rows, Claude Code and
+  Codex delegation rows) instead of always allowing them: under the default an
+  editing agent is direct work and a reading one is not. Blocked workers receive
+  an injected rule against starting subagents; BB cannot remove the provider's
+  own tool, so it is an instruction rather than enforcement.
 - Queue direct child messages while an orchestrator turn is running, using
   BB's persistent queue and delivery when idle. Global/Project settings
   and `scope --child-messages queued|immediate` control the policy. Automatic

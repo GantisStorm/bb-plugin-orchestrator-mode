@@ -375,6 +375,38 @@ describe("agent configuration", () => {
     expect(resolved.tools).toEqual([]);
   });
 
+  it("tells a plugin-spawned worker it owns its unit, and only while the scope blocks subagents", async () => {
+    const { harness } = await load();
+    const worker = makePluginAgentConfigurationContext({
+      thread: { id: WORKER, parentThreadId: THREAD },
+      // What the plugin stamps on a thread it spawned itself.
+      pluginMetadata: { workerFor: THREAD },
+    });
+    const blocked = await harness.behavior.resolveAgentConfiguration(worker);
+    expect(blocked.instructions).toContain("Start no subagents");
+    expect(blocked.instructions).toContain("`task`");
+    expect(blocked.tools).toEqual([]);
+
+    // Nothing is removed from the worker's provider either way; the scope only
+    // decides whether this plugin's rule is injected.
+    await harness.behavior.callRpc("set_scope_setting", {
+      projectId: null,
+      key: "workerSubagents",
+      value: "allowed",
+    });
+    const allowed = await harness.behavior.resolveAgentConfiguration(worker);
+    expect(allowed.instructions).toBeNull();
+    expect(allowed.tools).toEqual([]);
+  });
+
+  it("leaves a thread that carries no worker stamp alone", async () => {
+    const { harness } = await load();
+    const resolved = await harness.behavior.resolveAgentConfiguration(
+      makePluginAgentConfigurationContext({ thread: { id: "th_plain" }, pluginMetadata: {} }),
+    );
+    expect(resolved.instructions).toBeNull();
+  });
+
   it("honours a per-thread enforcement override in the contract", async () => {
     const { harness } = await load({ enforcement: "instruct" });
     const resolved = await harness.behavior.resolveAgentConfiguration(
@@ -887,6 +919,18 @@ describe("the dispatch checkpoint", () => {
     const result = await harness.behavior.runCli(["scope", "--global", "--child-messages", "immediate", "--json"]);
     expect(result.exitCode).toBe(0);
     expect(JSON.parse(result.stdout).values.childMessageDelivery).toBe("immediate");
+  });
+
+  it("writes and inherits both subagent policies through the scope CLI", async () => {
+    const { harness } = await load();
+    const written = await harness.behavior.runCli([
+      "scope", "--project", "proj_1", "--orchestrator-subagents", "none", "--worker-subagents", "allowed", "--json",
+    ]);
+    expect(written.exitCode).toBe(0);
+    expect(JSON.parse(written.stdout).values).toMatchObject({ orchestratorSubagents: "none", workerSubagents: "allowed" });
+    await harness.behavior.runCli(["scope", "--project", "proj_1", "--inherit", "orchestratorSubagents"]);
+    const inherited = await harness.behavior.runCli(["scope", "--project", "proj_1", "--inherit", "workerSubagents", "--json"]);
+    expect(JSON.parse(inherited.stdout).values).toMatchObject({ orchestratorSubagents: "read-only", workerSubagents: "blocked" });
   });
 
   it("mirrors authoritative state onto the thread before the turn", async () => {
@@ -2893,6 +2937,8 @@ describe("rpc", () => {
       workerRetention: "keep",
       workerWorkspace: "shared",
       childMessageDelivery: "queued",
+      orchestratorSubagents: "read-only",
+      workerSubagents: "blocked",
     };
     expect(await harness.behavior.callRpc("get_scope_settings", { projectId: null })).toEqual({
       values: globals,
@@ -2936,6 +2982,22 @@ describe("rpc", () => {
     })) as { violations: unknown[]; nudgeCount: number };
     expect(cleared.violations).toEqual([]);
     expect(cleared.nudgeCount).toBe(0);
+  });
+
+  it("records an editing subagent the orchestrator started, and not a read-only one", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    const subagent = (id: string, agent: string, seq: number) => workRow({
+      id, workKind: "tool", toolName: "other", turnId: "turn_2", sourceSeqStart: seq, sourceSeqEnd: seq,
+      toolArgs: { tasks: [{ agent, task: "Create the file" }] },
+    });
+    timelineRows = [...timelineRows, subagent("row_scout", "scout", 3), subagent("row_task", "task", 4)];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
+    const listed = await harness.behavior.runCli(["violations", "--thread", THREAD]);
+    expect(listed.stdout).toContain("started subagent `task` itself");
+    expect(listed.stdout).not.toContain("`scout`");
   });
 
   it("publishes a realtime signal the composer can refetch on", async () => {
@@ -3309,6 +3371,18 @@ describe("cli", () => {
       parentThreadId: THREAD,
     });
     expect(harness.inspection.sdk.callsTo("threads.update")).toEqual([]);
+  });
+
+  it("lets CLI delegation name its workspace when the scope is mixed", async () => {
+    const { harness } = await load({ workerWorkspace: "mixed" });
+    await enable(harness);
+    const context = { threadId: THREAD, projectId: "proj_1" };
+    const unnamed = await harness.behavior.runCli(["delegate", "--task", "Unnamed unit", "--no-wait"], context);
+    expect(unnamed.exitCode).not.toBe(0);
+    expect(spawned).toHaveLength(0);
+    const named = await harness.behavior.runCli(["delegate", "--task", "Named unit", "--workspace", "shared", "--no-wait"], context);
+    expect(named.exitCode).toBe(0);
+    expect(spawned).toHaveLength(1);
   });
 
   it.each(["--provider-id", "--providerId"])("accepts the %s CLI alias", async (flag) => {

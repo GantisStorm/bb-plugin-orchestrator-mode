@@ -124,6 +124,109 @@ export type WorkerModelPolicy = (typeof WORKER_MODEL_POLICIES)[number];
  */
 export const PINNED_DELEGATION_FIELDS = ["model", "provider", "reasoning"] as const;
 
+// ---------------------------------------------------------------------------
+// Subagents
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether an orchestrator may start a provider's own subagents. `read-only` is
+ * the default: the read-only agents are a second way to look something up, while
+ * an agent that can edit is the orchestrator doing the work behind a tool call.
+ * `all` stops judging them at all; `none` refuses every one of them.
+ */
+export const ORCHESTRATOR_SUBAGENT_POLICIES = ["read-only", "all", "none"] as const;
+export type OrchestratorSubagentPolicy = (typeof ORCHESTRATOR_SUBAGENT_POLICIES)[number];
+
+/**
+ * One line per policy, for the settings row. Read-only is the default because a
+ * subagent that can write is a way around the delegation contract.
+ */
+export const ORCHESTRATOR_SUBAGENT_POLICY_DESCRIPTIONS: Record<
+  OrchestratorSubagentPolicy,
+  string
+> = {
+  "read-only":
+    "Read-only lets the orchestrator start the providers' own reading agents — OMP's scout, security-reviewer, reviewer, librarian and seance, Claude Code's Explore and Plan — and counts an agent that can edit or write as direct work.",
+  all: "All lets the orchestrator start any subagent the provider offers, so it can spawn an editing agent instead of delegating the unit to a worker. Nothing about them is checked.",
+  none: "None keeps the orchestrator from starting any subagent at all: every unit goes to a worker through `orchestrator_delegate`.",
+};
+
+/**
+ * Whether a worker may start subagents of its own. `blocked` is the default: a
+ * worker owns one unit and finishes it, and a unit that fans out again is how a
+ * brief turns into work nobody is watching.
+ */
+export const WORKER_SUBAGENT_POLICIES = ["blocked", "allowed"] as const;
+export type WorkerSubagentPolicy = (typeof WORKER_SUBAGENT_POLICIES)[number];
+
+/** One line per worker policy, for the settings row. */
+export const WORKER_SUBAGENT_POLICY_DESCRIPTIONS: Record<WorkerSubagentPolicy, string> = {
+  blocked:
+    "Blocked tells every worker it owns its unit and starts nothing else: it does the work itself and reports, and says so when the unit is too big rather than splitting it.",
+  allowed:
+    "Allowed leaves workers with whatever subagents their provider gives them, so a worker can split a large unit itself, and injects no rule.",
+};
+
+/**
+ * The agents that only read. OMP's bundled ones have no edit or write tool —
+ * reviewer and librarian keep bash, the same allowance a read command gets —
+ * plus Claude Code's Explore and Plan, which are read-only by definition. A
+ * provider's own editing agents (OMP's `task`, Codex's `worker`) are absent on
+ * purpose: one of those is the orchestrator doing the work behind a tool call.
+ */
+export const READ_ONLY_SUBAGENTS: ReadonlySet<string> = new Set([
+  "scout",
+  "security-reviewer",
+  "reviewer",
+  "librarian",
+  "seance",
+  "explore",
+  "plan",
+]);
+
+/**
+ * The instruction a blocked scope injects into its workers. BB plugins cannot
+ * remove a provider's own subagent tool, so the rule is told, not enforced: the
+ * worker is the one who has to keep the brief whole.
+ */
+export const WORKER_SUBAGENT_RULE = `# THIS IS A WORKER UNIT
+
+Do this unit yourself and finish it. Start no subagents of your own — OMP's
+\`task\`, Claude Code's \`Agent\`/\`Task\`, Codex's \`spawnAgent\`, or any
+equivalent — and delegate none of it onwards. If the unit is too big to finish
+yourself, say so in your result instead of splitting it.`;
+
+/**
+ * The subagents a timeline row started, or null when the row is not a subagent
+ * at all. Two shapes reach this: a provider's native delegation row, which names
+ * its agent type (and counts as `general-purpose` when it does not), and a
+ * generic tool row whose arguments carry the OMP subagent tool's `tasks` array.
+ * An element of that array with no `agent` of its own is OMP's plain `task`.
+ */
+export function subagentsOf(row: WorkRowLike): string[] | null {
+  if (row.kind !== "work") return null;
+  if (row.workKind === "delegation") {
+    const type = row.subagentType;
+    const named = typeof type === "string" ? type.trim() : "";
+    return [named === "" ? "general-purpose" : named];
+  }
+  const args = row.toolArgs;
+  if (args === null || typeof args !== "object") return null;
+  const tasks = (args as Record<string, unknown>)["tasks"];
+  // An array of objects is the subagent tool's argument shape. Anything else —
+  // a missing `tasks`, or a plain list of strings — belongs to some other tool
+  // and is judged by name instead.
+  if (!Array.isArray(tasks) || tasks.length === 0) return null;
+  if (!tasks.every((task) => task !== null && typeof task === "object" && !Array.isArray(task))) {
+    return null;
+  }
+  return tasks.map((task) => {
+    const agent = (task as Record<string, unknown>)["agent"];
+    const named = typeof agent === "string" ? agent.trim() : "";
+    return named === "" ? "task" : named;
+  });
+}
+
 /**
  * What the plugin stores for workers: the execution every delegation starts on,
  * plus the one to retry with when a worker fails.
@@ -241,6 +344,10 @@ export interface WorkRowLike {
   toolName?: string | null | undefined;
   command?: string | null | undefined;
   change?: { path?: string | null } | null | undefined;
+  /** A tool row's arguments; the OMP subagent tool carries its `tasks` here. */
+  toolArgs?: Record<string, unknown> | null | undefined;
+  /** The agent a provider's native delegation row started, when it names one. */
+  subagentType?: string | null | undefined;
 }
 
 export interface Violation {
@@ -258,11 +365,18 @@ interface ClassifierOptions {
   allowReadCommands: boolean;
   /** Retained worker IDs recorded by this orchestrator's delegation handler. */
   workerThreadIds: readonly string[];
+  /**
+   * Which subagents this scope lets the orchestrator start. Read-only is the
+   * default, so a scope that never opens the setting still refuses an editing
+   * agent.
+   */
+  subagents: OrchestratorSubagentPolicy;
 }
 
 const DEFAULT_CLASSIFIER_OPTIONS: ClassifierOptions = {
   allowReadCommands: true,
   workerThreadIds: [],
+  subagents: "read-only",
 };
 
 /**
@@ -275,9 +389,10 @@ const MUTATING_TOOL_PATTERN =
 /** Work kinds that are always the orchestrator doing the work itself. */
 const ALWAYS_WORK: ReadonlySet<string> = new Set(["file-change", "command", "image-generation"]);
 
-/** Work kinds that are always allowed: thinking, asking, and delegating. */
+/** Work kinds that are always allowed: thinking, asking, and coordinating. */
 const ALWAYS_ALLOWED: ReadonlySet<string> = new Set([
-  "delegation",
+  // `delegation` is deliberately absent: a provider's own subagent row lands
+  // there, and whether it is allowed depends on the scope's subagent policy.
   "workflow",
   "question",
   "form",
@@ -1283,10 +1398,12 @@ export function classifyRow(
   row: WorkRowLike & { id: string; turnId?: string | null },
   options: Partial<ClassifierOptions> = {},
 ): Violation | null {
-  const { allowReadCommands, workerThreadIds = [] } = { ...DEFAULT_CLASSIFIER_OPTIONS, ...options };
+  const { allowReadCommands, workerThreadIds = [], subagents = "read-only" } = {
+    ...DEFAULT_CLASSIFIER_OPTIONS,
+    ...options,
+  };
   if (row.kind !== "work") return null;
   const workKind = row.workKind ?? "";
-  if (ALWAYS_ALLOWED.has(workKind)) return null;
   const turnId = row.turnId ?? null;
   const base = {
     id: row.id,
@@ -1294,6 +1411,26 @@ export function classifyRow(
     workKind,
     detectedAt: Date.now(),
   };
+
+  // Subagent rows are decided first: a provider's native delegation row wears
+  // the `delegation` work kind, and a generic tool row's name says nothing about
+  // what the orchestrator started with it.
+  const started = subagentsOf(row);
+  if (started !== null) {
+    const offending =
+      subagents === "all"
+        ? []
+        : subagents === "none"
+          ? started
+          : started.filter((name) => !READ_ONLY_SUBAGENTS.has(name.toLowerCase()));
+    if (offending.length === 0) return null;
+    return {
+      ...base,
+      detail: `started subagent \`${offending.join("`, `")}\` itself`,
+    };
+  }
+
+  if (ALWAYS_ALLOWED.has(workKind)) return null;
 
   if (workKind === "file-change") {
     const path = row.change?.path ?? "a file";
@@ -1401,6 +1538,12 @@ interface InstructionInput {
    * worktree leaves behind and how it lands; `shared` says nothing.
    */
   workspace?: "shared" | "worktree" | "mixed";
+  /**
+   * Which subagents the contract lets the orchestrator start. `read-only` — the
+   * default — names the ones that only read; `none` says to start none at all,
+   * and `all` says nothing.
+   */
+  subagents?: OrchestratorSubagentPolicy;
 }
 
 /**
@@ -1452,7 +1595,7 @@ export function buildInstructions(input: InstructionInput): string {
   const savedPresets =
     savedKinds.length === 0
       ? ""
-      : ` Saved worker kinds: ${savedKinds.join(", ")}; name one as \`preset\` for a unit of that kind.`;
+      : ` Saved worker kinds: ${savedKinds.join(", ")}; name one as \`preset\` for that kind.`;
 
   const preset = input.preset ?? "standard";
   // `delegate-only` takes the reading out of the orchestrator's hands entirely: the
@@ -1465,9 +1608,9 @@ export function buildInstructions(input: InstructionInput): string {
     preset === "review-heavy"
       ? `4. Every unit gets checked before you trust it: delegate it with \`verify: true\` so an
    independent worker runs what it claims (the tests, the command, the paths) and
-   reports raw output, then record a verdict on it with the \`${REVIEW_TOOL}\` tool.
-   Re-delegate a failed check; never patch it yourself.`
-      : `4. Record a verdict on every worker with the \`${REVIEW_TOOL}\` tool. Pass
+   reports raw output; record a verdict with \`${REVIEW_TOOL}\`. Re-delegate a failed
+   check; never patch it yourself.`
+      : `4. Record a verdict on every worker with \`${REVIEW_TOOL}\`. Pass
    \`verify: true\` for a unit whose result you cannot judge from its report: that
    adds a check unit. Send a wrong or incomplete result back to a worker; never
    patch it yourself.`;
@@ -1481,12 +1624,25 @@ export function buildInstructions(input: InstructionInput): string {
     input.workspace === "worktree"
       ? `\n\n   Units run in their own worktrees, so nothing a worker writes reaches your\n   checkout until it is merged. To land one, delegate the merge as its own unit\n   with \`workspace: "shared"\`, naming the branch.`
       : input.workspace === "mixed"
-        ? `\n\n   Name where each unit runs: \`workspace: "shared"\` edits your checkout at once,\n   \`workspace: "worktree"\` keeps it on a branch. Give a worktree to a unit that\n   would touch files another unit touches, or should not disturb the working tree.\n   To land one, delegate the merge as its own unit with \`workspace: "shared"\`.`
+        ? `\n\n   Name where each unit runs: \`workspace: "shared"\` edits your checkout at once,\n   \`workspace: "worktree"\` keeps it on a branch. Give one to a unit that would\n   touch files another unit touches, or that should not disturb your tree. Land it\n   by delegating the merge as its own unit with \`workspace: "shared"\`.`
         : "";
 
   const commands = input.allowReadCommands && preset !== "delegate-only"
     ? "Read-only shell commands are allowed for orientation. Literal stderr suppression (`2>/dev/null`) is allowed; other output redirects count as work."
     : "Only CLI delegation commands may run; read-only shell exploration is disabled.";
+
+  /**
+   * What the contract says about the provider's own subagents. The watchdog
+   * judges the same rows, so this sentence and the classifier read one policy;
+   * `all` says nothing, because there is nothing to restrict.
+   */
+  const readOnlyAgents = [...READ_ONLY_SUBAGENTS].join(", ");
+  const subagentRule =
+    input.subagents === "none"
+      ? `\n\n   Start no subagents of your own: every unit goes through \`${DELEGATE_TOOL}\`.`
+      : input.subagents === "all"
+        ? ""
+        : `\n\n   Subagents: only the read-only ones —\n   ${readOnlyAgents}.\n   An editing subagent is direct work: delegate the unit with\n   \`${DELEGATE_TOOL}\` instead.`;
 
   /**
    * What the contract says about whose model a worker runs on. A pinned scope —
@@ -1530,11 +1686,11 @@ ${watching}
 ## Do not do the work yourself
 
 - Creating, editing, moving or deleting any file.
-- Generating images instead of delegating their creation.
+- Generating images yourself.
 - Running a command that changes anything: builds, installs, tests, commits,
   migrations, formatters.
 - Writing code yourself, even a one-line fix, even when a worker would be slower.
-- Fixing up a worker's output by hand instead of sending it back to a worker.
+- Fixing a worker's output by hand instead of sending it back.
 
 ${commands}
 
@@ -1546,8 +1702,8 @@ ${workspaceRule}
    definition of done. A worker cannot see this conversation.
 3. Delegate with \`${DELEGATE_TOOL}\`; if unavailable, use
    \`bb orchestrator-mode delegate --task 'complete brief'\`.
-   Quote briefs safely; \`--no-wait\` fans out independent units. Resuming a
-   provider session may retain its original tool list.
+   Quote briefs safely; \`--no-wait\` fans out independent units. A resumed session
+   may retain its original tool list.
 ${pinLine}${reviewStep}
    Send corrections with \`bb thread tell <worker-id> ...\` (alias \`message\`) to
    recorded workers; safely quoted messages or quoted stdin heredocs are delegation.
@@ -1556,18 +1712,18 @@ ${pinLine}${reviewStep}
 ## When you may act directly
 
 Only reading, searching, planning, asking, delegating and reporting. Before a
-tool that changes something, stop and delegate.
+tool that changes something, stop and delegate.${subagentRule}
 
 ## Choosing the worker's model
 
 ${modelBudget} Ids come from
-\`bb provider list\` and \`bb provider models <provider>\`; both are read-only.
+\`bb provider list\` and \`bb provider models <provider>\`, both read-only.
 
 ${extraBudget(extra)}## If you cannot delegate
 
-Say so plainly and stop. "I cannot do this without doing the work myself" is a
-correct answer; doing the work is not. Do not argue with the mode; ask the user
-to turn it off in the composer if it is wrong.${reminderBlock(lines)}`;
+Say so plainly and stop: "I cannot do this without doing the work myself" is a
+correct answer, and doing the work is not. Do not argue with the mode; ask the
+user to turn it off in the composer.${reminderBlock(lines)}`;
 
   const whole = render(reminderLines);
   if (whole.length <= INSTRUCTION_LIMIT) return whole;
