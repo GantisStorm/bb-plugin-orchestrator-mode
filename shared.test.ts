@@ -528,22 +528,88 @@ describe("direct-work classification", () => {
   // OMP's subagent tool reaches the timeline as a generic tool row; the agents it
   // starts are in its `tasks` arguments. Claude Code and Codex use delegation rows.
   const omp = (id: string, ...agents: (string | undefined)[]) =>
-    row({ id, workKind: "tool", toolName: "other", toolArgs: { tasks: agents.map((agent) => (agent === undefined ? { task: "t" } : { agent, task: "t" })) } });
+    row({ id, workKind: "tool", toolName: "task", toolArgs: { tasks: agents.map((agent) => (agent === undefined ? { task: "t" } : { agent, task: "t" })) } });
 
-  it("lets the orchestrator start read-only subagents and flags editing ones by default", () => {
-    expect(classifyRow(omp("scout", "scout"))).toBeNull();
-    expect(classifyRow(omp("task", "task"))?.detail).toBe("started subagent `task` itself");
-    expect(classifyRow(omp("mixed", "scout", "task", "sonic"))?.detail).toBe("started subagent `task`, `sonic` itself");
-    expect(classifyRow(omp("unnamed", undefined))?.detail).toBe("started subagent `task` itself");
-    expect(classifyRow(row({ id: "explore", workKind: "delegation", subagentType: "Explore" }))).toBeNull();
+  it("flags editing and unverified definitions, including names that sound read-only", () => {
+    const options = { providerId: "acp-omp" };
+    expect(classifyRow(omp("scout", "scout"), options)?.detail).toContain("`scout`");
+    expect(classifyRow(omp("task", "task"), options)?.detail).toBe("started subagent `task` itself");
+    expect(classifyRow(omp("mixed", "scout", "task", "sonic"), options)?.detail).toBe("started subagent `scout`, `task`, `sonic` itself");
+    expect(classifyRow(omp("unnamed", undefined), options)?.detail).toBe("started subagent `task` itself");
+    expect(classifyRow(row({ id: "explore", workKind: "delegation", subagentType: "Explore" }))).not.toBeNull();
     expect(classifyRow(row({ id: "general", workKind: "delegation", subagentType: "general-purpose" }))).not.toBeNull();
     expect(classifyRow(row({ id: "untyped", workKind: "delegation", subagentType: null }))).not.toBeNull();
   });
 
   it("follows the scope's subagent policy", () => {
-    expect(classifyRow(omp("all", "task"), { subagents: "all" })).toBeNull();
+    expect(classifyRow(omp("all", "task"), { subagents: "all", providerId: "acp-omp" })).toBeNull();
     expect(classifyRow(row({ id: "all-native", workKind: "delegation" }), { subagents: "all" })).toBeNull();
-    expect(classifyRow(omp("none", "scout"), { subagents: "none" })?.detail).toBe("started subagent `scout` itself");
+    expect(classifyRow(omp("none", "scout"), { subagents: "none", providerId: "acp-omp" })?.detail).toBe("started subagent `scout` itself");
+  });
+
+  const claudeReadingRow = (name: string) => row({
+    id: name, workKind: "delegation", toolName: "delegation", subagentType: null,
+    presentation: {
+      label: { pending: "Running subagent", completed: "Subagent finished" },
+      detail: `${name} agent · model haiku`,
+    },
+  });
+  it.each(["Explore", "Plan"])("recovers the role in BB 0.46.1's native %s row without claiming it is verified", (name) => {
+    const providerId = "claude-code";
+    expect(classifyRow(claudeReadingRow(name), { providerId })?.detail).toBe(`started subagent \`${name}\` itself`);
+    expect(classifyRow(claudeReadingRow(name), { providerId, subagents: "none" })).not.toBeNull();
+    expect(classifyRow(claudeReadingRow(name), { providerId, subagents: "all" })).toBeNull();
+  });
+
+  it.each(["Explore", "reviewer"])("does not trust a writable custom %s or transfer names between providers", (name) => {
+    for (const providerId of ["claude-code", "acp-omp", "codex", undefined]) {
+      expect(classifyRow(claudeReadingRow(name), { providerId })).not.toBeNull();
+      expect(classifyRow(row({ id: name, workKind: "delegation", subagentType: name }), { providerId })).not.toBeNull();
+    }
+  });
+
+  it.each([
+    ["Waiting for agents", "Waited for agents"],
+    ["Messaging agent", "Messaged agent"],
+    ["Closing agent", "Closed agent"],
+    ["Resuming agent", "Resumed agent"],
+  ])("allows normalised Codex coordination: %s", (pending, completed) => {
+    const work = row({ id: pending, workKind: "delegation", toolName: "delegation", subagentType: null,
+      presentation: { label: { pending, completed } } });
+    for (const subagents of ORCHESTRATOR_SUBAGENT_POLICIES) {
+      expect(classifyRow(work, { providerId: "codex", subagents })).toBeNull();
+    }
+    expect(classifyRow(work, { providerId: "other", subagents: "none" })).not.toBeNull();
+  });
+
+  it("still judges native Codex launches", () => {
+    const work = row({ id: "spawn", workKind: "delegation", toolName: "delegation", subagentType: null,
+      presentation: { label: { pending: "Spawning agent", completed: "Spawned agent" } } });
+    expect(classifyRow(work, { providerId: "codex" })).not.toBeNull();
+    expect(classifyRow(work, { providerId: "codex", subagents: "none" })).not.toBeNull();
+    expect(classifyRow(work, { providerId: "codex", subagents: "all" })).toBeNull();
+  });
+
+  it("keeps unrelated tasks arrays under the ordinary mutating-tool classifier, even under all", () => {
+    for (const toolName of ["agent_teams_create", "write_tasks"]) {
+      for (const subagents of ORCHESTRATOR_SUBAGENT_POLICIES) {
+        expect(classifyRow(row({ id: toolName, workKind: "tool", toolName,
+          toolArgs: { tasks: [{ agent: "Explore", task: "t" }] },
+        }), { providerId: "acp-omp", subagents })?.detail).toBe(`called \`${toolName}\` itself`);
+      }
+    }
+    expect(classifyRow(row({ id: "read", workKind: "tool", toolName: "read_tasks",
+      toolArgs: { tasks: [{}] } }), { subagents: "none" })).toBeNull();
+  });
+
+  it("does not grant a subagent exemption to OMP calls whose tool identity was erased", () => {
+    for (const subagents of ORCHESTRATOR_SUBAGENT_POLICIES) {
+      const violation = classifyRow(row({ id: "opaque", workKind: "tool", toolName: "other",
+        toolArgs: { tasks: [{ agent: "scout", task: "Inspect code" }] },
+      }), { providerId: "acp-omp", subagents });
+      expect(violation?.detail).toContain("unidentified OMP tool");
+      expect(violation?.detail).not.toContain("started subagent");
+    }
   });
 
   it("judges a tool row without subagent tasks by its name, as before", () => {
@@ -704,6 +770,21 @@ describe("Git global option operands", () => {
 
 describe("the contract", () => {
   const levels: EnforcementLevel[] = ["instruct", "guard", "block"];
+
+  it.each(ORCHESTRATOR_SUBAGENT_POLICIES)("states the %s subagent policy under every enforcement level", (subagents) => {
+    for (const enforcement of levels) {
+      const text = buildInstructions({ enforcement, allowReadCommands: true, subagents });
+      if (subagents === "all") {
+        expect(text).toContain("Subagents: all, including editing agents, are allowed");
+        expect(text).toContain("existing user\n   and parent authorisation");
+        expect(text).toContain("no additional tools or permissions");
+      } else if (subagents === "none") {
+        expect(text).toContain("Start no subagents of your own");
+      } else {
+        expect(text).toContain("Subagents: read-only, with verified definition and capabilities");
+      }
+    }
+  });
 
   it("fits the 4096-character configure() budget in every mode", () => {
     // A distinctive marker, so "the append survived" is checkable and not just "the

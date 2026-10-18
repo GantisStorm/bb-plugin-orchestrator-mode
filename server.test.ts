@@ -219,6 +219,7 @@ async function load(
         get: async ({ threadId }: { threadId: string }) =>
           makeThreadResponse({
             id: threadId,
+            providerId: "acp-omp",
             environmentId: threadId === WORKER ? null : "env_1",
             parentThreadId: threadId === WORKER ? THREAD : null,
           }),
@@ -405,6 +406,49 @@ describe("agent configuration", () => {
       makePluginAgentConfigurationContext({ thread: { id: "th_plain" }, pluginMetadata: {} }),
     );
     expect(resolved.instructions).toBeNull();
+  });
+
+  it.each(["blocked", "allowed"])("inherits worker subagents %s without changing unit, retry or verifier permissions", async (policy) => {
+    const { harness } = await load({ workerSubagents: policy === "allowed" ? "blocked" : "allowed" }, undefined, CATALOG);
+    await harness.behavior.callRpc("set_scope_setting", {
+      projectId: "proj_1", key: "workerSubagents", value: policy,
+    });
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp", model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      permissionMode: "accept-edits", fallback: RETRY_TARGET,
+    });
+    let count = 0;
+    harness.inspection.sdk.stub("threads.spawn", async (args) => {
+      spawned.push(args as unknown as Record<string, unknown>);
+      return makeThreadResponse({ id: `unit_${++count}`, parentThreadId: THREAD, environmentId: "env_1" });
+    });
+    harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
+      makeThreadResponse({ id: threadId, status: threadId === "unit_1" ? "error" : "idle" }));
+    await enable(harness);
+    await harness.behavior.callAgentTool(DELEGATE_TOOL, { task: "Complete the unit", verify: true }, {
+      threadId: THREAD, projectId: "proj_1",
+    });
+    expect(spawned).toHaveLength(3);
+    for (const [index, args] of spawned.entries()) {
+      expect(args.permissionMode).toBe("accept-edits");
+      expect(args.executionInputSources).toMatchObject({ permissionMode: "explicit" });
+      const configured = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({
+        project: { id: "proj_1" }, thread: { id: `unit_${index + 1}`, parentThreadId: THREAD },
+        pluginMetadata: args.pluginMetadata as { workerFor: string },
+      }));
+      expect(configured.tools).toEqual([]);
+      if (policy === "blocked") expect(configured.instructions).toContain("Start no subagents");
+      else expect(configured.instructions).toBeNull();
+    }
+    await harness.behavior.callRpc("set_scope_setting", {
+      projectId: "proj_1", key: "workerSubagents", value: null,
+    });
+    const inherited = await harness.behavior.resolveAgentConfiguration(makePluginAgentConfigurationContext({
+      project: { id: "proj_1" }, thread: { id: "unit_1", parentThreadId: THREAD },
+      pluginMetadata: { workerFor: THREAD },
+    }));
+    if (policy === "allowed") expect(inherited.instructions).toContain("Start no subagents");
+    else expect(inherited.instructions).toBeNull();
   });
 
   it("honours a per-thread enforcement override in the contract", async () => {
@@ -2924,6 +2968,25 @@ describe("rpc", () => {
     expect(await harness.behavior.callRpc("get_default")).toEqual({ enabled: true });
   });
 
+  it("retains current or inherited policy fallbacks when stored values or writes are malformed", async () => {
+    const { harness } = await load({ orchestratorSubagents: "none", workerSubagents: "allowed" }, undefined, {}, {
+      project_settings: { proj_1: { orchestratorSubagents: "invalid", workerSubagents: false } },
+    });
+    for (const projectId of [null, "proj_1"]) {
+      for (const [key, value] of [["orchestratorSubagents", "invalid"], ["workerSubagents", 42]] as const) {
+        const result = await harness.behavior.callRpc("set_scope_setting", { projectId, key, value }) as { values: unknown };
+        expect(result.values).toMatchObject({ orchestratorSubagents: "none", workerSubagents: "allowed" });
+      }
+    }
+    const invalid = await load({ orchestratorSubagents: "invalid", workerSubagents: 42 });
+    expect(await invalid.harness.behavior.callRpc("get_scope_settings", { projectId: null }))
+      .toMatchObject({ values: { orchestratorSubagents: "read-only", workerSubagents: "blocked" } });
+    const restarted = await harness.lifecycle.reload(plugin);
+    hosts.push(restarted.harness);
+    expect(await restarted.harness.behavior.callRpc("get_scope_settings", { projectId: "proj_1" }))
+      .toMatchObject({ values: { orchestratorSubagents: "none", workerSubagents: "allowed" } });
+  });
+
   it("reads and writes one scope's settings, and refuses to clear the global record", async () => {
     const { bb, harness } = await load({ enforcement: "instruct", maxNudges: 5 });
     const globals = {
@@ -2984,20 +3047,107 @@ describe("rpc", () => {
     expect(cleared.nudgeCount).toBe(0);
   });
 
-  it("records an editing subagent the orchestrator started, and not a read-only one", async () => {
+  it("records identified OMP subagents whose definitions cannot be verified", async () => {
     const { harness } = await load({ enforcement: "guard" });
     await arm(harness);
     const subagent = (id: string, agent: string, seq: number) => workRow({
-      id, workKind: "tool", toolName: "other", turnId: "turn_2", sourceSeqStart: seq, sourceSeqEnd: seq,
+      id, workKind: "tool", toolName: "task", turnId: "turn_2", sourceSeqStart: seq, sourceSeqEnd: seq,
       toolArgs: { tasks: [{ agent, task: "Create the file" }] },
     });
     timelineRows = [...timelineRows, subagent("row_scout", "scout", 3), subagent("row_task", "task", 4)];
-    timelineMaxSeq = 4;
+    // The original live OMP repro had no tool identity at all. Keep it
+    // conservative without guessing a launch or trusting the agent's name.
+    timelineRows.push(workRow({ id: "row_opaque", workKind: "tool", toolName: "other", turnId: "turn_2",
+      sourceSeqStart: 5, sourceSeqEnd: 5, toolArgs: { tasks: [{ agent: "task", task: "Create the file" }] } }));
+    timelineMaxSeq = 5;
     await idle(harness);
     await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
     const listed = await harness.behavior.runCli(["violations", "--thread", THREAD]);
     expect(listed.stdout).toContain("started subagent `task` itself");
-    expect(listed.stdout).not.toContain("`scout`");
+    expect(listed.stdout).toContain("`scout`");
+    expect(listed.stdout).toContain("unidentified OMP tool");
+  });
+
+  it.each(["Explore", "Plan"])("does not mistake cached built-in telemetry for launch-specific proof of native Claude %s", async (name) => {
+    const { bb, harness } = await load({ enforcement: "block" });
+    harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
+      makeThreadResponse({ id: threadId, providerId: "claude-code" }));
+    harness.inspection.sdk.stub("threads.context", async () => ({ usage: {
+      estimated: true, usedTokens: 10, modelContextWindow: 1000,
+      snapshot: {
+        capturedAt: "2020-01-01T00:00:00.000Z", providerSessionId: "old_session", providerTurnId: null,
+        model: "claude-test", usedTokens: 10, contextWindowTokens: 1000, autoCompactAtTokens: null,
+        estimated: true,
+        categories: [{ id: "agents", kind: "used", label: "Agents", tokens: 10,
+          entries: [{ id: name, label: `${name} (built-in)`, tokens: 10 }] }],
+      },
+    } }));
+    await arm(harness);
+    timelineRows.push(workRow({
+      id: "native_read", workKind: "delegation", toolName: "delegation", subagentType: null,
+      turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 3,
+      presentation: { label: { pending: "Running subagent", completed: "Subagent finished" },
+        detail: `${name} agent · model haiku` },
+    }));
+    timelineMaxSeq = 3;
+    await idle(harness);
+    await vi.waitFor(async () => {
+      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 3,
+        violations: [expect.objectContaining({ detail: `started subagent \`${name}\` itself` })] } });
+    });
+    await vi.waitFor(() => expect(stoppedThreads).toEqual([THREAD]));
+    expect(harness.inspection.sdk.callsTo("threads.context")).toEqual([]);
+  });
+
+  it.each(["custom", "unavailable"])("keeps a native Claude definition conservative when %s", async (source) => {
+    const { harness } = await load({ enforcement: "block" });
+    harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
+      makeThreadResponse({ id: threadId, providerId: "claude-code" }));
+    harness.inspection.sdk.stub("threads.context", async () => {
+      if (source === "unavailable") throw new Error("offline");
+      return { usage: {
+        estimated: true, usedTokens: 10, modelContextWindow: 1000,
+        snapshot: {
+          capturedAt: new Date().toISOString(), providerSessionId: "session_1", providerTurnId: null,
+          model: "claude-test", usedTokens: 10, contextWindowTokens: 1000, autoCompactAtTokens: null,
+          estimated: true,
+          categories: [{ id: "agents", kind: "used", label: "Custom agents", tokens: 10,
+            entries: [{ id: "custom", label: "Explore (project)", tokens: 10 }] }],
+        },
+      } };
+    });
+    await arm(harness);
+    timelineRows.push(workRow({ id: "custom_read", workKind: "delegation", toolName: "delegation",
+      subagentType: null, turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 3,
+      presentation: { detail: "Explore agent" } }));
+    timelineMaxSeq = 3;
+    await idle(harness);
+    await vi.waitFor(() => expect(stoppedThreads).toEqual([THREAD]));
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      violations: [expect.objectContaining({ detail: "started subagent `Explore` itself" })],
+    });
+  });
+
+  it.each(["read-only", "none"])("allows normalised Codex result collection and cleanup under %s", async (subagents) => {
+    const { bb, harness } = await load({ enforcement: "block", orchestratorSubagents: subagents });
+    harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
+      makeThreadResponse({ id: threadId, providerId: "codex" }));
+    await arm(harness);
+    for (const [index, [pending, completed]] of [
+      ["Waiting for agents", "Waited for agents"], ["Messaging agent", "Messaged agent"],
+      ["Closing agent", "Closed agent"],
+    ].entries()) {
+      timelineRows.push(workRow({ id: `coordination_${index}`, workKind: "delegation", toolName: "delegation",
+        subagentType: null, turnId: "turn_2", sourceSeqStart: index + 3, sourceSeqEnd: index + 3,
+        presentation: { label: { pending, completed } } }));
+    }
+    timelineMaxSeq = 5;
+    await idle(harness);
+    await vi.waitFor(async () => {
+      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 5, violations: [] } });
+    });
+    expect(stoppedThreads).toEqual([]);
+    expect(sentTexts).toEqual([]);
   });
 
   it("publishes a realtime signal the composer can refetch on", async () => {

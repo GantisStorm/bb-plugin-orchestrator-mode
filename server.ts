@@ -2383,7 +2383,9 @@ export default async function plugin(bb: BbPluginApi) {
   async function scan(threadId: string): Promise<void> {
     // Resolved once per scan: the project a thread belongs to cannot change
     // mid-scan, and the classifier reads two values from it per row.
-    const scanSettings = settingsFor(await projectOfThread(threadId));
+    const scanThread = await bb.sdk.threads.get({ threadId }).catch(() => null);
+    const scanSettings = settingsFor(scanThread?.projectId);
+    const providerId = scanThread?.providerId;
     const state = await getState(threadId);
     if (state === undefined || !state.enabled) return;
     const enforcement = effectiveEnforcement(state);
@@ -2469,6 +2471,7 @@ export default async function plugin(bb: BbPluginApi) {
           allowReadCommands: scanSettings.allowReadCommands,
           workerThreadIds,
           subagents: scanSettings.orchestratorSubagents,
+          providerId,
         });
         if (violation !== null) {
           fresh.push(violation);

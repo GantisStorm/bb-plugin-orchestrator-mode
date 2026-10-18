@@ -99,7 +99,21 @@ Generic tool rows are classified using
 their names; this is a heuristic, not a complete description of their effects.
 
 Recognised research includes reads, searches, web fetches, plans and questions.
-Delegation rows remain available. Shell read-only checks reject writes through
+Native subagent launches resolve through `orchestratorSubagents`. Provider
+identity scopes the compatibility adapters: BB 0.46.1's Claude display detail
+retains the requested role, and Codex's fixed presentation labels distinguish
+launches from waiting, messaging, resuming and closing. Display names never grant
+read-only access. BB currently supplies no launch-bound resolved definition,
+capabilities or revision. Its context API returns stored usage telemetry, which
+can predate a custom override or a session change. Even a cached `built-in`
+entry therefore grants no exemption. Native reading support remains blocked
+on upstream provenance; all unverified launches stay conservative.
+Identified OMP `task` tools carry task arrays, but unrelated tools with the same
+argument key retain normal classification. Legacy OMP calls named only `other`
+cannot prove tool identity; opaque task-shaped calls remain unverified work
+under every policy. These limits avoid guessing permissions from payloads.
+
+Shell read-only checks reject writes through
 redirection and mutating command chains. Literal stderr suppression with
 `2>/dev/null` (or `2> /dev/null`) is allowed when every command only reads;
 other output redirects still count as work. `find` actions that delete,

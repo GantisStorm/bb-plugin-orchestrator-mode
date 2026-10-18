@@ -82,10 +82,15 @@ delegated; inspecting images is allowed. Git commands that create or delete
 branches or tags, change remotes, or rewrite reflogs also count as work.
 
 Your provider's own subagents follow the scope's **Orchestrator subagents**
-policy. Under the default `read-only` you may start reading agents (OMP's scout,
-security-reviewer, reviewer, librarian, seance; Claude Code's Explore and Plan);
-starting an editing one, such as OMP's `task`, is direct work. Delegate that unit
-with `orchestrator_delegate` instead.
+policy. Under the default `read-only`, only reading definitions with
+launch-specific provenance and capability proof can be allowed. BB currently
+exposes no such proof, so native launches remain unverified work, including
+Explore and Plan. Familiar names and cached context snapshots confer no trust.
+`none` prohibits launches, while `all` allows identified subagents, including
+editing ones, within existing user and parent authority. Codex coordination
+(waiting, messaging, resuming or closing) is allowed under every policy. An OMP
+tool whose identity was erased to `other` cannot establish a subagent exemption.
+Delegate unverified units with `orchestrator_delegate` instead.
 
 ## Delegating
 

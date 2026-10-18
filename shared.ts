@@ -130,8 +130,8 @@ export const PINNED_DELEGATION_FIELDS = ["model", "provider", "reasoning"] as co
 
 /**
  * Whether an orchestrator may start a provider's own subagents. `read-only` is
- * the default: the read-only agents are a second way to look something up, while
- * an agent that can edit is the orchestrator doing the work behind a tool call.
+ * the default: only launch-bound proof of a reading definition could permit
+ * one. BB currently exposes no such proof, so unverified launches remain work.
  * `all` stops judging them at all; `none` refuses every one of them.
  */
 export const ORCHESTRATOR_SUBAGENT_POLICIES = ["read-only", "all", "none"] as const;
@@ -146,8 +146,8 @@ export const ORCHESTRATOR_SUBAGENT_POLICY_DESCRIPTIONS: Record<
   string
 > = {
   "read-only":
-    "Read-only lets the orchestrator start the providers' own reading agents — OMP's scout, security-reviewer, reviewer, librarian and seance, Claude Code's Explore and Plan — and counts an agent that can edit or write as direct work.",
-  all: "All lets the orchestrator start any subagent the provider offers, so it can spawn an editing agent instead of delegating the unit to a worker. Nothing about them is checked.",
+    "Read-only requires launch-specific proof of a reading definition and its capabilities. BB does not expose that proof yet, so native launches remain unverified work; delegate through the plugin instead.",
+  all: "All allows identified subagents, including editing agents, within existing user and parent authority. Unidentified tools receive no exemption, and no additional permissions are granted.",
   none: "None keeps the orchestrator from starting any subagent at all: every unit goes to a worker through `orchestrator_delegate`.",
 };
 
@@ -168,23 +168,6 @@ export const WORKER_SUBAGENT_POLICY_DESCRIPTIONS: Record<WorkerSubagentPolicy, s
 };
 
 /**
- * The agents that only read. OMP's bundled ones have no edit or write tool —
- * reviewer and librarian keep bash, the same allowance a read command gets —
- * plus Claude Code's Explore and Plan, which are read-only by definition. A
- * provider's own editing agents (OMP's `task`, Codex's `worker`) are absent on
- * purpose: one of those is the orchestrator doing the work behind a tool call.
- */
-export const READ_ONLY_SUBAGENTS: ReadonlySet<string> = new Set([
-  "scout",
-  "security-reviewer",
-  "reviewer",
-  "librarian",
-  "seance",
-  "explore",
-  "plan",
-]);
-
-/**
  * The instruction a blocked scope injects into its workers. BB plugins cannot
  * remove a provider's own subagent tool, so the rule is told, not enforced: the
  * worker is the one who has to keep the brief whole.
@@ -203,19 +186,41 @@ yourself, say so in your result instead of splitting it.`;
  * generic tool row whose arguments carry the OMP subagent tool's `tasks` array.
  * An element of that array with no `agent` of its own is OMP's plain `task`.
  */
-export function subagentsOf(row: WorkRowLike): string[] | null {
+export function subagentsOf(row: WorkRowLike, providerId?: string): string[] | null {
   if (row.kind !== "work") return null;
   if (row.workKind === "delegation") {
+    // BB 0.46.1 normalises Codex's toolName to `delegation`; the provider's
+    // fixed presentation labels retain the action. Titles/prompts are not used.
+    if (providerId === "codex" || providerId === "codex-work") {
+      const label = row.presentation?.label;
+      if (label != null && [
+        ["Waiting for agents", "Waited for agents"],
+        ["Messaging agent", "Messaged agent"],
+        ["Closing agent", "Closed agent"],
+        ["Resuming agent", "Resumed agent"],
+      ].some(([pending, completed]) => label.pending === pending && label.completed === completed)) return null;
+      if (["wait", "sendInput", "closeAgent", "resumeAgent"].includes(row.toolName ?? "")) return null;
+    }
     const type = row.subagentType;
     const named = typeof type === "string" ? type.trim() : "";
-    return [named === "" ? "general-purpose" : named];
+    if (named !== "") return [named];
+    // Native Claude launches carry the type only in presentation.detail on
+    // BB 0.46.1. This recovers identity, not permission: the classifier still
+    // cannot treat this name as resolved-definition or capability evidence.
+    if (providerId === "claude-code" && typeof row.presentation?.detail === "string") {
+      const match = /^([^\r\n·]+?) agent(?: · model [^\r\n]+)?$/.exec(row.presentation.detail);
+      if (match !== null) return [match[1]!.trim()];
+    }
+    return ["general-purpose"];
   }
+  // OMP's task payload is meaningful only on its own task tool. An unrelated
+  // tool (e.g. agent_teams_create) keeps its ordinary mutating-tool judgement.
+  if (row.workKind !== "tool" || providerId !== "acp-omp" || row.toolName !== "task") return null;
   const args = row.toolArgs;
   if (args === null || typeof args !== "object") return null;
   const tasks = (args as Record<string, unknown>)["tasks"];
-  // An array of objects is the subagent tool's argument shape. Anything else —
-  // a missing `tasks`, or a plain list of strings — belongs to some other tool
-  // and is judged by name instead.
+  // Tool identity is checked above; malformed arguments do not prove a safe
+  // launch, so the caller keeps its ordinary tool judgement.
   if (!Array.isArray(tasks) || tasks.length === 0) return null;
   if (!tasks.every((task) => task !== null && typeof task === "object" && !Array.isArray(task))) {
     return null;
@@ -348,6 +353,10 @@ export interface WorkRowLike {
   toolArgs?: Record<string, unknown> | null | undefined;
   /** The agent a provider's native delegation row started, when it names one. */
   subagentType?: string | null | undefined;
+  presentation?: {
+    label?: { pending: string; completed: string };
+    detail?: string;
+  } | undefined;
 }
 
 export interface Violation {
@@ -371,6 +380,8 @@ interface ClassifierOptions {
    * agent.
    */
   subagents: OrchestratorSubagentPolicy;
+  /** Provider identity comes from the thread, never from a tool's arguments. */
+  providerId?: string;
 }
 
 const DEFAULT_CLASSIFIER_OPTIONS: ClassifierOptions = {
@@ -1398,7 +1409,7 @@ export function classifyRow(
   row: WorkRowLike & { id: string; turnId?: string | null },
   options: Partial<ClassifierOptions> = {},
 ): Violation | null {
-  const { allowReadCommands, workerThreadIds = [], subagents = "read-only" } = {
+  const { allowReadCommands, workerThreadIds = [], subagents = "read-only", providerId } = {
     ...DEFAULT_CLASSIFIER_OPTIONS,
     ...options,
   };
@@ -1412,17 +1423,25 @@ export function classifyRow(
     detectedAt: Date.now(),
   };
 
+  // Older OMP/ACP versions erase the tool identity altogether. Such a row
+  // cannot establish either a subagent exemption or its capabilities. Keep
+  // task-shaped opaque calls conservative, including under `all`, without
+  // claiming they launched anything or exempting unrelated named tools.
+  if (providerId === "acp-omp" && workKind === "tool" && row.toolName === "other" &&
+      Array.isArray(row.toolArgs?.tasks) && row.toolArgs.tasks.length > 0) {
+    return { ...base, detail: "used an unidentified OMP tool with task arguments; cannot verify its effects" };
+  }
+
   // Subagent rows are decided first: a provider's native delegation row wears
   // the `delegation` work kind, and a generic tool row's name says nothing about
   // what the orchestrator started with it.
-  const started = subagentsOf(row);
+  const started = subagentsOf(row, providerId);
   if (started !== null) {
-    const offending =
-      subagents === "all"
-        ? []
-        : subagents === "none"
-          ? started
-          : started.filter((name) => !READ_ONLY_SUBAGENTS.has(name.toLowerCase()));
+    // BB exposes neither the resolved definition/capabilities at launch nor a
+    // definition revision. Names can be overridden; context snapshots are
+    // cached telemetry. Until launch-bound proof exists, read-only cannot
+    // safely exempt even a familiar reading role. `all` is an explicit opt-in.
+    const offending = subagents === "all" ? [] : started;
     if (offending.length === 0) return null;
     return {
       ...base,
@@ -1540,8 +1559,8 @@ interface InstructionInput {
   workspace?: "shared" | "worktree" | "mixed";
   /**
    * Which subagents the contract lets the orchestrator start. `read-only` — the
-   * default — names the ones that only read; `none` says to start none at all,
-   * and `all` says nothing.
+   * default — requires capability proof; `none` says to start none at all,
+   * and `all` explicitly permits subagents within existing authority.
    */
   subagents?: OrchestratorSubagentPolicy;
 }
@@ -1634,15 +1653,14 @@ export function buildInstructions(input: InstructionInput): string {
   /**
    * What the contract says about the provider's own subagents. The watchdog
    * judges the same rows, so this sentence and the classifier read one policy;
-   * `all` says nothing, because there is nothing to restrict.
+   * Every value is explicit, including under instruction-only enforcement.
    */
-  const readOnlyAgents = [...READ_ONLY_SUBAGENTS].join(", ");
   const subagentRule =
     input.subagents === "none"
       ? `\n\n   Start no subagents of your own: every unit goes through \`${DELEGATE_TOOL}\`.`
       : input.subagents === "all"
-        ? ""
-        : `\n\n   Subagents: only the read-only ones —\n   ${readOnlyAgents}.\n   An editing subagent is direct work: delegate the unit with\n   \`${DELEGATE_TOOL}\` instead.`;
+        ? `\n\n   Subagents: all, including editing agents, are allowed within existing user\n   and parent authorisation. This grants no additional tools or permissions.`
+        : `\n\n   Subagents: read-only, with verified definition and capabilities. BB lacks\n   launch-specific proof, so native launches remain unverified work; use\n   \`${DELEGATE_TOOL}\` instead.`;
 
   /**
    * What the contract says about whose model a worker runs on. A pinned scope —
