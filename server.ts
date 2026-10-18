@@ -31,6 +31,7 @@ import {
   DEFAULT_ENFORCEMENT,
   DELEGATE_TOOL,
   ENFORCEMENT_LEVELS,
+  ORCHESTRATOR_SUBAGENT_POLICIES,
   PINNED_DELEGATION_FIELDS,
   PERMISSION_MODES,
   REASONING_LEVELS,
@@ -38,6 +39,8 @@ import {
   REVIEW_VERDICTS,
   WORKER_MODEL_POLICIES,
   WORKER_PRESETS,
+  WORKER_SUBAGENT_POLICIES,
+  WORKER_SUBAGENT_RULE,
   SERVICE_TIERS,
   EXTRA_INSTRUCTION_LIMIT,
   INSTRUCTION_LIMIT,
@@ -65,6 +68,8 @@ import {
   type WorkerExecution,
   type WorkerModelOption,
   type WorkerModelPolicy,
+  type OrchestratorSubagentPolicy,
+  type WorkerSubagentPolicy,
 } from "./shared";
 
 export { DELEGATE_TOOL };
@@ -343,6 +348,8 @@ const SETTINGS_KEYS = [
   "workerRetention",
   "workerWorkspace",
   "childMessageDelivery",
+  "orchestratorSubagents",
+  "workerSubagents",
 ] as const;
 const settingsKeySchema = z.enum(SETTINGS_KEYS);
 
@@ -358,6 +365,8 @@ const settingsViewSchema = z.object({
   workerRetention: z.enum(WORKER_RETENTION),
   workerWorkspace: z.enum(WORKER_WORKSPACES),
   childMessageDelivery: z.enum(["queued", "immediate"]),
+  orchestratorSubagents: z.enum(ORCHESTRATOR_SUBAGENT_POLICIES),
+  workerSubagents: z.enum(WORKER_SUBAGENT_POLICIES),
 });
 
 export type SettingsViewDto = z.infer<typeof settingsViewSchema>;
@@ -581,6 +590,10 @@ export default async function plugin(bb: BbPluginApi) {
     workerRetention: WorkerRetention;
     workerWorkspace: WorkerWorkspace;
     childMessageDelivery: "queued" | "immediate";
+    /** Whether this scope's orchestrator may start provider subagents at all. */
+    orchestratorSubagents: OrchestratorSubagentPolicy;
+    /** Whether this scope's workers may start subagents of their own. */
+    workerSubagents: WorkerSubagentPolicy;
   }
 
   /** The global record: what every project inherits, plus the composer default. */
@@ -609,6 +622,8 @@ export default async function plugin(bb: BbPluginApi) {
     workerRetention: "keep",
     workerWorkspace: "shared",
     childMessageDelivery: "queued",
+    orchestratorSubagents: "read-only",
+    workerSubagents: "blocked",
   };
 
   /**
@@ -771,6 +786,12 @@ export default async function plugin(bb: BbPluginApi) {
         values.childMessageDelivery === "queued" || values.childMessageDelivery === "immediate"
           ? values.childMessageDelivery
           : base.childMessageDelivery,
+      orchestratorSubagents: isOneOf(ORCHESTRATOR_SUBAGENT_POLICIES, values.orchestratorSubagents)
+        ? values.orchestratorSubagents
+        : base.orchestratorSubagents,
+      workerSubagents: isOneOf(WORKER_SUBAGENT_POLICIES, values.workerSubagents)
+        ? values.workerSubagents
+        : base.workerSubagents,
     };
   }
 
@@ -1121,6 +1142,7 @@ export default async function plugin(bb: BbPluginApi) {
       preset: settings.contractPreset,
       modelPolicy: settings.workerModelPolicy,
       workspace: settings.workerWorkspace,
+      subagents: settings.orchestratorSubagents,
     });
   }
 
@@ -2173,9 +2195,24 @@ export default async function plugin(bb: BbPluginApi) {
     // new-thread default from one that merely predates it, and guessing here is
     // what once governed every mirror-less thread in the app. The dispatch
     // hook, which does have createdAt, is the single place the default lands.
-    const mirror = readMirror(context.pluginMetadata as Record<string, unknown>);
+    const metadata = context.pluginMetadata as Record<string, unknown>;
+    const mirror = readMirror(metadata);
     const enabled = mirror !== null && mirror.enabled;
-    if (!enabled) return { tools: [], skills: [] };
+    if (!enabled) {
+      // A worker this plugin spawned owns one unit, and it is the last thread
+      // that should fan out again. The provider's own subagent tool cannot be
+      // removed from here — `configure` only adds — so the rule is told, not
+      // enforced, and the worker is the one that has to keep the brief whole.
+      const spawnedBy = metadata["workerFor"];
+      if (
+        typeof spawnedBy === "string" &&
+        spawnedBy.trim() !== "" &&
+        settingsFor(context.project.id).workerSubagents === "blocked"
+      ) {
+        return { tools: [], skills: [], instructions: WORKER_SUBAGENT_RULE };
+      }
+      return { tools: [], skills: [] };
+    }
     // The context carries the project, so a session's contract is the one resolved
     // for the project it belongs to rather than the plugin-wide default.
     const settings = settingsFor(context.project.id);
@@ -2197,6 +2234,7 @@ export default async function plugin(bb: BbPluginApi) {
         preset: settings.contractPreset,
         modelPolicy: settings.workerModelPolicy,
         workspace: settings.workerWorkspace,
+        subagents: settings.orchestratorSubagents,
       }),
     };
   });
@@ -2345,7 +2383,9 @@ export default async function plugin(bb: BbPluginApi) {
   async function scan(threadId: string): Promise<void> {
     // Resolved once per scan: the project a thread belongs to cannot change
     // mid-scan, and the classifier reads two values from it per row.
-    const scanSettings = settingsFor(await projectOfThread(threadId));
+    const scanThread = await bb.sdk.threads.get({ threadId }).catch(() => null);
+    const scanSettings = settingsFor(scanThread?.projectId);
+    const providerId = scanThread?.providerId;
     const state = await getState(threadId);
     if (state === undefined || !state.enabled) return;
     const enforcement = effectiveEnforcement(state);
@@ -2428,7 +2468,10 @@ export default async function plugin(bb: BbPluginApi) {
         // judged, only recorded.
         if (turnId !== null && graceTurnIds.includes(turnId)) continue;
         const violation = classifyRow(row, {
-          allowReadCommands: scanSettings.allowReadCommands, workerThreadIds,
+          allowReadCommands: scanSettings.allowReadCommands,
+          workerThreadIds,
+          subagents: scanSettings.orchestratorSubagents,
+          providerId,
         });
         if (violation !== null) {
           fresh.push(violation);
@@ -2834,6 +2877,8 @@ export default async function plugin(bb: BbPluginApi) {
     retention?: WorkerRetention;
     "worker-workspace"?: WorkerWorkspace;
     "child-messages"?: "queued" | "immediate";
+    "orchestrator-subagents"?: OrchestratorSubagentPolicy;
+    "worker-subagents"?: WorkerSubagentPolicy;
   }
 
   function settingsPatch(options: ScopeSettingsFlags): Partial<OrchestratorSettings> {
@@ -2858,6 +2903,12 @@ export default async function plugin(bb: BbPluginApi) {
       ...(options["child-messages"] === undefined
         ? {}
         : { childMessageDelivery: options["child-messages"] }),
+      ...(options["orchestrator-subagents"] === undefined
+        ? {}
+        : { orchestratorSubagents: options["orchestrator-subagents"] }),
+      ...(options["worker-subagents"] === undefined
+        ? {}
+        : { workerSubagents: options["worker-subagents"] }),
     };
   }
 
@@ -2969,6 +3020,11 @@ export default async function plugin(bb: BbPluginApi) {
             "no-wait": { type: "boolean", description: "Return immediately so other units can be delegated" },
             timeout: { type: "integer", min: 10, max: 3600, description: "Wait timeout in seconds (default 900)" },
             hidden: { type: "boolean", description: "Keep the worker out of the sidebar" },
+            workspace: {
+              type: "enum",
+              values: ["shared", "worktree"],
+              description: "Where this unit runs: shared (the orchestrator's checkout) or worktree. Required when the scope's worker workspace is mixed",
+            },
           },
           async run(input, ctx) {
             const threadId = resolveThreadId(input.options.thread, ctx);
@@ -2980,6 +3036,7 @@ export default async function plugin(bb: BbPluginApi) {
               waitForResult: input.options["no-wait"] !== true,
               timeoutSeconds: input.options.timeout,
               hidden: input.options.hidden,
+              workspace: input.options.workspace,
             });
             if (!parsed.success) {
               throw new PluginCliError("invalid delegation arguments", {
@@ -3103,6 +3160,18 @@ export default async function plugin(bb: BbPluginApi) {
               values: [...WORKER_WORKSPACES],
               description: "Write that scope's worker workspace: shared or worktree",
             },
+            "orchestrator-subagents": {
+              type: "enum",
+              values: [...ORCHESTRATOR_SUBAGENT_POLICIES],
+              description:
+                "Write that scope's orchestrator subagent policy: read-only (the default) allows the providers' reading agents only, all allows any, none starts none",
+            },
+            "worker-subagents": {
+              type: "enum",
+              values: [...WORKER_SUBAGENT_POLICIES],
+              description:
+                "Write that scope's worker subagent policy: blocked (the default) tells every worker it owns its unit, allowed leaves its provider's subagents alone",
+            },
             "worker-provider": { type: "string", description: "Write this project's worker provider" },
             "worker-model": { type: "string", description: "Write this project's worker model" },
             "clear-worker": {
@@ -3195,6 +3264,8 @@ export default async function plugin(bb: BbPluginApi) {
                   `  worker retention:     ${values.workerRetention}`,
                   `  worker workspace:     ${values.workerWorkspace}`,
                   `  child messages:       ${values.childMessageDelivery}`,
+                  `  orchestrator subagents: ${values.orchestratorSubagents}`,
+                  `  worker subagents:        ${values.workerSubagents}`,
                   `  workers run as:       ${worker}${describeFallback(live.worker.fallback)}${describePresets(live.worker.presets)}`,
                   `  rules:                ${extraInstructions === "" ? "none" : `${extraInstructions.length} characters`}`,
                   `  new threads default:  ${live.defaultForNewThreads ? "on" : "off"}`,
@@ -3253,6 +3324,8 @@ export default async function plugin(bb: BbPluginApi) {
                 `  worker retention:    ${values.workerRetention}${view.overridden.includes("workerRetention") ? " (project)" : " (global)"}`,
                 `  worker workspace:    ${values.workerWorkspace}${view.overridden.includes("workerWorkspace") ? " (project)" : " (global)"}`,
                 `  child messages:      ${values.childMessageDelivery}${view.overridden.includes("childMessageDelivery") ? " (project)" : " (global)"}`,
+                `  orchestrator subagents: ${values.orchestratorSubagents}${view.overridden.includes("orchestratorSubagents") ? " (project)" : " (global)"}`,
+                `  worker subagents:       ${values.workerSubagents}${view.overridden.includes("workerSubagents") ? " (project)" : " (global)"}`,
                 `  workers run as:      ${view.worker}`,
                 `  project rules:       ${view.rules === null ? "inherits the global rules" : `${view.rules.length} characters`}`,
               ].join("\n"),

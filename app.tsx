@@ -37,7 +37,11 @@ import {
   ENFORCEMENT_DESCRIPTIONS,
   ENFORCEMENT_LEVELS,
   INSTRUCTION_LIMIT,
+  ORCHESTRATOR_SUBAGENT_POLICIES,
+  ORCHESTRATOR_SUBAGENT_POLICY_DESCRIPTIONS,
   WORKER_MODEL_POLICIES,
+  WORKER_SUBAGENT_POLICIES,
+  WORKER_SUBAGENT_POLICY_DESCRIPTIONS,
   type WorkerConfig,
   type WorkerExecution,
   type WorkerPresetName,
@@ -715,6 +719,26 @@ function ScopeSettings() {
             value: policy,
             label: policy,
             help: WORKER_MODEL_POLICY_DESCRIPTIONS[policy],
+          })),
+        )}
+        {enumRow(
+          "orchestratorSubagents",
+          "Orchestrator subagents",
+          "Whether the orchestrator may start a provider's own subagents. A subagent that edits is the orchestrator doing the work, not delegating it.",
+          ORCHESTRATOR_SUBAGENT_POLICIES.map((policy) => ({
+            value: policy,
+            label: policy,
+            help: ORCHESTRATOR_SUBAGENT_POLICY_DESCRIPTIONS[policy],
+          })),
+        )}
+        {enumRow(
+          "workerSubagents",
+          "Worker subagents",
+          "Whether a worker may start subagents of its own. Blocked tells it the unit is its own to finish; a unit too big for that is reported rather than split.",
+          WORKER_SUBAGENT_POLICIES.map((policy) => ({
+            value: policy,
+            label: policy,
+            help: WORKER_SUBAGENT_POLICY_DESCRIPTIONS[policy],
           })),
         )}
       </div>

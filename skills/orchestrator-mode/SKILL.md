@@ -30,6 +30,7 @@ bb orchestrator-mode worker [--provider <id>] [--model <id>] [--preset <name>] [
 bb orchestrator-mode contract [--thread <id>] [--rules <text>] [--clear-rules] [--json]
 bb orchestrator-mode scope [--project <id>] [--max-parallel <n>] [--inherit <key>] [--inherit-all] [--json]
 bb orchestrator-mode scope --global|--project <id> [--child-messages queued|immediate] [--json]
+bb orchestrator-mode scope --global|--project <id> [--orchestrator-subagents read-only|all|none] [--worker-subagents blocked|allowed]
 ```
 
 `--thread` defaults to the thread running the command, so an agent can inspect
@@ -79,6 +80,17 @@ output redirects and mutating `find` actions (`-delete`, `-exec`, `-fprint`)
 still count as work. Creating images counts as work and must be
 delegated; inspecting images is allowed. Git commands that create or delete
 branches or tags, change remotes, or rewrite reflogs also count as work.
+
+Your provider's own subagents follow the scope's **Orchestrator subagents**
+policy. Under the default `read-only`, only reading definitions with
+launch-specific provenance and capability proof can be allowed. BB currently
+exposes no such proof, so native launches remain unverified work, including
+Explore and Plan. Familiar names and cached context snapshots confer no trust.
+`none` prohibits launches, while `all` allows identified subagents, including
+editing ones, within existing user and parent authority. Codex coordination
+(waiting, messaging, resuming or closing) is allowed under every policy. An OMP
+tool whose identity was erased to `other` cannot establish a subagent exemption.
+Delegate unverified units with `orchestrator_delegate` instead.
 
 ## Delegating
 

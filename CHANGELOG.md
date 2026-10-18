@@ -19,6 +19,18 @@ All notable changes to Orchestrator Mode are documented here. The format follows
   delegation pass `model`, `provider` and `reasoning` and keeps the contract's
   "give a hard unit a stronger model" advice. `Pinned` refuses those three and
   says so in the contract, while leaving stored presets reachable.
+- Add subagent policies — **Orchestrator subagents** (`read-only` default,
+  `all`, `none`; `scope --orchestrator-subagents`) and **Worker subagents**
+  (`blocked` default, `allowed`; `scope --worker-subagents`). The watchdog now
+  judges identified provider subagents instead of always allowing them. The
+  default requires launch-specific read-only provenance, which BB does not yet
+  expose; native reading support remains blocked on that upstream metadata.
+  Familiar names and cached telemetry grant no trust. Codex coordination stays allowed;
+  unrelated task arrays retain normal classification. Legacy opaque OMP calls
+  remain unverified work. Every policy is explicit in the contract and grants
+  no additional user or parent authority. Blocked workers receive
+  an injected rule against starting subagents; BB cannot remove the provider's
+  own tool, so it is an instruction rather than enforcement.
 - Queue direct child messages while an orchestrator turn is running, using
   BB's persistent queue and delivery when idle. Global/Project settings
   and `scope --child-messages queued|immediate` control the policy. Automatic

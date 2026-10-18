@@ -195,6 +195,23 @@ pair rather than a switch:
   a delegation that passes `model`, `provider` or `reasoning` is refused, and the
   contract stops inviting one. Flexible lets the orchestrator ask for a stronger
   or cheaper model for a single unit instead.
+- **Orchestrator subagents** `Read-only` (default), `All` or `None`. Read-only
+  requires launch-specific proof of a reading definition and its capabilities.
+  **BB does not currently expose that proof**, so native launches, including
+  Explore and Plan, remain unverified work. Familiar names and cached context
+  snapshots cannot establish whether a custom writable definition was resolved.
+  This limitation needs a provider/SDK change; use `orchestrator_delegate` until
+  that evidence is available. `None` counts every launch; `All` permits identified
+  subagents, including editing ones, within existing user and parent authority.
+  Codex waiting, messaging, resuming and closing are coordination under every
+  policy. OMP's `task` arguments are parsed only when its tool is identified.
+  Older OMP/ACP rows named only `other` cannot establish that identity: opaque
+  task-shaped calls remain unverified work even under `All`. This is a BB
+  metadata limitation; use `orchestrator_delegate` for those units.
+- **Worker subagents** `Blocked` (default) or `Allowed`. Blocked injects a rule
+  into every worker this plugin spawns: do the unit yourself, start no subagents,
+  and say so when the unit is too big. A BB plugin cannot remove a provider's own
+  subagent tool, so this is an instruction, not a watchdog.
 
 ### Where workers run
 
@@ -553,6 +570,8 @@ CLI, and the composer toggles.
 | `contractPreset` | `standard` | Which [contract level](#the-contract) a session receives. |
 | `workerRetention` | `keep` | What happens to a worker once its result has been read: keep it, archive check units, or archive every read worker. |
 | `workerWorkspace` | `shared` | Where a delegation runs: `shared`, `worktree`, or `mixed` (the orchestrator names one per unit, see [Where workers run](#where-workers-run)). |
+| `orchestratorSubagents` | `read-only` | Allow verified reading definitions, all identified subagents, or no subagent launches. |
+| `workerSubagents` | `blocked` | Inject the no-onward-delegation rule, or omit it with `allowed`; neither value grants tools or changes permission mode. |
 | `maxParallelWorkers` | `8` | Refuse a delegation while this many workers are running. `0` removes the cap. |
 | `maxDelegationsPerTurn` | `20` | Refuse a delegation once a turn has delegated this many. `0` removes the cap. |
 
