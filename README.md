@@ -602,9 +602,11 @@ bb plugin enable orchestrator-mode
 
 ## Release notes
 
-See the [0.1.3 release notes](docs/releases/0.1.3.md) for the composer fix.
-The [0.1.2 release notes](docs/releases/0.1.2.md) cover worker controls,
-watchdog fixes, upgrade guidance and contributor acknowledgements; the
+See the [0.1.4 release notes](docs/releases/0.1.4.md) for worker model pins,
+subagent policies and contributor acknowledgements. The
+[0.1.3 release notes](docs/releases/0.1.3.md) cover the composer fix. The
+[0.1.2 release notes](docs/releases/0.1.2.md) cover worker controls,
+watchdog fixes and upgrade guidance; the
 [changelog](CHANGELOG.md) records the full version history.
 
 ## Development

@@ -6,6 +6,8 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ## Unreleased
 
+## 0.1.4 - 2026-10-18
+
 ### Fixed
 
 - Avoid the 30-second startup dependency loop by discovering worker models and
@@ -50,6 +52,21 @@ All notable changes to Orchestrator Mode are documented here. The format follows
   Recover pending batches on reload and handle concurrent queue changes.
 - Preserve the per-turn delegation budget when messages join a running turn
   or wait in the queue; reset it only when a new turn starts.
+- Treat a correction sent to a thread this orchestrator owns, including a
+  hidden child and a fork, as coordination rather than direct work.
+
+### Contributors
+
+- Thank you [@GantisStorm](https://github.com/GantisStorm) for
+  [PR #10](https://github.com/MacHatter1/bb-plugin-orchestrator-mode/pull/10):
+  pin worker models to the scope's stored execution, and
+  [PR #12](https://github.com/MacHatter1/bb-plugin-orchestrator-mode/pull/12):
+  orchestrator and worker subagent policies.
+- [@MacHatter1](https://github.com/MacHatter1) contributed queued child
+  messages, batched child updates in
+  [PR #9](https://github.com/MacHatter1/bb-plugin-orchestrator-mode/pull/9),
+  and the startup stall fix in
+  [PR #11](https://github.com/MacHatter1/bb-plugin-orchestrator-mode/pull/11).
 
 ## 0.1.3 - 2026-10-07
 
