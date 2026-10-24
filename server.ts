@@ -861,7 +861,9 @@ export default async function plugin(bb: BbPluginApi) {
     if (
       exec.model !== undefined &&
       catalogReady &&
-      catalog.unavailable.length === 0 &&
+      (exec.providerId === undefined
+        ? catalog.unavailable.length === 0
+        : catalog.providers.includes(exec.providerId)) &&
       !catalog.models.some((option) => option.id === exec.model)
     ) {
       const sample = catalog.models
@@ -3132,6 +3134,17 @@ export default async function plugin(bb: BbPluginApi) {
             },
           },
           async run(input, ctx) {
+            // A --thread that is not the calling thread would let a worker delegate on another orchestrator's behalf.
+            if (
+              input.options.thread !== undefined &&
+              ctx.threadId !== undefined &&
+              input.options.thread.trim() !== ctx.threadId
+            ) {
+              throw new PluginCliError("delegation runs in the calling thread only", {
+                code: "thread_mismatch",
+                hint: "Run this inside the orchestrator's own bb thread, without --thread.",
+              });
+            }
             const threadId = resolveThreadId(input.options.thread, ctx);
             const parsed = delegateParameters.safeParse({
               task: input.options.task,

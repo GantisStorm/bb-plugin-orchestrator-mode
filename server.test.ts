@@ -2855,6 +2855,18 @@ describe("the delegation tool", () => {
     expect(spawned).toHaveLength(0);
   });
 
+  it("refuses a delegation that names a thread other than the caller", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    const result = await harness.behavior.runCli(
+      ["delegate", "--thread", "th_other", "--task", "Do it", "--no-wait"],
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("calling thread");
+    expect(spawned).toHaveLength(0);
+  });
+
   it("checks every unit of a review-heavy scope without being asked", async () => {
     const { harness } = await load({ contractPreset: "review-heavy" });
     await enable(harness);

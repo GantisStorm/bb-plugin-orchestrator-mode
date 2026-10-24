@@ -21,11 +21,11 @@ import {
   definePluginApp,
   experimental_PermissionModePicker as PermissionModePicker,
   experimental_ProviderModelPicker as ProviderModelPicker,
-  useComposerView,
+  useComposer,
   useRealtime,
   useRpc,
   useSdk,
-  type ComposerView,
+  type PluginComposerApi,
   type ExperimentalProviderModelPickerValue,
   type PluginComposerScope,
 } from "@get-bb/plugin-sdk/app";
@@ -37,6 +37,9 @@ import {
   ENFORCEMENT_DESCRIPTIONS,
   ENFORCEMENT_LEVELS,
   INSTRUCTION_LIMIT,
+  isOneOf,
+  REASONING_LEVELS,
+  SERVICE_TIERS,
   ORCHESTRATOR_SUBAGENT_POLICIES,
   ORCHESTRATOR_SUBAGENT_POLICY_DESCRIPTIONS,
   WORKER_MODEL_POLICIES,
@@ -90,9 +93,19 @@ function scopeKey(scope: PluginComposerScope): string | null {
   return null;
 }
 
-function controllerFor(view: ComposerView): Controller | null {
+function controllerFor(view: PluginComposerApi): Controller | null {
   const key = scopeKey(view.scope);
   return key === null ? null : (registry.get(key) ?? null);
+}
+
+/** The picker's value as a stored execution. A reasoning level or tier this plugin does not store is dropped. */
+function executionOf(next: ExperimentalProviderModelPickerValue): Partial<WorkerExecution> {
+  const { reasoningLevel, serviceTier, ...rest } = next;
+  return {
+    ...rest,
+    ...(isOneOf(REASONING_LEVELS, reasoningLevel) ? { reasoningLevel } : {}),
+    ...(isOneOf(SERVICE_TIERS, serviceTier) ? { serviceTier } : {}),
+  };
 }
 
 /** Re-render whenever any controller's contents change. */
@@ -119,7 +132,7 @@ const ICON_NAME = "orchestrator-mode/hub";
  * compact layout, where the action button does not render.
  */
 function OrchestratorHost() {
-  const view = useComposerView();
+  const view = useComposer();
   const rpc = useRpc<typeof rpcContract>();
   const key = scopeKey(view.scope);
   const threadId = view.scope.kind === "thread" ? view.scope.threadId : null;
@@ -273,7 +286,7 @@ function OrchestratorHost() {
 
 /** The toggle button that renders before the native voice/submit actions. */
 function OrchestratorToggle() {
-  const view = useComposerView();
+  const view = useComposer();
   const key = scopeKey(view.scope);
   const controller = useController(key);
   if (key === null || controller === null) return null;
@@ -434,7 +447,7 @@ function ScopeSettings() {
     return {
       providerId: provider.id,
       model: model.id,
-      reasoningLevel: model.defaultReasoningEffort,
+      reasoningLevel: isOneOf(REASONING_LEVELS, model.defaultReasoningEffort) ? model.defaultReasoningEffort : undefined,
       permissionMode: system.permissionCeiling,
     };
   }, [sdk]);
@@ -793,7 +806,7 @@ function ScopeSettings() {
             value={selectionOf(execution)}
             disabled={busy}
             className="h-8 max-w-full"
-            onChange={(next) => void save({ ...execution, ...next })}
+            onChange={(next) => void save({ ...execution, ...executionOf(next) })}
           />
           <PermissionModePicker
             providerId={execution.providerId!}
@@ -852,7 +865,7 @@ function ScopeSettings() {
               void save({
                 ...stored,
                 fallback: {
-                  ...next,
+                  ...executionOf(next),
                   ...(fallback.permissionMode === undefined
                     ? {}
                     : { permissionMode: fallback.permissionMode }),
@@ -1112,7 +1125,7 @@ export default definePluginApp((app) => {
         label: "Orchestrator mode",
         description: "Force this thread to delegate every unit of work",
         disabled: (view) => controllerFor(view) === null,
-        run: async ({ view }) => {
+        run: async ({ composer: view }) => {
           const controller = controllerFor(view);
           if (controller === null) {
             toast.error("Orchestrator mode is not available in this composer.");

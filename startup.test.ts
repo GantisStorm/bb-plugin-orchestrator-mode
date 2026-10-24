@@ -226,6 +226,28 @@ describe("startup readiness", () => {
     }
   });
 
+  it("checks a requested model against its named provider while another provider is unreadable", async () => {
+    vi.useFakeTimers();
+    const host = fixture(async (args) => {
+      if (args?.providerId === "beta") throw new Error("offline");
+      return args?.providerId ? models(args.providerId) : providers;
+    });
+    try {
+      await plugin(host.bb);
+      host.harness.behavior.runService("worker-catalog");
+      await flush();
+      await expect(
+        host.harness.behavior.callRpc("set_worker_execution", { providerId: "alpha", model: "beta-model" }),
+      ).rejects.toThrow(/Unknown worker model "beta-model"/);
+      expect(await getWorker(host)).not.toHaveProperty("model");
+      await host.harness.behavior.callRpc("set_worker_execution", { providerId: "alpha", model: "alpha-model" });
+      expect(await getWorker(host)).toMatchObject({ providerId: "alpha", model: "alpha-model" });
+    } finally {
+      await host.harness.lifecycle.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it("distinguishes a successful empty catalog from unavailable discovery", async () => {
     const host = fixture(async () => ({ providers: [], models: [] }));
     try {

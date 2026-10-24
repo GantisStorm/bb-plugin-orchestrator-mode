@@ -273,7 +273,7 @@ describe("thread composer", () => {
     expect(disabled(plusMenuView({ kind: "thread", threadId: THREAD }))).toBe(false);
 
     await act(async () => {
-      await item.run({ composer: {} as never, view: plusMenuView({ kind: "thread", threadId: THREAD }) as never });
+      await item.run({ composer: plusMenuView({ kind: "thread", threadId: THREAD }) as never });
     });
     expect(rpc.calls.some((call) => call.method === "set_enabled")).toBe(true);
   });
