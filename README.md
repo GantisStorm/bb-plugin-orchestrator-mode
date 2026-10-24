@@ -209,9 +209,11 @@ pair rather than a switch:
   task-shaped calls remain unverified work even under `All`. This is a BB
   metadata limitation; use `orchestrator_delegate` for those units.
 - **Worker subagents** `Blocked` (default) or `Allowed`. Blocked injects a rule
-  into every worker this plugin spawns: do the unit yourself, start no subagents,
-  and say so when the unit is too big. A BB plugin cannot remove a provider's own
-  subagent tool, so this is an instruction, not a watchdog.
+  into every worker this plugin spawns: do the unit yourself and start no
+  subagents. The watchdog then watches each such worker's timeline; a launch is
+  answered with a correction message, up to the scope's reminder budget. BB
+  cannot stop the provider's own subagent tool before it runs, so a launch can
+  land before the correction does.
 
 ### Where workers run
 

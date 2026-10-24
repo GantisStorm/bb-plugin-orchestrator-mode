@@ -6,6 +6,17 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- A blocked worker's subagent launches are watched. The watchdog reads each
+  worker's timeline and sends a correction message when it starts a subagent,
+  within the scope's reminder budget. Before this, the rule was only injected.
+
+### Fixed
+
+- A `delegate-only` contract's watchdog now refuses shell reads too, matching
+  the contract, which runs no shell commands.
+
 ## 0.1.4 - 2026-10-18
 
 ### Fixed

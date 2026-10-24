@@ -67,6 +67,9 @@ function queueFixture(harness: FakePluginHarness, initial: QueueEntry[]) {
 /** Timeline rows the watchdog reads, mutated per test. */
 let timelineRows: unknown[] = [];
 let timelineMaxSeq = 0;
+/** The worker's own timeline rows, returned for the worker thread only. */
+let workerRows: unknown[] = [];
+let workerMaxSeq = 0;
 /** Per-thread plugin-metadata namespaces, as the server would store them. */
 let metadata: Record<string, Record<string, unknown>> = {};
 let sentTexts: string[] = [];
@@ -204,7 +207,8 @@ async function load(
           metadata[threadId] = current;
           return current;
         },
-        timeline: async () => ({ rows: timelineRows, maxSeq: timelineMaxSeq }),
+        timeline: async ({ threadId }: { threadId: string }) =>
+          threadId === WORKER ? { rows: workerRows, maxSeq: workerMaxSeq } : { rows: timelineRows, maxSeq: timelineMaxSeq },
         list: async (args: {
           parentThreadId?: string;
           sourceThreadId?: string;
@@ -270,7 +274,8 @@ async function load(
 
 beforeEach(() => {
   timelineRows = [];
-  timelineMaxSeq = 0;
+  workerRows = [];
+  workerMaxSeq = 0;
   metadata = {};
   sentTexts = [];
   stoppedThreads = [];
@@ -3066,6 +3071,60 @@ describe("rpc", () => {
     expect(listed.stdout).toContain("started subagent `task` itself");
     expect(listed.stdout).toContain("`scout`");
     expect(listed.stdout).toContain("unidentified OMP tool");
+  });
+
+  it("nudges a worker that starts a subagent while its scope blocks them", async () => {
+    const { harness } = await load({ enforcement: "guard", workerSubagents: "blocked" });
+    await enable(harness);
+    await harness.behavior.runCli(
+      ["delegate", "--task", "Write the parser", "--no-wait"],
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    workerRows = [workRow({
+      id: "row_worker_task", workKind: "tool", toolName: "task", turnId: "turn_w1",
+      sourceSeqStart: 1, sourceSeqEnd: 1, toolArgs: { tasks: [{ agent: "reviewer", task: "split it" }] },
+    })];
+    workerMaxSeq = 1;
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: WORKER }),
+      lastAssistantText: null,
+    });
+    await vi.waitFor(() => expect(sentTexts.some((text) => text.includes("started subagent `reviewer`"))).toBe(true));
+  });
+
+  it("leaves a worker alone when its scope allows subagents", async () => {
+    const { harness } = await load({ enforcement: "guard", workerSubagents: "allowed" });
+    await enable(harness);
+    await harness.behavior.runCli(
+      ["delegate", "--task", "Write the parser", "--no-wait"],
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    workerRows = [workRow({
+      id: "row_worker_task", workKind: "tool", toolName: "task", turnId: "turn_w1",
+      sourceSeqStart: 1, sourceSeqEnd: 1, toolArgs: { tasks: [{ agent: "reviewer", task: "split it" }] },
+    })];
+    workerMaxSeq = 1;
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: WORKER }),
+      lastAssistantText: null,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(sentTexts.filter((text) => text.includes("started subagent"))).toEqual([]);
+  });
+
+  it("holds a delegate-only orchestrator to its no-commands contract even when reads are allowed", async () => {
+    const { harness } = await load({ enforcement: "block", allowReadCommands: true, contractPreset: "delegate-only" });
+    await arm(harness);
+    timelineRows = [...timelineRows, workRow({
+      id: "row_ls", workKind: "command", turnId: "turn_2", sourceSeqStart: 3, sourceSeqEnd: 4, command: "ls",
+    })];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      violations: Array<{ detail: string }>;
+    };
+    expect(state.violations.map((violation) => violation.detail)).toEqual(["ran `ls`"]);
   });
 
   it.each(["Explore", "Plan"])("does not mistake cached built-in telemetry for launch-specific proof of native Claude %s", async (name) => {

@@ -55,6 +55,7 @@ import {
   buildReviewNudge,
   buildVerifierBrief,
   classifyRow,
+  subagentsOf,
   defaultAppliesTo,
   isEnforcementLevel,
   isOneOf,
@@ -201,6 +202,11 @@ export interface ThreadState {
    * with the same unjudged workers is not nagged twice.
    */
   lastReviewNudge: string | null;
+  /**
+   * The orchestrator this thread is a worker of, when this plugin spawned it.
+   * A worker never runs the mode, so its subagent launches are watched through this link.
+   */
+  workerOf: string | null;
 }
 
 const delegationSchema = z.object({
@@ -1239,6 +1245,7 @@ export default async function plugin(bb: BbPluginApi) {
       nudgeCount: typeof state.nudgeCount === "number" ? state.nudgeCount : 0,
       violationNudges: typeof state.violationNudges === "number" ? state.violationNudges : 0,
       reviewNudges: typeof state.reviewNudges === "number" ? state.reviewNudges : 0,
+      workerOf: typeof state.workerOf === "string" ? state.workerOf : null,
     };
   }
 
@@ -1267,6 +1274,7 @@ export default async function plugin(bb: BbPluginApi) {
       delegations: [],
       turnStartedAt: 0,
       lastReviewNudge: null,
+      workerOf: null,
     };
   }
 
@@ -1836,6 +1844,7 @@ export default async function plugin(bb: BbPluginApi) {
             : { executionInputSources: executionSources(exec) }),
           pluginMetadata: { workerFor: orchestratorId },
         });
+        await mutateState(spawned.id, (current) => ({ ...current, workerOf: orchestratorId }));
         await mutateState(orchestratorId, (current) => ({
           ...current,
           delegations: trimDelegations([
@@ -2343,6 +2352,10 @@ export default async function plugin(bb: BbPluginApi) {
     const scanSettings = settingsFor(scanThread?.projectId);
     const providerId = scanThread?.providerId;
     const state = await getState(threadId);
+    if (state !== undefined && !state.enabled && state.workerOf !== null) {
+      await scanWorker(threadId, state, providerId, scanSettings);
+      return;
+    }
     if (state === undefined || !state.enabled) return;
     const enforcement = effectiveEnforcement(state);
     if (enforcement === "instruct") return;
@@ -2424,7 +2437,8 @@ export default async function plugin(bb: BbPluginApi) {
         // judged, only recorded.
         if (turnId !== null && graceTurnIds.includes(turnId)) continue;
         const violation = classifyRow(row, {
-          allowReadCommands: scanSettings.allowReadCommands,
+          // The delegate-only contract runs no shell commands, so its watchdog judges reads as work too.
+          allowReadCommands: scanSettings.allowReadCommands && scanSettings.contractPreset !== "delegate-only",
           workerThreadIds,
           subagents: scanSettings.orchestratorSubagents,
           providerId,
@@ -2465,6 +2479,71 @@ export default async function plugin(bb: BbPluginApi) {
     );
     bb.realtime.publish(STATE_CHANGED, { at: Date.now(), threadId, violations: fresh.length });
     await intervene(threadId, updated, fresh, enforcement, liveTurnKey ?? fresh[fresh.length - 1]!.id);
+  }
+
+  /**
+   * A worker this plugin spawned. Its scope decides whether it may start subagents.
+   * The provider's own subagent tool cannot be removed, so a launch is answered
+   * with a correction instead of being prevented.
+   */
+  async function scanWorker(
+    threadId: string,
+    state: ThreadState,
+    providerId: string | undefined,
+    settings: SettingsView,
+  ): Promise<void> {
+    if (settings.workerSubagents !== "blocked") return;
+    const timeline = await bb.sdk.threads.timeline({
+      threadId,
+      includeNestedRows: "true",
+      ...(state.lastSeq > 0 ? { afterSequence: String(state.lastSeq) } : {}),
+    });
+    const rows = asScanRows(timeline.delta?.upsertRows ?? timeline.rows);
+    const reportedMaxSeq =
+      typeof timeline.maxSeq === "number" && Number.isFinite(timeline.maxSeq) ? timeline.maxSeq : 0;
+    let maxSeq = Math.max(state.lastSeq, reportedMaxSeq);
+    const seen = [...state.seenRowIds];
+    const started: string[] = [];
+    let launchTurn = "";
+    for (const row of rows) {
+      const seq = typeof row.sourceSeqEnd === "number" ? row.sourceSeqEnd : 0;
+      if (seq > maxSeq) maxSeq = seq;
+      if (seq !== 0 && seq <= state.lastSeq) continue;
+      const key = seenKey(row);
+      if (seen.includes(key)) continue;
+      seen.push(key);
+      const names = subagentsOf(row, providerId);
+      if (names === null || names.length === 0) continue;
+      started.push(...names);
+      launchTurn = row.turnId ?? row.id;
+    }
+    const updated = await mutateState(threadId, (current) => ({
+      ...current,
+      lastSeq: Math.max(current.lastSeq, maxSeq),
+      seenRowIds: seen.slice(-MAX_SEEN_ROWS),
+    }));
+    if (started.length === 0 || updated === undefined) return;
+    if (updated.lastNudgeTurnId === launchTurn || updated.nudgeCount >= settings.maxNudges) return;
+    const names = [...new Set(started)].map((name) => `\`${name}\``).join(", ");
+    bb.log.warn(`worker ${threadId} started subagent ${names}`);
+    try {
+      await bb.sdk.threads.send({
+        threadId,
+        mode: "auto",
+        input: [{
+          type: "text",
+          text: `You started subagent ${names} yourself. Worker subagents are blocked in this scope: finish this unit with your own tools and start no subagents.`,
+          mentions: [],
+        }],
+      });
+      await mutateState(threadId, (current) => ({
+        ...current,
+        nudgeCount: current.nudgeCount + 1,
+        lastNudgeTurnId: launchTurn,
+      }));
+    } catch (cause) {
+      bb.log.warn(`worker nudge failed for ${threadId}: ${String(cause)}`);
+    }
   }
 
   async function intervene(
@@ -2510,7 +2589,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("experimental_thread.events", ({ thread }) => {
     void (async () => {
       const state = await getState(thread.id);
-      if (state?.enabled === true) scheduleScan(thread.id);
+      if (state?.enabled === true || state?.workerOf) scheduleScan(thread.id);
     })();
   });
 
@@ -2521,6 +2600,8 @@ export default async function plugin(bb: BbPluginApi) {
       if (state?.enabled === true) {
         scheduleScan(thread.id, 250);
         await checkReviews(thread.id);
+      } else if (state?.workerOf) {
+        scheduleScan(thread.id, 250);
       }
     })();
   });
