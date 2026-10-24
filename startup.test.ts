@@ -164,14 +164,11 @@ describe("startup readiness", () => {
     } finally { ready.resolve(providers); await host.harness.lifecycle.dispose(); }
   });
 
-  it.each(["system", "provider", "returned error"])("preserves choices on %s discovery failure and retries without failing activation", async (failure) => {
+  it("preserves choices on system discovery failure and retries without failing activation", async () => {
     vi.useFakeTimers();
     let failing = true;
     const host = fixture(async (args) => {
-      if (failing && failure === "returned error" && args?.providerId === "beta") {
-        return { providers: [], models: [], modelLoadError: { code: "timeout", providerId: "beta", detail: "offline" } };
-      }
-      if (failing && (failure === "system" || args?.providerId === "beta")) throw new Error("offline");
+      if (failing) throw new Error("offline");
       return args?.providerId ? models(args.providerId) : providers;
     });
     try {
@@ -181,6 +178,40 @@ describe("startup readiness", () => {
       const service = host.harness.behavior.runService("worker-catalog");
       await flush();
       expect(host.harness.logEntries.some((entry) => entry.message.includes("preserving saved choices and retrying"))).toBe(true);
+      expect(await getWorker(host)).toEqual(config);
+      expect(await getProject(host)).toEqual(config);
+      expect(vi.getTimerCount()).toBe(1);
+      failing = false;
+      await vi.advanceTimersByTimeAsync(30_000);
+      await service.done;
+      expect(await getWorker(host)).toMatchObject({ providerId: "beta", model: "beta-model" });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await host.harness.lifecycle.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["provider", "returned error"])("keeps a provider that cannot list its models unavailable without stalling discovery (%s)", async (failure) => {
+    vi.useFakeTimers();
+    let failing = true;
+    const host = fixture(async (args) => {
+      if (failing && args?.providerId === "beta") {
+        if (failure === "returned error") {
+          return { providers: [], models: [], modelLoadError: { code: "timeout", providerId: "beta", detail: "offline" } };
+        }
+        throw new Error("offline");
+      }
+      return args?.providerId ? models(args.providerId) : providers;
+    });
+    try {
+      await host.bb.storage.kv.set("worker", config);
+      await host.bb.storage.kv.set("project_worker", { project: config });
+      await plugin(host.bb);
+      const service = host.harness.behavior.runService("worker-catalog");
+      await flush();
+      // The healthy providers are validated now. Beta is unreadable, so its saved choice is kept, not dropped.
+      expect(host.harness.logEntries.some((entry) => entry.message.includes("worker providers unavailable, retrying: beta"))).toBe(true);
       expect(await getWorker(host)).toEqual(config);
       expect(await getProject(host)).toEqual(config);
       expect(vi.getTimerCount()).toBe(1);

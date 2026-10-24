@@ -852,7 +852,7 @@ describe("the contract", () => {
     // than rereading it. Nothing else changes.
     const reviewHeavy = contract("review-heavy");
     expect(reviewHeavy).toContain(strictStep);
-    expect(reviewHeavy).toContain("runs what it claims");
+    expect(reviewHeavy).toContain("runs what the unit claims");
     expect(reviewHeavy).not.toContain(onDemandStep);
     expect(reviewHeavy).not.toContain(delegated);
     expect(reviewHeavy).toContain("Read-only shell commands");

@@ -6,16 +6,30 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `bb orchestrator-mode review` records a worker verdict from the orchestrator's own
+  shell, for sessions that lack the `orchestrator_review` tool. It takes no `--thread`
+  override, so a worker cannot judge its own output.
+
 ### Changed
 
 - A blocked worker's subagent launches are watched. The watchdog reads each
   worker's timeline and sends a correction message when it starts a subagent,
   within the scope's reminder budget. Before this, the rule was only injected.
+- `review-heavy` checks every unit: the plugin starts the check unit itself. `verify: false`
+  and `waitForResult: false` are refused under it.
+- `read-only` is removed from orchestrator subagents. It behaved exactly like `none`, while
+  its help promised reading agents that were never allowed. `none` is the default, and a
+  stored `read-only` falls back to it.
 
 ### Fixed
 
 - A `delegate-only` contract's watchdog now refuses shell reads too, matching
   the contract, which runs no shell commands.
+- One worker provider that cannot list its models no longer stalls the worker catalog. The
+  other providers stay validated, its saved choices are kept, and discovery retries until it
+  can list its models.
 
 ## 0.1.4 - 2026-10-18
 

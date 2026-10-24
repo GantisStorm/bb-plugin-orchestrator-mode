@@ -483,19 +483,30 @@ async function loadWorkerCatalog(bb: BbPluginApi, signal: AbortSignal): Promise<
   const system = await whileActive(bb.sdk.providers.models(), signal);
   if (system.modelLoadError) throw new Error(`Provider catalog: ${system.modelLoadError.code}`);
   const providers: string[] = [];
+  const unavailable: string[] = [];
   const models: WorkerModelOption[] = [];
   for (const provider of system.providers) {
     if (!provider.available) continue;
-    providers.push(provider.id);
     signal.throwIfAborted();
-    const response = await whileActive(bb.sdk.providers.models({ providerId: provider.id }), signal);
-    if (response.modelLoadError) throw new Error(`Provider ${provider.id}: ${response.modelLoadError.code}`);
+    // One provider that cannot list its models must not hold the whole catalog:
+    // it is reported unavailable, and every other provider stays validated.
+    const response = await whileActive(bb.sdk.providers.models({ providerId: provider.id }), signal).catch(
+      (cause: unknown) => {
+        if (signal.aborted) throw cause;
+        return undefined;
+      },
+    );
+    if (response === undefined || response.modelLoadError) {
+      unavailable.push(provider.id);
+      continue;
+    }
+    providers.push(provider.id);
     for (const model of response.models) {
       if (models.some((existing) => existing.id === model.id)) continue;
       models.push({ id: model.id, providerId: provider.id });
     }
   }
-  return { providers, models };
+  return { providers, models, unavailable };
 }
 
 /** Stop consumers on service abort; observe late SDK results without using a
@@ -537,7 +548,7 @@ function executionSources(exec: WorkerExecution): WorkerExecutionSources {
 export default async function plugin(bb: BbPluginApi) {
   /** Stop in-flight consumers before the plugin context becomes stale. */
   let disposed = false;
-  let catalog: WorkerCatalog = { providers: [], models: [] };
+  let catalog: WorkerCatalog = { providers: [], models: [], unavailable: [] };
   let catalogReady = false;
 
   /** The settings that shape thread behaviour, after a scope's values are validated. */
@@ -584,7 +595,7 @@ export default async function plugin(bb: BbPluginApi) {
     workerRetention: "keep",
     workerWorkspace: "shared",
     childMessageDelivery: "queued",
-    orchestratorSubagents: "read-only",
+    orchestratorSubagents: "none",
     workerSubagents: "blocked",
   };
 
@@ -674,11 +685,11 @@ export default async function plugin(bb: BbPluginApi) {
    */
   function workerChoice(
     value: string | undefined,
-    options: readonly string[],
+    options: readonly string[] | undefined,
     setting: string,
   ): string | undefined {
     if (value === undefined || value === "") return undefined;
-    if (catalogReady && !options.includes(value)) {
+    if (catalogReady && options !== undefined && !options.includes(value)) {
       bb.log.warn(`${setting} "${value}" is not in the current catalog; ignoring it`);
       return undefined;
     }
@@ -802,12 +813,12 @@ export default async function plugin(bb: BbPluginApi) {
   function sanitizeExecution(record: Record<string, unknown>): WorkerExecution {
     const providerId = workerChoice(
       typeof record.providerId === "string" ? record.providerId : undefined,
-      catalog.providers,
+      [...catalog.providers, ...catalog.unavailable],
       "worker provider",
     );
     const model = workerChoice(
       typeof record.model === "string" ? record.model : undefined,
-      catalog.models.map((option) => option.id),
+      catalog.unavailable.length === 0 ? catalog.models.map((option) => option.id) : undefined,
       "worker model",
     );
     return reconcile({
@@ -835,15 +846,22 @@ export default async function plugin(bb: BbPluginApi) {
     if (
       exec.providerId !== undefined &&
       catalogReady &&
-      !catalog.providers.includes(exec.providerId)
+      !catalog.providers.includes(exec.providerId) &&
+      !catalog.unavailable.includes(exec.providerId)
     ) {
       throw new Error(
         `Unknown worker provider "${exec.providerId}". Providers this machine offers: ${catalog.providers.join(", ")}. Omit provider to inherit the project default.`,
       );
     }
+    if (exec.providerId !== undefined && catalog.unavailable.includes(exec.providerId)) {
+      throw new Error(
+        `Worker provider "${exec.providerId}" cannot list its models right now, so it cannot start a worker. Providers this machine offers: ${catalog.providers.join(", ")}.`,
+      );
+    }
     if (
       exec.model !== undefined &&
       catalogReady &&
+      catalog.unavailable.length === 0 &&
       !catalog.models.some((option) => option.id === exec.model)
     ) {
       const sample = catalog.models
@@ -1618,7 +1636,7 @@ export default async function plugin(bb: BbPluginApi) {
       .boolean()
       .optional()
       .describe(
-        "Also spawn an independent check unit on the same brief, told to run what the unit claims and report its raw output before a pass or fail verdict. Use it for a unit whose result you cannot judge from its report alone. Default false.",
+        "Also spawn an independent check unit on the same brief, told to run what the unit claims and report its raw output before a pass or fail verdict. Use it for a unit whose result you cannot judge from its report alone. Default false, except under a review-heavy scope, which checks every unit.",
       ),
     model: z
       .string()
@@ -1687,6 +1705,15 @@ export default async function plugin(bb: BbPluginApi) {
      */
     const parent = await bb.sdk.threads.get({ threadId });
     const projectId = contextProjectId ?? parent.projectId;
+    // A review-heavy scope checks every unit, so the check is the scope's rule, not an option the orchestrator can skip.
+    const reviewHeavy = settingsFor(projectId).contractPreset === "review-heavy";
+    if (reviewHeavy && verify === false) {
+      throw new Error("This scope is review-heavy, so every unit gets an independent check. Leave verify unset.");
+    }
+    if (reviewHeavy && waitForResult === false) {
+      throw new Error("This scope is review-heavy, so every unit is checked once it finishes. Keep waitForResult true.");
+    }
+    const checkUnit = verify === true || reviewHeavy;
     const scopeWorkspace = settingsFor(projectId).workerWorkspace;
     if (workspace === undefined && scopeWorkspace === "mixed") {
       throw new Error(
@@ -2021,7 +2048,7 @@ export default async function plugin(bb: BbPluginApi) {
       const reported = `${report(workerId, settled)}${await worktreeNote(workerEnvironmentId)}`;
       // Checking a worker that never ran is pointless: there is nothing to
       // inspect, and the orchestrator has to re-delegate that unit anyway.
-      if (verify !== true || settled.running || settled.status === "error") return reported;
+      if (!checkUnit || settled.running || settled.status === "error") return reported;
       return `${reported}${await runVerifier(workerId, workerLabel, settled.output)}`;
     }
 
@@ -2075,6 +2102,57 @@ export default async function plugin(bb: BbPluginApi) {
     execute: delegateTask,
   });
 
+  /**
+   * Record a verdict on a worker this thread delegated. The review tool and the
+   * `review` CLI both write it, so an orchestrator whose session lacks the tool can
+   * still judge its workers.
+   */
+  async function recordVerdict(
+    threadId: string,
+    workerThreadId: string,
+    verdict: ReviewVerdict,
+    notes: string | undefined,
+    verifiedBy: string | undefined,
+  ): Promise<string> {
+    const state = await getState(threadId);
+    const known = state?.delegations ?? [];
+    if (!known.some((delegation) => delegation.threadId === workerThreadId)) {
+      const ids = known.map((delegation) => delegation.threadId).join(", ");
+      throw new Error(
+        `This thread has no worker ${workerThreadId}.${ids === "" ? " It has delegated nothing yet." : ` Workers it delegated: ${ids}.`}`,
+      );
+    }
+    const updated = await mutateState(threadId, (current) => ({
+      ...current,
+      delegations: current.delegations.map((delegation) =>
+        delegation.threadId === workerThreadId
+          ? {
+              ...delegation,
+              verdict,
+              notes: notes ?? delegation.notes ?? null,
+              reviewedAt: Date.now(),
+              ...(verifiedBy === undefined ? {} : { verifiedBy }),
+            }
+          : delegation,
+      ),
+    }));
+    // Recording a verdict is the moment the orchestrator demonstrably read the
+    // result, which is what retention waits for.
+    await maybeArchive(threadId, workerThreadId);
+    const reviewed = updated?.delegations.find((delegation) => delegation.threadId === workerThreadId);
+    if (reviewed?.verifiedBy != null) {
+      await maybeArchive(threadId, reviewed.verifiedBy);
+    }
+    const remaining = unreviewedOf(updated?.delegations ?? []).length;
+    const tail =
+      remaining === 0
+        ? " Every worker has a verdict."
+        : ` ${remaining} worker${remaining === 1 ? "" : "s"} still unjudged.`;
+    return verdict === "rejected"
+      ? `Recorded rejected for ${workerThreadId}. Re-delegate that unit to a worker. Do not fix it yourself.${tail}`
+      : `Recorded accepted for ${workerThreadId}.${tail}`;
+  }
+
   bb.agents.registerTool({
     name: REVIEW_TOOL,
     description:
@@ -2112,45 +2190,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (threadId === undefined) {
         throw new Error(`${REVIEW_TOOL} needs a thread context.`);
       }
-      const state = await getState(threadId);
-      const known = state?.delegations ?? [];
-      if (!known.some((delegation) => delegation.threadId === workerThreadId)) {
-        const ids = known.map((delegation) => delegation.threadId).join(", ");
-        throw new Error(
-          `This thread has no worker ${workerThreadId}.${ids === "" ? " It has delegated nothing yet." : ` Workers it delegated: ${ids}.`}`,
-        );
-      }
-      const updated = await mutateState(threadId, (current) => ({
-        ...current,
-        delegations: current.delegations.map((delegation) =>
-          delegation.threadId === workerThreadId
-            ? {
-                ...delegation,
-                verdict,
-                notes: notes ?? delegation.notes ?? null,
-                reviewedAt: Date.now(),
-                ...(verifiedBy === undefined ? {} : { verifiedBy }),
-              }
-            : delegation,
-        ),
-      }));
-      // Recording a verdict is the moment the orchestrator demonstrably read the
-      // result, which is what retention waits for.
-      await maybeArchive(threadId, workerThreadId);
-      const reviewed = updated?.delegations.find(
-        (delegation) => delegation.threadId === workerThreadId,
-      );
-      if (reviewed?.verifiedBy != null) {
-        await maybeArchive(threadId, reviewed.verifiedBy);
-      }
-      const remaining = unreviewedOf(updated?.delegations ?? []).length;
-      const tail =
-        remaining === 0
-          ? " Every worker has a verdict."
-          : ` ${remaining} worker${remaining === 1 ? "" : "s"} still unjudged.`;
-      return verdict === "rejected"
-        ? `Recorded rejected for ${workerThreadId}. Re-delegate that unit to a worker. Do not fix it yourself.${tail}`
-        : `Recorded accepted for ${workerThreadId}.${tail}`;
+      return recordVerdict(threadId, workerThreadId, verdict, notes, verifiedBy);
     },
   });
 
@@ -3046,6 +3086,34 @@ export default async function plugin(bb: BbPluginApi) {
             return render(input.options.json, state, describeState(threadId, state, scope));
           },
         }),
+        review: cliCommand({
+          summary: "Record your verdict on one worker's output, for when the review tool is not loaded in this session",
+          options: {
+            worker: { type: "string", required: true, description: "The worker thread whose output you judged" },
+            verdict: { type: "enum", required: true, values: [...REVIEW_VERDICTS], description: "accepted, or rejected" },
+            notes: { type: "string", description: "What you checked and what you concluded" },
+            "verified-by": { type: "string", description: "The check unit's thread id, when one ran" },
+            json: { type: "boolean", description: "Emit machine-readable JSON" },
+          },
+          async run(input, ctx) {
+            // Only the thread the command runs in may judge. A --thread override would let a
+            // worker name its orchestrator and accept its own output.
+            if (ctx.threadId === undefined || ctx.threadId === "") {
+              throw new PluginCliError("no thread to judge from", {
+                code: "thread_required",
+                hint: "Run this inside the orchestrator's bb thread.",
+              });
+            }
+            const text = await recordVerdict(
+              ctx.threadId,
+              input.options.worker,
+              input.options.verdict,
+              input.options.notes,
+              input.options["verified-by"],
+            );
+            return render(input.options.json, { message: text }, text);
+          },
+        }),
         delegate: cliCommand({
           summary: "Delegate to a worker when the native tool is unavailable",
           options: {
@@ -3201,7 +3269,7 @@ export default async function plugin(bb: BbPluginApi) {
               type: "enum",
               values: [...ORCHESTRATOR_SUBAGENT_POLICIES],
               description:
-                "Write that scope's orchestrator subagent policy: read-only (the default) allows the providers' reading agents only, all allows any, none starts none",
+                "Write that scope's orchestrator subagent policy: none (the default) starts no subagents, all allows any identified subagent within existing authority",
             },
             "worker-subagents": {
               type: "enum",
@@ -3609,6 +3677,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.background.service("worker-catalog", {
     async start(signal) {
+      let lastReported = "";
       while (!signal.aborted) {
         try {
           const discovered = await loadWorkerCatalog(bb, signal);
@@ -3622,7 +3691,13 @@ export default async function plugin(bb: BbPluginApi) {
             projectWorker[projectId] = storedWorkerConfig(config);
           }
           bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
-          return;
+          // A provider that could not list its models is retried, so its models join the catalog once it can.
+          if (discovered.unavailable.length === 0) return;
+          const reported = discovered.unavailable.join(", ");
+          if (reported !== lastReported) {
+            lastReported = reported;
+            bb.log.warn(`worker providers unavailable, retrying: ${reported}`);
+          }
         } catch (cause) {
           if (signal.aborted || disposed) return;
           bb.log.warn(`worker provider catalog unavailable; preserving saved choices and retrying: ${String(cause)}`);

@@ -129,26 +129,22 @@ export const PINNED_DELEGATION_FIELDS = ["model", "provider", "reasoning"] as co
 // ---------------------------------------------------------------------------
 
 /**
- * Whether an orchestrator may start a provider's own subagents. `read-only` is
- * the default: only launch-bound proof of a reading definition could permit
- * one. BB currently exposes no such proof, so unverified launches remain work.
- * `all` stops judging them at all; `none` refuses every one of them.
+ * Whether an orchestrator may start a provider's own subagents. `none` is the
+ * default. BB exposes no launch-bound proof of a definition's capabilities, so a
+ * native launch cannot be shown to be read-only, and every launch counts as work.
+ * `all` stops judging them and permits any identified subagent within existing
+ * user and parent authority.
  */
-export const ORCHESTRATOR_SUBAGENT_POLICIES = ["read-only", "all", "none"] as const;
+export const ORCHESTRATOR_SUBAGENT_POLICIES = ["none", "all"] as const;
 export type OrchestratorSubagentPolicy = (typeof ORCHESTRATOR_SUBAGENT_POLICIES)[number];
 
-/**
- * One line per policy, for the settings row. Read-only is the default because a
- * subagent that can write is a way around the delegation contract.
- */
+/** One line per policy, for the settings row. */
 export const ORCHESTRATOR_SUBAGENT_POLICY_DESCRIPTIONS: Record<
   OrchestratorSubagentPolicy,
   string
 > = {
-  "read-only":
-    "Read-only requires launch-specific proof of a reading definition and its capabilities. BB does not expose that proof yet, so native launches remain unverified work; delegate through the plugin instead.",
   all: "All allows identified subagents, including editing agents, within existing user and parent authority. Unidentified tools receive no exemption, and no additional permissions are granted.",
-  none: "None keeps the orchestrator from starting any subagent at all: every unit goes to a worker through `orchestrator_delegate`.",
+  none: "None keeps the orchestrator from starting any subagent at all, reading ones included: every unit goes to a worker through `orchestrator_delegate`. BB cannot verify that a native subagent only reads.",
 };
 
 /**
@@ -266,6 +262,11 @@ export interface WorkerModelOption {
 export interface WorkerCatalog {
   providers: readonly string[];
   models: readonly WorkerModelOption[];
+  /**
+   * Providers listed as available whose models could not be read right now. Their
+   * saved and requested choices are kept, and only model names go unchecked.
+   */
+  unavailable: readonly string[];
 }
 
 /**
@@ -387,7 +388,7 @@ interface ClassifierOptions {
 const DEFAULT_CLASSIFIER_OPTIONS: ClassifierOptions = {
   allowReadCommands: true,
   workerThreadIds: [],
-  subagents: "read-only",
+  subagents: "none",
 };
 
 /**
@@ -1409,7 +1410,7 @@ export function classifyRow(
   row: WorkRowLike & { id: string; turnId?: string | null },
   options: Partial<ClassifierOptions> = {},
 ): Violation | null {
-  const { allowReadCommands, workerThreadIds = [], subagents = "read-only", providerId } = {
+  const { allowReadCommands, workerThreadIds = [], subagents = "none", providerId } = {
     ...DEFAULT_CLASSIFIER_OPTIONS,
     ...options,
   };
@@ -1558,9 +1559,8 @@ interface InstructionInput {
    */
   workspace?: "shared" | "worktree" | "mixed";
   /**
-   * Which subagents the contract lets the orchestrator start. `read-only` — the
-   * default — requires capability proof; `none` says to start none at all,
-   * and `all` explicitly permits subagents within existing authority.
+   * Which subagents the contract lets the orchestrator start. `none` — the default —
+   * says to start none at all; `all` explicitly permits subagents within existing authority.
    */
   subagents?: OrchestratorSubagentPolicy;
 }
@@ -1625,10 +1625,10 @@ export function buildInstructions(input: InstructionInput): string {
       : "";
   const reviewStep =
     preset === "review-heavy"
-      ? `4. Every unit gets checked before you trust it: delegate it with \`verify: true\` so an
-   independent worker runs what it claims (the tests, the command, the paths) and
-   reports raw output; record a verdict with \`${REVIEW_TOOL}\`. Re-delegate a failed
-   check; never patch it yourself.`
+      ? `4. Every unit gets checked before you trust it: the plugin starts an independent check
+   unit on each one. It runs what the unit claims (the tests, the command, the paths)
+   and reports raw output. Record a verdict with \`${REVIEW_TOOL}\`. Re-delegate a
+   failed check; never patch it yourself.`
       : `4. Record a verdict on every worker with \`${REVIEW_TOOL}\`. Pass
    \`verify: true\` for a unit whose result you cannot judge from its report: that
    adds a check unit. Send a wrong or incomplete result back to a worker; never
@@ -1651,16 +1651,13 @@ export function buildInstructions(input: InstructionInput): string {
     : "Only CLI delegation commands may run; read-only shell exploration is disabled.";
 
   /**
-   * What the contract says about the provider's own subagents. The watchdog
-   * judges the same rows, so this sentence and the classifier read one policy;
-   * Every value is explicit, including under instruction-only enforcement.
+   * What the contract says about the provider's own subagents. The watchdog judges
+   * the same rows, so this sentence and the classifier read one policy.
    */
   const subagentRule =
-    input.subagents === "none"
-      ? `\n\n   Start no subagents of your own: every unit goes through \`${DELEGATE_TOOL}\`.`
-      : input.subagents === "all"
-        ? `\n\n   Subagents: all, including editing agents, are allowed within existing user\n   and parent authorisation. This grants no additional tools or permissions.`
-        : `\n\n   Subagents: read-only, with verified definition and capabilities. BB lacks\n   launch-specific proof, so native launches remain unverified work; use\n   \`${DELEGATE_TOOL}\` instead.`;
+    input.subagents === "all"
+      ? `\n\n   Subagents: all, including editing agents, are allowed within existing user\n   and parent authorisation. This grants no additional tools or permissions.`
+      : `\n\n   Start no subagents of your own: every unit goes through \`${DELEGATE_TOOL}\`.`;
 
   /**
    * What the contract says about whose model a worker runs on. A pinned scope —

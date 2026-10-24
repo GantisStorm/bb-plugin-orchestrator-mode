@@ -979,7 +979,7 @@ describe("the dispatch checkpoint", () => {
     expect(JSON.parse(written.stdout).values).toMatchObject({ orchestratorSubagents: "none", workerSubagents: "allowed" });
     await harness.behavior.runCli(["scope", "--project", "proj_1", "--inherit", "orchestratorSubagents"]);
     const inherited = await harness.behavior.runCli(["scope", "--project", "proj_1", "--inherit", "workerSubagents", "--json"]);
-    expect(JSON.parse(inherited.stdout).values).toMatchObject({ orchestratorSubagents: "read-only", workerSubagents: "blocked" });
+    expect(JSON.parse(inherited.stdout).values).toMatchObject({ orchestratorSubagents: "none", workerSubagents: "blocked" });
   });
 
   it("mirrors authoritative state onto the thread before the turn", async () => {
@@ -2855,6 +2855,63 @@ describe("the delegation tool", () => {
     expect(spawned).toHaveLength(0);
   });
 
+  it("checks every unit of a review-heavy scope without being asked", async () => {
+    const { harness } = await load({ contractPreset: "review-heavy" });
+    await enable(harness);
+    let started = 0;
+    harness.inspection.sdk.stub("threads.spawn", async (args) => {
+      spawned.push(args as unknown as Record<string, unknown>);
+      return makeThreadResponse({ id: started++ === 0 ? "th_unit" : "th_check", parentThreadId: THREAD });
+    });
+    harness.inspection.sdk.stub("threads.output", async ({ threadId }) => ({
+      output: threadId === "th_check" ? "VERDICT: pass\nthe file exists" : "did the thing",
+    }));
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Add a retry to src/retry.ts" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned).toHaveLength(2);
+    expect(String(spawned[1]!.prompt)).toContain("Do not modify any file");
+  });
+
+  it("refuses to skip or background the check in a review-heavy scope", async () => {
+    const { harness } = await load({ contractPreset: "review-heavy" });
+    await enable(harness);
+    const context = { threadId: THREAD, projectId: "proj_1" };
+    await expect(
+      harness.behavior.callAgentTool(DELEGATE_TOOL, { task: "Do it", verify: false }, context),
+    ).rejects.toThrow(/review-heavy/);
+    await expect(
+      harness.behavior.callAgentTool(DELEGATE_TOOL, { task: "Do it", waitForResult: false }, context),
+    ).rejects.toThrow(/review-heavy/);
+    expect(spawned).toHaveLength(0);
+  });
+
+  it("lets the orchestrator record a verdict from its own shell, and refuses a worker judging itself", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    await harness.behavior.runCli(
+      ["delegate", "--task", "Write the parser", "--no-wait"],
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    const accepted = await harness.behavior.runCli(
+      ["review", "--worker", WORKER, "--verdict", "accepted", "--notes", "ran the tests"],
+      { threadId: THREAD },
+    );
+    expect(accepted.exitCode).toBe(0);
+    expect(accepted.stdout).toContain(`Recorded accepted for ${WORKER}`);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({
+      delegations: [{ threadId: WORKER, verdict: "accepted" }],
+    });
+    const self = await harness.behavior.runCli(
+      ["review", "--worker", WORKER, "--verdict", "accepted"],
+      { threadId: WORKER },
+    );
+    expect(self.exitCode).not.toBe(0);
+    expect(self.stderr).toContain(`no worker ${WORKER}`);
+  });
+
   it("names the provider, not the model, when the provider is the typo", async () => {
     const { harness } = await load({}, undefined, CATALOG);
     await expect(
@@ -2903,7 +2960,7 @@ describe("the delegation tool", () => {
       text: string;
     };
     expect(contract.text).toContain("Every unit gets checked before you trust it");
-    expect(contract.text).toContain("runs what it claims");
+    expect(contract.text).toContain("runs what the unit claims");
     expect(contract.text).not.toContain("`verify: true` for a unit whose result you cannot judge");
   });
 
@@ -2985,7 +3042,7 @@ describe("rpc", () => {
     }
     const invalid = await load({ orchestratorSubagents: "invalid", workerSubagents: 42 });
     expect(await invalid.harness.behavior.callRpc("get_scope_settings", { projectId: null }))
-      .toMatchObject({ values: { orchestratorSubagents: "read-only", workerSubagents: "blocked" } });
+      .toMatchObject({ values: { orchestratorSubagents: "none", workerSubagents: "blocked" } });
     const restarted = await harness.lifecycle.reload(plugin);
     hosts.push(restarted.harness);
     expect(await restarted.harness.behavior.callRpc("get_scope_settings", { projectId: "proj_1" }))
@@ -3005,7 +3062,7 @@ describe("rpc", () => {
       workerRetention: "keep",
       workerWorkspace: "shared",
       childMessageDelivery: "queued",
-      orchestratorSubagents: "read-only",
+      orchestratorSubagents: "none",
       workerSubagents: "blocked",
     };
     expect(await harness.behavior.callRpc("get_scope_settings", { projectId: null })).toEqual({
@@ -3187,7 +3244,7 @@ describe("rpc", () => {
     });
   });
 
-  it.each(["read-only", "none"])("allows normalised Codex result collection and cleanup under %s", async (subagents) => {
+  it.each(["none", "all"])("allows normalised Codex result collection and cleanup under %s", async (subagents) => {
     const { bb, harness } = await load({ enforcement: "block", orchestratorSubagents: subagents });
     harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
       makeThreadResponse({ id: threadId, providerId: "codex" }));

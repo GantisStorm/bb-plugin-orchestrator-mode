@@ -30,7 +30,7 @@ bb orchestrator-mode worker [--provider <id>] [--model <id>] [--preset <name>] [
 bb orchestrator-mode contract [--thread <id>] [--rules <text>] [--clear-rules] [--json]
 bb orchestrator-mode scope [--project <id>] [--max-parallel <n>] [--inherit <key>] [--inherit-all] [--json]
 bb orchestrator-mode scope --global|--project <id> [--child-messages queued|immediate] [--json]
-bb orchestrator-mode scope --global|--project <id> [--orchestrator-subagents read-only|all|none] [--worker-subagents blocked|allowed]
+bb orchestrator-mode scope --global|--project <id> [--orchestrator-subagents none|all] [--worker-subagents blocked|allowed]
 ```
 
 `--thread` defaults to the thread running the command, so an agent can inspect
@@ -82,15 +82,13 @@ delegated; inspecting images is allowed. Git commands that create or delete
 branches or tags, change remotes, or rewrite reflogs also count as work.
 
 Your provider's own subagents follow the scope's **Orchestrator subagents**
-policy. Under the default `read-only`, only reading definitions with
-launch-specific provenance and capability proof can be allowed. BB currently
-exposes no such proof, so native launches remain unverified work, including
-Explore and Plan. Familiar names and cached context snapshots confer no trust.
-`none` prohibits launches, while `all` allows identified subagents, including
-editing ones, within existing user and parent authority. Codex coordination
-(waiting, messaging, resuming or closing) is allowed under every policy. An OMP
-tool whose identity was erased to `other` cannot establish a subagent exemption.
-Delegate unverified units with `orchestrator_delegate` instead.
+policy. Under the default `none`, every launch counts as work, reading agents
+included: BB exposes no launch-bound proof that a native subagent only reads, so
+none can be exempted. `all` allows identified subagents, including editing ones,
+within existing user and parent authority. Codex coordination (waiting, messaging,
+resuming or closing) is allowed under every policy. An OMP tool whose identity was
+erased to `other` cannot establish a subagent exemption. Delegate unverified units
+with `orchestrator_delegate` instead.
 
 ## Delegating
 
@@ -149,10 +147,18 @@ Call `orchestrator_review` with the worker's thread id, `accepted` or `rejected`
 and a line of notes. A turn that ends with unjudged workers gets one reminder. A
 rejected result is re-delegated, never patched by you.
 
+If `orchestrator_review` is not among this session's tools, run
+`bb orchestrator-mode review --worker <id> --verdict accepted|rejected --notes "..."`
+from your own shell. It records the same verdict. It takes no `--thread`, so only the
+orchestrator thread can judge its workers.
+
 `verify: true` on a delegation spawns an independent check unit that inspects the
 repository and reports `VERDICT: pass` or `VERDICT: fail`. Its report comes back
 with the worker's, and its thread is recorded as that delegation's evidence. Use
 it when you cannot judge a unit from its report alone.
+
+Under a `review-heavy` scope every unit gets a check unit, so `verify: false` and
+`waitForResult: false` are refused there.
 
 ## Choosing the worker's execution
 

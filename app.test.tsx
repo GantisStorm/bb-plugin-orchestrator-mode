@@ -355,7 +355,7 @@ describe("the settings section", () => {
       workerRetention: "keep",
       workerWorkspace: "shared",
       childMessageDelivery: "queued",
-      orchestratorSubagents: "read-only",
+      orchestratorSubagents: "none",
       workerSubagents: "blocked",
     };
     const projectWorker: Record<string, WorkerConfig> = {};
@@ -595,22 +595,20 @@ describe("the settings section", () => {
     await flush();
     const query = within(slot.container);
 
-    // Read-only first, and none last: the value a scope that never opened the row
-    // keeps is the one the row shows when it opens.
+    // None first: the value a scope that never opened the row keeps is the one the row shows when it opens.
     const orchestrator = query.getByLabelText("Orchestrator subagents") as HTMLSelectElement;
     expect(Array.from(orchestrator.options, (option) => option.textContent)).toEqual([
-      "read-only",
-      "all",
       "none",
+      "all",
     ]);
     await act(async () => {
-      fireEvent.change(orchestrator, { target: { value: "none" } });
+      fireEvent.change(orchestrator, { target: { value: "all" } });
     });
     await flush();
     expect(rpc.calls.filter((call) => call.method === "set_scope_setting").at(-1)?.input).toEqual({
       projectId: null,
       key: "orchestratorSubagents",
-      value: "none",
+      value: "all",
     });
 
     // The worker policy keeps its own key, one row further down.

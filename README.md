@@ -195,19 +195,15 @@ pair rather than a switch:
   a delegation that passes `model`, `provider` or `reasoning` is refused, and the
   contract stops inviting one. Flexible lets the orchestrator ask for a stronger
   or cheaper model for a single unit instead.
-- **Orchestrator subagents** `Read-only` (default), `All` or `None`. Read-only
-  requires launch-specific proof of a reading definition and its capabilities.
-  **BB does not currently expose that proof**, so native launches, including
-  Explore and Plan, remain unverified work. Familiar names and cached context
-  snapshots cannot establish whether a custom writable definition was resolved.
-  This limitation needs a provider/SDK change; use `orchestrator_delegate` until
-  that evidence is available. `None` counts every launch; `All` permits identified
-  subagents, including editing ones, within existing user and parent authority.
-  Codex waiting, messaging, resuming and closing are coordination under every
-  policy. OMP's `task` arguments are parsed only when its tool is identified.
-  Older OMP/ACP rows named only `other` cannot establish that identity: opaque
-  task-shaped calls remain unverified work even under `All`. This is a BB
-  metadata limitation; use `orchestrator_delegate` for those units.
+- **Orchestrator subagents** `None` (default) or `All`. `None` counts every launch
+  as work, reading agents included: BB exposes no launch-bound proof that a native
+  subagent only reads, so none can be exempted. `All` permits identified subagents,
+  including editing ones, within existing user and parent authority. Codex waiting,
+  messaging, resuming and closing are coordination under both policies. OMP's `task`
+  arguments are parsed only when its tool is identified. Older OMP/ACP rows named
+  only `other` cannot establish that identity: opaque task-shaped calls remain
+  unverified work even under `All`. This is a BB metadata limitation; use
+  `orchestrator_delegate` for those units.
 - **Worker subagents** `Blocked` (default) or `Allowed`. Blocked injects a rule
   into every worker this plugin spawns: do the unit yourself and start no
   subagents. The watchdog then watches each such worker's timeline; a launch is
@@ -416,7 +412,7 @@ can produce with an append at the cap and asserts it fits.
 | Level | What a session does |
 | --- | --- |
 | `standard` (default) | Delegates the work, records a verdict on every worker, and adds a check unit only where a report cannot settle a unit. |
-| `review-heavy` | Puts an independent check unit in front of every unit. Each one runs what the unit claims, and counts against `maxParallelWorkers`, so this roughly doubles the work in flight. |
+| `review-heavy` | Puts an independent check unit in front of every unit. The plugin starts each check itself, and each one counts against `maxParallelWorkers`, so this roughly doubles the work in flight. `verify: false` and `waitForResult: false` are refused under it. |
 | `delegate-only` | Hands the reading over too: no exploratory shell commands, and finding things out is a unit of work. CLI delegation remains available. |
 
 The check unit is adversarial, not a reread: it runs what the unit claims (the
@@ -491,6 +487,11 @@ reasoning?, permissionMode? })` hands one unit to a worker, and
 `orchestrator_review({ workerThreadId, verdict, notes?, verifiedBy? })` records
 your verdict on the result. The watchdog expects one verdict per worker whose
 result was used.
+
+If this session lacks the `orchestrator_review` tool, run
+`bb orchestrator-mode review --worker <id> --verdict accepted|rejected --notes "..."`
+from the orchestrator's own shell. It records the same verdict. It takes no `--thread`,
+so a worker cannot name its orchestrator and judge its own output.
 The brief is required and limited to 20,000 characters; the title is limited to
 200. Waiting defaults to `true`, with a 900-second timeout (range 10–3,600).
 `hidden` defaults to `false`. A timeout returns the worker's status and leaves it
@@ -572,7 +573,7 @@ CLI, and the composer toggles.
 | `contractPreset` | `standard` | Which [contract level](#the-contract) a session receives. |
 | `workerRetention` | `keep` | What happens to a worker once its result has been read: keep it, archive check units, or archive every read worker. |
 | `workerWorkspace` | `shared` | Where a delegation runs: `shared`, `worktree`, or `mixed` (the orchestrator names one per unit, see [Where workers run](#where-workers-run)). |
-| `orchestratorSubagents` | `read-only` | Allow verified reading definitions, all identified subagents, or no subagent launches. |
+| `orchestratorSubagents` | `none` | Allow identified subagents (`all`), or none (`none`, the default). Reading subagents count as work too, because BB cannot verify that a native one only reads. |
 | `workerSubagents` | `blocked` | Inject the no-onward-delegation rule, or omit it with `allowed`; neither value grants tools or changes permission mode. |
 | `maxParallelWorkers` | `8` | Refuse a delegation while this many workers are running. `0` removes the cap. |
 | `maxDelegationsPerTurn` | `20` | Refuse a delegation once a turn has delegated this many. `0` removes the cap. |
