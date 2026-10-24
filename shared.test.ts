@@ -1053,6 +1053,20 @@ describe("the contract", () => {
     })).not.toBeNull();
   });
 
+  it("counts recording a verdict from the shell as coordination, not direct work", () => {
+    for (const command of [
+      "bb orchestrator-mode review --worker th_w1 --verdict accepted --notes 'ran the tests'",
+      'bb orchestrator-mode review --worker th_w1 --verdict rejected --notes "the output is empty"',
+    ]) {
+      expect(classifyRow(row({ id: command, workKind: "command", command }), {
+        allowReadCommands: false,
+      })).toBeNull();
+    }
+    expect(classifyRow(row({
+      id: "chained", workKind: "command", command: "bb orchestrator-mode review --worker th_w1 --verdict accepted; rm -rf build",
+    }), { allowReadCommands: false })).not.toBeNull();
+  });
+
   it("allows CLI delegation even when read-only exploration is disabled", () => {
     for (const command of [
       "bb orchestrator-mode delegate --task 'Implement retries; add tests > 3 cases'",

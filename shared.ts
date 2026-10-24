@@ -1340,7 +1340,7 @@ function literalHeredocEnd(command: string, offset: number): number | null {
   return null;
 }
 
-/** CLI delegation is permitted even in sessions without the native tool. */
+/** CLI delegation and verdicts are permitted even in sessions without the native tool. */
 function isDelegationCommand(
   command: string,
   allowReadCommands: boolean,
@@ -1348,7 +1348,7 @@ function isDelegationCommand(
 ): boolean {
   // Ordinary shell quoting only; quoted heredoc bodies are literal message data.
   const delegates = (part: string) =>
-    /^(?:\S*\/)?bb\s+orchestrator-mode\s+delegate(?:\s|$)/.test(part) ||
+    /^(?:\S*\/)?bb\s+orchestrator-mode\s+(?:delegate|review)(?:\s|$)/.test(part) ||
     isWorkerFollowup(part, workerThreadIds);
   const segments: string[] = [];
   let segment = "";
