@@ -398,6 +398,26 @@ const DEFAULT_CLASSIFIER_OPTIONS: ClassifierOptions = {
 const MUTATING_TOOL_PATTERN =
   /(write|edit|create|delete|remove|rename|move|copy|apply|patch|replace|append|insert|mkdir|touch|chmod|chown|commit|push|merge|rebase|reset|revert|checkout|install|build|compile|exec|execute|shell|bash|command|run|kill|upload|deploy|migrate|format|lint|test)/i;
 
+/**
+ * Verbs that change state but do not appear inside the substring list above. They
+ * match whole name tokens only: `set` must not flag `get_settings`, and `archive`
+ * must not flag `list_archived_threads`.
+ */
+const MUTATING_TOOL_TOKENS: ReadonlySet<string> = new Set(["update", "set", "publish", "archive"]);
+
+/** Lowercase word tokens of a tool name, splitting on separators and camelCase humps. */
+function toolNameTokens(toolName: string): string[] {
+  return toolName
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token !== "");
+}
+
+function isMutatingToolName(toolName: string): boolean {
+  return MUTATING_TOOL_PATTERN.test(toolName) || toolNameTokens(toolName).some((token) => MUTATING_TOOL_TOKENS.has(token));
+}
+
 /** Work kinds that are always the orchestrator doing the work itself. */
 const ALWAYS_WORK: ReadonlySet<string> = new Set(["file-change", "command", "image-generation"]);
 
@@ -1486,7 +1506,7 @@ export function classifyRow(
     // A generic tool row: the provider's own vocabulary. Judge it by name.
     const toolName = row.toolName ?? null;
     if (toolName === null) return null;
-    if (!MUTATING_TOOL_PATTERN.test(toolName)) return null;
+    if (!isMutatingToolName(toolName)) return null;
     return { ...base, detail: `called \`${toolName}\` itself` };
   }
 

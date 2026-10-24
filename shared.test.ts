@@ -509,6 +509,18 @@ describe("direct-work classification", () => {
     expect(classifyRow(row({ id: "r7", workKind: "tool", toolName: null }))).toBeNull();
   });
 
+  it("flags a state-changing tool whose verb the substring list misses", () => {
+    for (const toolName of ["update_config", "set_setting", "publish_release", "archive_thread", "updateConfig"]) {
+      expect(classifyRow(row({ id: toolName, workKind: "tool", toolName }))?.detail).toBe(`called \`${toolName}\` itself`);
+    }
+  });
+
+  it("keeps reads whose names share a verb's letters as reads", () => {
+    for (const toolName of ["get_settings", "list_archived_threads", "publishers_view", "settings_list"]) {
+      expect(classifyRow(row({ id: toolName, workKind: "tool", toolName }))).toBeNull();
+    }
+  });
+
   it("allows coordination, questions, planning and research", () => {
     for (const workKind of [
       "workflow",

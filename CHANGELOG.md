@@ -30,6 +30,9 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 - One worker provider that cannot list its models no longer stalls the worker catalog. The
   other providers stay validated, its saved choices are kept, and discovery retries until it
   can list its models.
+- A generic tool whose name uses `update`, `set`, `publish` or `archive` as a whole word is
+  now judged as work. Before, names like `update_config` or `set_setting` passed unjudged.
+  Names that only share letters, such as `get_settings` or `list_archived_threads`, stay reads.
 
 ## 0.1.4 - 2026-10-18
 
