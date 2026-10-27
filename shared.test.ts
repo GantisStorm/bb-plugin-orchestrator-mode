@@ -1109,3 +1109,46 @@ describe("the contract", () => {
     })).not.toBeNull();
   });
 });
+
+describe("GET-only curl and gh api", () => {
+  const reads = [
+    "curl -s https://example.com/status",
+    "curl -sS -L -f https://api.example.com/v1/health",
+    "curl -I https://example.com",
+    "curl -s -H 'Accept: application/json' -m 10 https://example.com",
+    "curl -X GET https://example.com",
+    "curl -s https://example.com/status | jq .ok",
+    "gh api repos/owner/repo",
+    "gh api --paginate repos/owner/repo/pulls",
+    "gh api -X GET repos/owner/repo",
+    "gh api --method GET repos/owner/repo --jq .name",
+  ];
+  const writes = [
+    "curl -X POST https://example.com/deploy",
+    "curl -d 'x=1' https://example.com",
+    "curl --data-binary @body.json https://example.com",
+    "curl --json '{}' https://example.com",
+    "curl -F file=@a.txt https://example.com",
+    "curl -T a.txt https://example.com",
+    "curl -o out.bin https://example.com",
+    "curl -O https://example.com/a.bin",
+    "curl -K config.txt https://example.com",
+    "curl https://example.com -X DELETE",
+    "gh api -X POST repos/owner/repo/issues",
+    "gh api --method PATCH repos/owner/repo",
+    "gh api repos/owner/repo -f title=x",
+    "gh api repos/owner/repo -F state=closed",
+    "gh api --input body.json repos/owner/repo",
+    "gh api graphql -f query=x",
+  ];
+  for (const command of reads) {
+    it(`reads \`${command}\``, () => {
+      expect(isReadOnlyCommand(command)).toBe(true);
+    });
+  }
+  for (const command of writes) {
+    it(`refuses \`${command}\``, () => {
+      expect(isReadOnlyCommand(command)).toBe(false);
+    });
+  }
+});

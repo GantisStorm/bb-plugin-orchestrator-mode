@@ -2433,14 +2433,42 @@ export default async function plugin(bb: BbPluginApi) {
         return [];
       }
     }
-    const [childIds, forkIds] = await Promise.all([
+    // A worker spawned with `bb thread spawn` records no parent, so ownership
+    // falls back to the project: a thread there created after this orchestrator
+    // is one it could have spawned. An older thread in the project is someone
+    // else's work. A failed read contributes nothing, as for the parent pages.
+    async function projectThreadIds(): Promise<string[]> {
+      const projectId = scanThread?.projectId;
+      const floor = scanThread?.createdAt;
+      if (typeof projectId !== "string" || typeof floor !== "number") return [];
+      try {
+        const threads = await bb.sdk.threads.list({
+          projectId,
+          includeHidden: true,
+          limit: MAX_CHILD_THREADS,
+        });
+        return threads.flatMap((thread) =>
+          typeof thread.id === "string" &&
+          thread.id !== threadId &&
+          typeof thread.createdAt === "number" &&
+          thread.createdAt >= floor
+            ? [thread.id]
+            : [],
+        );
+      } catch {
+        return [];
+      }
+    }
+    const [childIds, forkIds, projectIds] = await Promise.all([
       listedIds({ parentThreadId: threadId }),
       listedIds({ sourceThreadId: threadId }),
+      projectThreadIds(),
     ]);
     const workerThreadIds = [...new Set([
       ...((await getState(threadId))?.delegations.map((worker) => worker.threadId) ?? []),
       ...childIds,
       ...forkIds,
+      ...projectIds,
     ])];
     const enabledAtMs = state.enabledAt === null ? 0 : Date.parse(state.enabledAt);
     // A missing or malformed maxSeq must not poison the cursor: Math.max(2, undefined) is NaN, which persists as null.

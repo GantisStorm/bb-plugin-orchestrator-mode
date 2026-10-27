@@ -15,6 +15,10 @@ import { CHILD_BATCH_WAIT_REASON } from "./child-message-queue";
 
 const THREAD = "th_orchestrator";
 const WORKER = "th_worker";
+/** The project the SDK's dispatch-hook fixture uses, so a project override set through it applies to this thread too. */
+const PROJECT = "project-1";
+/** When the orchestrator was created, in ms. A thread in its project created after this could be one it spawned. */
+const CREATED_AT = 1_700_000_000_000;
 type QueueEntry = ReturnType<typeof makeQueueEntry>;
 
 function childEntry(id: string, senderThreadId = WORKER, overrides: Partial<QueueEntry> = {}): QueueEntry {
@@ -78,14 +82,17 @@ let archivedThreads: string[] = [];
 let spawned: Record<string, unknown>[] = [];
 /**
  * Threads `threads.list` can return. A child is found by `parentThreadId`, a
- * fork by `sourceThreadId` (its parent is null). A hidden thread is returned
- * only when the caller passes `includeHidden`.
+ * fork by `sourceThreadId` (its parent is null), and any thread in a project by
+ * `projectId`. A hidden thread is returned only when the caller passes
+ * `includeHidden`.
  */
 let childThreads: {
   id: string;
   parentThreadId?: string | null;
   sourceThreadId?: string | null;
   hidden?: boolean;
+  projectId?: string;
+  createdAt?: number;
 }[] = [];
 
 /** Every loaded host, disposed after each test so no scan timer leaks into the next. */
@@ -212,12 +219,14 @@ async function load(
         list: async (args: {
           parentThreadId?: string;
           sourceThreadId?: string;
+          projectId?: string;
           includeHidden?: boolean;
         } = {}) =>
           childThreads.filter((child) => {
             if (child.hidden === true && args.includeHidden !== true) return false;
             if (args.parentThreadId !== undefined && child.parentThreadId !== args.parentThreadId) return false;
             if (args.sourceThreadId !== undefined && child.sourceThreadId !== args.sourceThreadId) return false;
+            if (args.projectId !== undefined && child.projectId !== args.projectId) return false;
             return true;
           }),
         get: async ({ threadId }: { threadId: string }) =>
@@ -226,6 +235,8 @@ async function load(
             providerId: "acp-omp",
             environmentId: threadId === WORKER ? null : "env_1",
             parentThreadId: threadId === WORKER ? THREAD : null,
+            projectId: PROJECT,
+            createdAt: CREATED_AT,
           }),
         spawn: async (args) => {
           spawned.push(args as unknown as Record<string, unknown>);
@@ -1179,6 +1190,85 @@ describe("the watchdog", () => {
       { parentThreadId: THREAD, includeHidden: true, limit: 200 },
       { sourceThreadId: THREAD, includeHidden: true, limit: 200 },
     ]));
+  });
+
+  it("treats a correction to a thread spawned in this project after it as coordination", async () => {
+    const { bb, harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    // `bb thread spawn` records no parent, so the project and creation order are
+    // the only ownership signal for a worker the orchestrator spawned itself.
+    childThreads = [{ id: WORKER, projectId: PROJECT, createdAt: CREATED_AT + 60_000 }];
+    timelineRows = [
+      ...timelineRows,
+      workRow({
+        id: "row_tell_project_later",
+        workKind: "command",
+        turnId: "turn_2",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 4,
+        command: `bb thread tell ${WORKER} 'HOLD: do not change the schema yet'`,
+      }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+    await vi.waitFor(async () => {
+      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+    });
+
+    expect(sentTexts).toEqual([]);
+    expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({ violations: [] });
+    const lists = harness.inspection.sdk.callsTo("threads.list").map((call) => call[0]);
+    expect(lists).toEqual(expect.arrayContaining([{ projectId: PROJECT, includeHidden: true, limit: 200 }]));
+  });
+
+  it("still records a correction to a thread in this project that predates the orchestrator", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    childThreads = [{ id: WORKER, projectId: PROJECT, createdAt: CREATED_AT - 60_000 }];
+    timelineRows = [
+      ...timelineRows,
+      workRow({
+        id: "row_tell_project_earlier",
+        workKind: "command",
+        turnId: "turn_2",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 4,
+        command: `bb thread tell ${WORKER} 'HOLD: do not change the schema yet'`,
+      }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+
+    await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      violations: unknown[];
+    };
+    expect(state.violations).toHaveLength(1);
+  });
+
+  it("still records a correction to a later thread in another project", async () => {
+    const { harness } = await load({ enforcement: "guard" });
+    await arm(harness);
+    childThreads = [{ id: WORKER, projectId: "proj_other", createdAt: CREATED_AT + 60_000 }];
+    timelineRows = [
+      ...timelineRows,
+      workRow({
+        id: "row_tell_other_project",
+        workKind: "command",
+        turnId: "turn_2",
+        sourceSeqStart: 3,
+        sourceSeqEnd: 4,
+        command: `bb thread tell ${WORKER} 'HOLD: do not change the schema yet'`,
+      }),
+    ];
+    timelineMaxSeq = 4;
+    await idle(harness);
+
+    await vi.waitFor(() => expect(sentTexts).toHaveLength(1));
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
+      violations: unknown[];
+    };
+    expect(state.violations).toHaveLength(1);
   });
 
   it("treats a correction to an unrecorded fork as coordination", async () => {

@@ -33,6 +33,13 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 - A generic tool whose name uses `update`, `set`, `publish` or `archive` as a whole word is
   now judged as work. Before, names like `update_config` or `set_setting` passed unjudged.
   Names that only share letters, such as `get_settings` or `list_archived_threads`, stay reads.
+- A `bb thread tell` to a thread in the orchestrator's project created after it counts as
+  coordination, so a worker spawned with `bb thread spawn`, which records no parent, is
+  covered. A thread in that project created before the orchestrator is still flagged, and so
+  is a tell to a thread in another project.
+- `curl` and `gh api` count as reads when they only fetch: `curl` with GET or HEAD, `gh api`
+  with GET. A flag that sends a body, writes a file or reads a config, and `gh api graphql`,
+  stay work. Before, every `curl` and `gh api` call was work, even a plain status check.
 
 ## 0.1.4 - 2026-10-18
 

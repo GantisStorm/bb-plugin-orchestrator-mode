@@ -1238,6 +1238,81 @@ const FIND_PATTERN_OPTIONS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * curl flags that only read: error and silent output, headers and HEAD. Every
+ * other flag is work. The allowlist is the point: a flag not listed here is
+ * assumed to send, write or read a config, so an unknown flag refuses.
+ */
+const CURL_READ_SHORT_FLAGS: ReadonlySet<string> = new Set(["s", "S", "f", "L", "i", "I", "v"]);
+const CURL_READ_LONG_FLAGS: ReadonlySet<string> = new Set([
+  "--silent",
+  "--show-error",
+  "--fail",
+  "--location",
+  "--include",
+  "--head",
+  "--verbose",
+]);
+const CURL_VALUE_FLAGS: ReadonlySet<string> = new Set(["-m", "--max-time", "-H", "--header", "--connect-timeout"]);
+
+/** A curl line that only makes GET or HEAD requests to http(s) URLs. */
+function isReadOnlyCurl(args: readonly string[]): boolean {
+  let urls = 0;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === "-X" || arg === "--request") {
+      if (args[index + 1]?.toUpperCase() !== "GET") return false;
+      index += 1;
+    } else if (CURL_VALUE_FLAGS.has(arg)) {
+      index += 1;
+    } else if (CURL_READ_LONG_FLAGS.has(arg)) {
+      continue;
+    } else if (/^-[A-Za-z]+$/.test(arg)) {
+      if (![...arg.slice(1)].every((letter) => CURL_READ_SHORT_FLAGS.has(letter))) return false;
+    } else if (/^https?:\/\//i.test(arg)) {
+      urls += 1;
+    } else {
+      return false;
+    }
+  }
+  return urls > 0;
+}
+
+/** gh api flags that only read. `-X`/`--method` reads only when it names GET. */
+const GH_API_READ_FLAGS: ReadonlySet<string> = new Set(["--paginate", "--silent", "--include", "-i", "--verbose"]);
+const GH_API_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  "--jq",
+  "-q",
+  "--template",
+  "-t",
+  "--hostname",
+  "-H",
+  "--header",
+  "--cache",
+]);
+
+/** A gh api call that makes only GET requests to one endpoint. `graphql` is always a POST. */
+function isReadOnlyGhApi(args: readonly string[]): boolean {
+  let endpoints = 0;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === "-X" || arg === "--method") {
+      if (args[index + 1]?.toUpperCase() !== "GET") return false;
+      index += 1;
+    } else if (GH_API_VALUE_FLAGS.has(arg)) {
+      index += 1;
+    } else if (GH_API_READ_FLAGS.has(arg)) {
+      continue;
+    } else if (arg.startsWith("-")) {
+      return false;
+    } else {
+      if (arg === "graphql") return false;
+      endpoints += 1;
+    }
+  }
+  return endpoints === 1;
+}
+
+/**
  * True when one command in a line only reads.
  *
  * The rule, in order. The program must be one this file models — an allowlisted
@@ -1281,6 +1356,8 @@ function isReadOnlySegment(segment: string): boolean {
   // `bb plugin new --help` reports, `bb plugin install x` does not.
   if (name === "bb") return HELP_OR_VERSION.test(segment) || isReadOnlyBbSegment(args);
   if (name === "env") return isReadOnlyEnvSegment(args);
+  if (name === "curl") return isReadOnlyCurl(args);
+  if (name === "gh" && args[0] === "api") return isReadOnlyGhApi(args.slice(1));
   if (!READ_ONLY_PROGRAMS.has(name)) return false;
   const mutating = MUTATING_PROGRAM_FLAGS[name];
   if (name === "find" && mutating !== undefined) {
