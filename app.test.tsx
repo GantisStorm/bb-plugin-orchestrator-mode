@@ -22,6 +22,27 @@ interface StateDto {
   defaultForNewThreads: boolean;
   allowReadCommands: boolean;
   maxNudges: number;
+  workers: {
+    total: number;
+    running: number;
+    settled: number;
+    accepted: number;
+    rejected: number;
+    waiting: number;
+    unconfirmed: number;
+  };
+  children: {
+    available: boolean;
+    total: number;
+    running: number;
+    error: string | null;
+  };
+  retention: {
+    threads: number;
+    caps: { delegations: number; violations: number; seenRows: number };
+    lost: { delegations: number; violations: number; seenRows: number };
+  };
+  judge: { configured: boolean; advisory: boolean };
 }
 
 function baseState(overrides: Partial<StateDto> = {}): StateDto {
@@ -36,6 +57,22 @@ function baseState(overrides: Partial<StateDto> = {}): StateDto {
     defaultForNewThreads: false,
     allowReadCommands: true,
     maxNudges: 3,
+    workers: {
+      total: 0,
+      running: 0,
+      settled: 0,
+      accepted: 0,
+      rejected: 0,
+      waiting: 0,
+      unconfirmed: 0,
+    },
+    children: { available: true, total: 0, running: 0, error: null },
+    retention: {
+      threads: 1,
+      caps: { delegations: 50, violations: 100, seenRows: 500 },
+      lost: { delegations: 0, violations: 0, seenRows: 0 },
+    },
+    judge: { configured: false, advisory: false },
     ...overrides,
   };
 }
@@ -98,6 +135,12 @@ async function flush(): Promise<void> {
   });
 }
 
+/** One read can start the next: settle the state read, then the child list. */
+async function settle(): Promise<void> {
+  await flush();
+  await flush();
+}
+
 async function click(element: Element): Promise<void> {
   await act(async () => {
     fireEvent.click(element);
@@ -128,6 +171,33 @@ function plusMenuView(scope: unknown) {
     layout: "compact" as const,
     draft: { text: "", isEmpty: true, attachmentCount: 0 },
     run: { isRunning: false, isSubmitting: false },
+  };
+}
+
+/** One row as BB's own thread list returns it; only the fields the strip reads. */
+function childRow(overrides: Record<string, unknown> & { id: string }) {
+  return {
+    parentThreadId: THREAD,
+    title: null,
+    titleFallback: null,
+    status: "idle",
+    visibility: "visible",
+    archivedAt: null,
+    deletedAt: null,
+    ...overrides,
+  };
+}
+
+/** A `useSdk()` stand-in whose child list returns `rows` (or throws `error`). */
+function childSdk(rows: unknown[] | string, calls: unknown[] = []) {
+  return {
+    threads: {
+      list: async (args: unknown) => {
+        calls.push(args);
+        if (typeof rows === "string") throw new Error(rows);
+        return rows;
+      },
+    },
   };
 }
 
@@ -169,7 +239,7 @@ describe("thread composer", () => {
     const host = mount(Host, rpc, options);
     await flush();
 
-    expect(within(host.container).getByText(/Orchestrator mode is on/)).toBeTruthy();
+    expect(within(host.container).getByTestId("orch-strip-thread")).toBeTruthy();
     expect(host.inspection.composer.textEffect).toBeNull();
     expect(host.inspection.composer.textEffectCalls).toEqual([]);
     expect(host.inspection.composer.text).toBe(options.composer.text);
@@ -181,7 +251,7 @@ describe("thread composer", () => {
     const toggle = mount(Toggle, rpc, threadOptions());
     await flush();
 
-    expect(within(host.container).queryByText(/Orchestrator mode is on/)).toBeNull();
+    expect(within(host.container).queryByTestId("orch-strip-thread")).toBeNull();
     expect(host.container.textContent).toBe("");
     const button = toggleButton(toggle);
     expect(button.getAttribute("aria-pressed")).toBe("false");
@@ -202,20 +272,22 @@ describe("thread composer", () => {
     expect(host.inspection.composer.textEffect).toBeNull();
     expect(host.inspection.composer.textEffectCalls).toEqual([]);
     expect(host.inspection.composer.text).toBe("do the thing");
-    expect(within(host.container).getByText(/Orchestrator mode is on/)).toBeTruthy();
-    expect(within(host.container).getByText(/may only read, plan, ask/)).toBeTruthy();
+    expect(within(host.container).getByTestId("orch-strip-thread")).toBeTruthy();
+    expect(
+      host.container.querySelector('[data-level="guard"]')?.textContent,
+    ).toBe("guard");
   });
 
   it("turns the mode off from the strip without changing the draft", async () => {
     const rpc = makeRpc({ enabled: true });
     const host = mount(Host, rpc, threadOptions());
     await flush();
-    expect(within(host.container).getByText(/Orchestrator mode is on/)).toBeTruthy();
+    expect(within(host.container).getByTestId("orch-strip-thread")).toBeTruthy();
     expect(host.inspection.composer.textEffect).toBeNull();
 
     await click(within(host.container).getByText("Turn off"));
 
-    expect(within(host.container).queryByText(/Orchestrator mode is on/)).toBeNull();
+    expect(within(host.container).queryByTestId("orch-strip-thread")).toBeNull();
     expect(rpc.state.enabled).toBe(false);
     expect(host.inspection.composer.textEffect).toBeNull();
     expect(host.inspection.composer.textEffectCalls).toEqual([]);
@@ -240,10 +312,251 @@ describe("thread composer", () => {
     await flush();
     const strip = within(host.container);
 
-    expect(strip.getByText(/Direct work caught \(1 total\)/)).toBeTruthy();
-    expect(strip.getByText(/changed src\/server.ts itself/)).toBeTruthy();
-    expect(strip.getByText(/· block/)).toBeTruthy();
+    expect(strip.getByTestId("orch-alert")).toBeTruthy();
+    expect(strip.getByText("Direct work caught")).toBeTruthy();
+    expect(strip.getByText("1")).toBeTruthy();
+    expect(strip.getByText("changed src/server.ts itself")).toBeTruthy();
+    expect(host.container.querySelector('[data-level="block"]')?.textContent).toBe("block");
     expect(host.container.querySelector('[data-violations="true"]')).not.toBeNull();
+  });
+
+  it("draws one robot per child thread BB has now, not per delegation record", async () => {
+    const rpc = makeRpc({
+      enabled: true,
+      workers: {
+        total: 21,
+        running: 1,
+        settled: 20,
+        accepted: 18,
+        rejected: 2,
+        waiting: 0,
+        unconfirmed: 0,
+      },
+      children: { available: true, total: 2, running: 1, error: null },
+    });
+    const listCalls: unknown[] = [];
+    const host = mount(Host, rpc, {
+      ...threadOptions(),
+      sdk: childSdk(
+        [
+          childRow({ id: "th_build", title: "Build the settings page", status: "active" }),
+          childRow({ id: "th_review", title: "Review the diff", status: "idle" }),
+        ],
+        listCalls,
+      ),
+    });
+    await settle();
+    const strip = within(host.container);
+
+    // The crew is BB's current tree: two child threads, two robots.
+    const crew = strip.getByTestId("orch-crew");
+    expect(crew.getAttribute("role")).toBe("group");
+    expect(crew.getAttribute("aria-label")).toBe("Current child threads");
+    const bots = Array.from(crew.querySelectorAll(".orch__bot"));
+    expect(bots).toHaveLength(2);
+    expect(bots[0]!.getAttribute("aria-label")).toBe("Build the settings page · active");
+    expect(bots[0]!.getAttribute("data-state")).toBe("running");
+    expect(bots[1]!.getAttribute("aria-label")).toBe("Review the diff · idle");
+    expect(bots[1]!.getAttribute("data-state")).toBe("idle");
+    // Nothing on this row comes from the 21 delegation records.
+    expect(crew.textContent).not.toContain("+");
+    // One bounded page of live children: hidden ones count, archived ones never
+    // spend the page a live child needs.
+    expect(listCalls[0]).toEqual({
+      parentThreadId: THREAD,
+      archived: false,
+      includeHidden: true,
+      limit: 50,
+    });
+
+    // The live count agrees, and history stays named as history.
+    const current = strip.getByTestId("orch-children");
+    expect(current.getAttribute("role")).toBe("group");
+    expect(current.getAttribute("aria-label")).toBe("Child threads in BB right now");
+    expect(current.textContent).toContain("2 children");
+    expect(strip.getByTestId("orch-children-running").textContent).toContain("1 running");
+    expect(strip.getByTestId("orch-children-running").getAttribute("data-live")).toBe("true");
+    const ledger = strip.getByTestId("orch-ledger-stats");
+    expect(ledger.getAttribute("aria-label")).toContain("Delegation ledger");
+    expect(ledger.textContent).toContain("21 recorded");
+    expect(ledger.textContent).toContain("20 finished");
+    // The retired reading of the record as a current count is gone.
+    expect(host.container.textContent).not.toContain("21 workers");
+  });
+
+  it("says no child threads right now only when BB's count says none", async () => {
+    const rpc = makeRpc({
+      enabled: true,
+      workers: {
+        total: 21,
+        running: 0,
+        settled: 21,
+        accepted: 21,
+        rejected: 0,
+        waiting: 0,
+        unconfirmed: 0,
+      },
+      children: { available: true, total: 0, running: 0, error: null },
+    });
+    const host = mount(Host, rpc, threadOptions());
+    await settle();
+    const strip = within(host.container);
+
+    // Records cannot make that line false: there are no children now.
+    expect(strip.getByText("No child threads right now.")).toBeTruthy();
+    expect(strip.queryByTestId("orch-crew")).toBeNull();
+    expect(strip.getByTestId("orch-ledger-stats").textContent).toContain("21 recorded");
+  });
+
+  it("counts the children it does not draw instead of drawing them", async () => {
+    const listed = Array.from({ length: 12 }, (_, index) =>
+      childRow({ id: `th_${index}`, title: `Worker ${index}` }),
+    );
+    const rpc = makeRpc({
+      enabled: true,
+      children: { available: true, total: 12, running: 0, error: null },
+    });
+    const host = mount(Host, rpc, { ...threadOptions(), sdk: childSdk(listed) });
+    await settle();
+    const strip = within(host.container);
+
+    const crew = strip.getByTestId("orch-crew");
+    expect(crew.querySelectorAll(".orch__bot")).toHaveLength(8);
+    const more = crew.querySelector(".orch__more")!;
+    // The overflow is one readable unit for assistive tech, so it carries the
+    // image role instead of sitting in the DOM as unlabelled text.
+    expect(more.getAttribute("role")).toBe("img");
+    expect(more.textContent).toBe("+4");
+    expect(more.getAttribute("aria-label")).toBe("4 more child threads");
+    expect(strip.getByTestId("orch-children").textContent).toContain("12 children");
+  });
+
+  it("draws a hidden child as a child and leaves archived, deleted and foreign ones out", async () => {
+    const rpc = makeRpc({
+      enabled: true,
+      children: { available: true, total: 2, running: 0, error: null },
+    });
+    const host = mount(Host, rpc, {
+      ...threadOptions(),
+      sdk: childSdk([
+        childRow({ id: "th_hidden", title: "Hidden worker", visibility: "hidden", status: "active" }),
+        childRow({ id: "th_archived", title: "Archived worker", archivedAt: Date.now() }),
+        childRow({ id: "th_deleted", title: "Deleted worker", deletedAt: Date.now() }),
+        childRow({ id: "th_foreign", title: "Someone else's worker", parentThreadId: "th_other" }),
+      ]),
+    });
+    await settle();
+    const crew = within(host.container).getByTestId("orch-crew");
+    const bots = Array.from(crew.querySelectorAll(".orch__bot"));
+    expect(bots).toHaveLength(1);
+    expect(bots[0]!.getAttribute("aria-label")).toBe(
+      "Hidden worker · active · hidden from the sidebar",
+    );
+    expect(bots[0]!.getAttribute("data-hidden")).toBe("true");
+    // The one child it could not draw is counted, not silently dropped, and the
+    // count is readable on its own.
+    const more = crew.querySelector(".orch__more")!;
+    expect(more.textContent).toBe("+1");
+    expect(more.getAttribute("role")).toBe("img");
+    expect(more.getAttribute("aria-label")).toBe("1 more child thread");
+  });
+
+  it("keeps a live child on the page when archived rows crowd the read limit", async () => {
+    // The request asks for live rows only; a page that ignored that must still
+    // never let history push a live child out of the crew.
+    const archived = Array.from({ length: 50 }, (_, index) =>
+      childRow({ id: `th_archived_${index}`, title: `Archived ${index}`, archivedAt: Date.now() }),
+    );
+    const rpc = makeRpc({
+      enabled: true,
+      children: { available: true, total: 52, running: 1, error: null },
+    });
+    const host = mount(Host, rpc, {
+      ...threadOptions(),
+      sdk: childSdk([
+        ...archived,
+        childRow({ id: "th_live", title: "Live worker", status: "active" }),
+        childRow({ id: "th_hidden", title: "Quiet worker", visibility: "hidden" }),
+      ]),
+    });
+    await settle();
+    const crew = within(host.container).getByTestId("orch-crew");
+
+    const bots = Array.from(crew.querySelectorAll(".orch__bot"));
+    expect(bots).toHaveLength(2);
+    expect(bots.map((bot) => bot.getAttribute("aria-label"))).toEqual([
+      "Live worker · active",
+      "Quiet worker · idle · hidden from the sidebar",
+    ]);
+    expect(bots.map((bot) => bot.getAttribute("data-hidden"))).toEqual(["false", "true"]);
+    expect(bots.map((bot) => bot.getAttribute("role"))).toEqual(["img", "img"]);
+
+    // 52 counted and 2 painted: the missing 50 are named as a count on a unit
+    // assistive tech can read, never silently dropped.
+    const more = crew.querySelector(".orch__more")!;
+    expect(more.textContent).toBe("+50");
+    expect(more.getAttribute("role")).toBe("img");
+    expect(more.getAttribute("aria-label")).toBe("50 more child threads");
+    expect(within(host.container).getByTestId("orch-children").textContent).toContain(
+      "52 children",
+    );
+  });
+
+  it("reports children as unknown rather than counting the ledger when BB cannot be read", async () => {
+    const rpc = makeRpc({
+      enabled: true,
+      workers: {
+        total: 21,
+        running: 1,
+        settled: 20,
+        accepted: 18,
+        rejected: 2,
+        waiting: 0,
+        unconfirmed: 0,
+      },
+      children: { available: false, total: 0, running: 0, error: "threads.count failed" },
+    });
+    const host = mount(Host, rpc, threadOptions());
+    await flush();
+    const strip = within(host.container);
+
+    const unknown = strip.getByTestId("orch-children-unknown");
+    expect(unknown.textContent).toContain("Children unknown");
+    expect(unknown.textContent).toContain("threads.count failed");
+    expect(strip.queryByTestId("orch-children-running")).toBeNull();
+    // Neither the ledger total nor a zero is passed off as the live count, and
+    // no robot claims an identity the plugin could not read.
+    expect(host.container.textContent).not.toContain("21 children");
+    expect(host.container.textContent).not.toContain("0 children");
+    expect(host.container.textContent).not.toContain("No child threads");
+    expect(strip.queryByTestId("orch-crew")).toBeNull();
+    expect(strip.getByTestId("orch-ledger-stats").textContent).toContain("21 recorded");
+  });
+
+  it("says the child list could not be read instead of drawing records as children", async () => {
+    const rpc = makeRpc({
+      enabled: true,
+      workers: {
+        total: 21,
+        running: 0,
+        settled: 21,
+        accepted: 21,
+        rejected: 0,
+        waiting: 0,
+        unconfirmed: 0,
+      },
+      children: { available: true, total: 2, running: 0, error: null },
+    });
+    const host = mount(Host, rpc, { ...threadOptions(), sdk: childSdk("threads.list failed") });
+    await settle();
+    const strip = within(host.container);
+
+    const note = strip.getByTestId("orch-crew-unknown");
+    expect(note.textContent).toContain("2 child threads are in BB");
+    expect(note.textContent).toContain("threads.list failed");
+    expect(strip.queryByTestId("orch-crew")).toBeNull();
+    expect(host.container.querySelectorAll(".orch__bot")).toHaveLength(0);
+    expect(strip.getByTestId("orch-ledger-stats").textContent).toContain("21 recorded");
   });
 
   it("refetches when the backend publishes a state change", async () => {
@@ -259,7 +572,7 @@ describe("thread composer", () => {
     await flush();
 
     expect(rpc.calls.filter((call) => call.method === "get_state").length).toBeGreaterThan(before);
-    expect(within(host.container).getByText(/Orchestrator mode is on/)).toBeTruthy();
+    expect(within(host.container).getByTestId("orch-strip-thread")).toBeTruthy();
   });
 
   it("toggles through the plus-menu row the compact layout falls back to", async () => {
@@ -343,6 +656,8 @@ describe("the settings section", () => {
     let worker: WorkerConfig = initial;
     let extra = "";
     let newThreads = false;
+    /** Whether the fake secret store holds a judge key. */
+    let judgeKeyStored = false;
     /** The global record the server would resolve every scope over. */
     const globals: Record<string, unknown> = {
       enforcement: "guard",
@@ -357,6 +672,9 @@ describe("the settings section", () => {
       childMessageDelivery: "queued",
       orchestratorSubagents: "none",
       workerSubagents: "blocked",
+      judgeAdvisory: false,
+      maxRevisions: 1,
+      maxStallResumes: 1,
     };
     const projectWorker: Record<string, WorkerConfig> = {};
     const projectRules: Record<string, string> = {};
@@ -419,6 +737,10 @@ describe("the settings section", () => {
         calls.push({ method: "get_scope_settings", input });
         return scopeView(input.projectId);
       },
+      get_judge: async () => {
+        calls.push({ method: "get_judge", input: null });
+        return { configured: judgeKeyStored };
+      },
       set_scope_setting: async (input: { projectId: string | null; key: string; value: unknown }) => {
         calls.push({ method: "set_scope_setting", input });
         if (input.projectId === null) {
@@ -438,6 +760,9 @@ describe("the settings section", () => {
       /** The inputs one method was called with, in order. */
       inputsOf: (method: string) => calls.filter((call) => call.method === method).map((call) => call.input),
       worker: () => worker,
+      setJudgeStored: (value: boolean) => {
+        judgeKeyStored = value;
+      },
     };
   }
 
@@ -565,6 +890,85 @@ describe("the settings section", () => {
       key: "contractPreset",
       value: "delegate-only",
     });
+  });
+
+  it("writes the two boolean switches as booleans, so the server stores them", async () => {
+    const rpc = makeSettingsRpc();
+    const slot = mountSettings(rpc);
+    await flush();
+    const query = within(slot.container);
+    const reads = query.getByLabelText("Read-only commands") as HTMLSelectElement;
+    expect(reads.value).toBe("true");
+    await act(async () => {
+      fireEvent.change(reads, { target: { value: "false" } });
+    });
+    await flush();
+    expect(rpc.calls.filter((call) => call.method === "set_scope_setting").at(-1)?.input).toEqual({
+      projectId: null,
+      key: "allowReadCommands",
+      value: false,
+    });
+
+    const judge = query.getByLabelText("Advisory judge") as HTMLSelectElement;
+    await act(async () => {
+      fireEvent.change(judge, { target: { value: "true" } });
+    });
+    await flush();
+    expect(rpc.calls.filter((call) => call.method === "set_scope_setting").at(-1)?.input).toEqual({
+      projectId: null,
+      key: "judgeAdvisory",
+      value: true,
+    });
+  });
+
+  it("names the judge key's state instead of the opt-in", async () => {
+    const rpc = makeSettingsRpc();
+    rpc.setJudgeStored(true);
+    const slot = mountSettings(rpc);
+    await flush();
+    const query = within(slot.container);
+    const optIn = query.getByLabelText("Advisory judge") as HTMLSelectElement;
+    // The scope never opted in, so the row below must not claim the judge is on
+    // just because a key exists.
+    expect(optIn.value).toBe("false");
+    expect(query.getByText("Key stored.")).toBeTruthy();
+    expect(query.queryByText(/Judge on/)).toBeNull();
+  });
+
+  it("says no key is stored when the secret store is empty", async () => {
+    const rpc = makeSettingsRpc();
+    const slot = mountSettings(rpc);
+    await flush();
+    expect(within(slot.container).getByText("No key stored.")).toBeTruthy();
+  });
+
+  it("draws no second password field for the judge key", async () => {
+    const rpc = makeSettingsRpc();
+    const slot = mountSettings(rpc);
+    await flush();
+    const query = within(slot.container);
+
+    // BB's own plugin settings render the single secret field from the
+    // descriptor. This panel only reports whether a key exists, so it draws no
+    // field and makes no write: one place to enter the key, one label.
+    expect(slot.container.querySelectorAll('input[type="password"]')).toHaveLength(0);
+    expect(query.getByTestId("orch-judge-key-state").textContent).toBe("No key stored.");
+    expect(rpc.calls.some((call) => call.method === "set_judge_key")).toBe(false);
+  });
+
+  it("re-reads the judge key state after a settings write in BB", async () => {
+    const rpc = makeSettingsRpc();
+    const slot = mountSettings(rpc);
+    await flush();
+    const state = () => within(slot.container).getByTestId("orch-judge-key-state").textContent;
+    expect(state()).toBe("No key stored.");
+
+    rpc.setJudgeStored(true);
+    await act(async () => {
+      await slot.behavior.emitRealtime("orchestrator-state", { at: Date.now() });
+    });
+    await flush();
+    expect(state()).toBe("Key stored.");
   });
 
   it("writes the worker model policy from the scope editor", async () => {
@@ -737,5 +1141,144 @@ describe("the settings section", () => {
       projectId: "proj_beta",
       config: null,
     });
+  });
+});
+
+describe("setup-jev pending interaction", () => {
+  const setup = app.pendingInteractions[0]!;
+  const SYNTHETIC_KEY = "sk-or-v1-synthetic-test-key";
+
+  function mountSetup(
+    options: {
+      submitError?: string;
+      cancelError?: string;
+      payload?: Record<string, boolean | string>;
+    } = {},
+  ) {
+    const submitted: unknown[] = [];
+    let cancellations = 0;
+    const slot = renderSlot(
+      { component: setup.component },
+      {
+        interaction: {
+          id: "pi_1",
+          threadId: THREAD,
+          title: "Store the OpenRouter key for the advisory judge",
+          payload: options.payload ?? { configured: false },
+          createdAt: 1,
+          expiresAt: null,
+        },
+        submit: async (value: unknown) => {
+          if (options.submitError !== undefined) throw new Error(options.submitError);
+          submitted.push(value);
+        },
+        cancel: async () => {
+          if (options.cancelError !== undefined) throw new Error(options.cancelError);
+          cancellations += 1;
+        },
+      },
+    );
+    slots.push(slot);
+    return { slot, submitted, cancellations: () => cancellations };
+  }
+
+  async function typeKey(input: HTMLInputElement, value: string): Promise<void> {
+    await act(async () => {
+      fireEvent.change(input, { target: { value } });
+    });
+  }
+
+  it("registers one renderer under the setup-jev id", () => {
+    expect(app.pendingInteractions).toHaveLength(1);
+    expect(setup.id).toBe("setup-jev");
+  });
+
+  it("submits exactly the typed key and nothing else", async () => {
+    const { slot, submitted, cancellations } = mountSetup();
+    const query = within(slot.container);
+    const input = query.getByLabelText("OpenRouter key") as HTMLInputElement;
+    expect(input.type).toBe("password");
+    expect(input.autocomplete).toBe("off");
+
+    await typeKey(input, SYNTHETIC_KEY);
+    await click(query.getByRole("button", { name: "Save key" }));
+
+    expect(submitted).toEqual([{ key: SYNTHETIC_KEY }]);
+    expect(cancellations()).toBe(0);
+  });
+
+  it("saves without offering a value read back from the secret store", async () => {
+    // The payload's only field is a boolean; a renderer that read it as a secret
+    // would leak it into the document.
+    const { slot } = mountSetup({ payload: { configured: true, judgeKey: `stored-${SYNTHETIC_KEY}` } });
+    await flush();
+    const text = slot.container.textContent ?? "";
+    expect(text).toContain("A key is already stored; saving replaces it.");
+    expect(text).not.toContain(SYNTHETIC_KEY);
+    expect(slot.container.querySelectorAll('input[type="password"]')).toHaveLength(1);
+  });
+
+  it("cancels without submitting and leaves no error", async () => {
+    const { slot, submitted, cancellations } = mountSetup();
+    const query = within(slot.container);
+    await click(query.getByRole("button", { name: "Cancel" }));
+    expect(cancellations()).toBe(1);
+    expect(submitted).toEqual([]);
+    expect(query.queryByRole("alert")).toBeNull();
+  });
+
+  it("blocks an empty key in place with an accessible error", async () => {
+    const { slot, submitted } = mountSetup();
+    const query = within(slot.container);
+    const input = query.getByLabelText("OpenRouter key") as HTMLInputElement;
+
+    await click(query.getByRole("button", { name: "Save key" }));
+
+    const alert = query.getByRole("alert");
+    expect(alert.textContent).toBe("Enter the key before saving.");
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    expect(input.getAttribute("aria-describedby")?.split(" ")).toContain(alert.id);
+    expect(submitted).toEqual([]);
+  });
+
+  it("reports a failed save accessibly without echoing the key or losing it", async () => {
+    const { slot, submitted } = mountSetup({ submitError: `Rejected: ${SYNTHETIC_KEY}` });
+    const query = within(slot.container);
+    const input = query.getByLabelText("OpenRouter key") as HTMLInputElement;
+
+    await typeKey(input, SYNTHETIC_KEY);
+    await click(query.getByRole("button", { name: "Save key" }));
+
+    const alert = query.getByRole("alert");
+    expect(alert.textContent).not.toContain(SYNTHETIC_KEY);
+    expect(input.getAttribute("aria-invalid")).toBe("true");
+    expect(input.value).toBe(SYNTHETIC_KEY);
+    expect((query.getByRole("button", { name: "Save key" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(submitted).toEqual([]);
+  });
+
+  it("reports a failed cancel in the same alert region", async () => {
+    const { slot, cancellations } = mountSetup({ cancelError: "The prompt has already closed." });
+    const query = within(slot.container);
+    await click(query.getByRole("button", { name: "Cancel" }));
+    expect(query.getByRole("alert")).toBeTruthy();
+    expect(cancellations()).toBe(0);
+  });
+
+  it("reveals the key on Show and masks it again on Hide", async () => {
+    const { slot } = mountSetup();
+    const query = within(slot.container);
+    const input = query.getByLabelText("OpenRouter key") as HTMLInputElement;
+    await typeKey(input, SYNTHETIC_KEY);
+
+    const show = query.getByRole("button", { name: "Show" });
+    expect(show.getAttribute("aria-pressed")).toBe("false");
+    await click(show);
+    expect((query.getByLabelText("OpenRouter key") as HTMLInputElement).type).toBe("text");
+    expect(query.getByRole("button", { name: "Hide" }).getAttribute("aria-pressed")).toBe("true");
+
+    await click(query.getByRole("button", { name: "Hide" }));
+    expect((query.getByLabelText("OpenRouter key") as HTMLInputElement).type).toBe("password");
+    expect((query.getByLabelText("OpenRouter key") as HTMLInputElement).value).toBe(SYNTHETIC_KEY);
   });
 });

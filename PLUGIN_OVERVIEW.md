@@ -10,9 +10,13 @@ continues, so detected direct work can be recorded, corrected or stopped.
 ## In the composer
 
 Use the delegation icon or the **Orchestrator mode** row in the `+` menu to
-toggle one thread. The strip above the input shows the enforcement level,
-recent direct work and a **Turn off** button. The draft gains a left-edge
-accent. BB may group the icon under **More plugin actions**.
+toggle one thread. The surface above the input shows the enforcement level, a
+small robot per current child in that child's own state, the live child-thread
+count BB reports (kept apart from the recorded ledger) and
+the durable record status. Direct work the watchdog caught sits in its own red
+box with its detail and a **Clear** action, and a worker ledger shows the
+execution that was asked for next to the one BB resolved. The editable draft is
+never decorated. BB may group the icon under **More plugin actions**.
 
 In the root new-thread composer, the switch controls the new-thread default.
 It applies only to qualifying root threads created while the default is on,
@@ -37,7 +41,15 @@ the catalog does not offer is refused with the alternatives named.
 Every delegation is also meant to end in a verdict: the orchestrator records one
 per worker with `orchestrator_review`, and a turn that ends with unjudged
 workers gets one reminder. `verify: true` adds an independent check unit that
-inspects the work and reports pass or fail instead of repairing it.
+inspects the work and reports pass or fail instead of repairing it; a build kind
+is checked automatically. A failed check is re-delegated once with its findings,
+a rejected build unit is re-delegated from the reviewer's notes, and an
+`accepted` verdict is refused while the stored check verdict is a failure.
+
+A unit names its `kind` — build, review or research — which picks its checkout
+under a mixed workspace and its check policy without needing a stored execution
+preset. A worker with no recorded progress for five minutes is resumed on the same
+session, up to the scope's budget, rather than replaced.
 
 `instruct` writes the rules and checks nothing. `guard` (the default) also
 watches the timeline, records direct work and sends corrective messages up to
@@ -64,12 +76,15 @@ your environment and use ordinary provider resources.
 ## CLI and settings
 
 `bb orchestrator-mode` provides `status`, `on`, `off`, `violations` (including
-`--clear`), `default`, `worker` and `contract`. Thread commands accept
+`--clear`), `default`, `worker`, `review` and `contract`. `status` reports worker
+counts, decisions, effective and unconfirmed executions, retained threads, and
+the record caps with any records already lost to them. Thread commands accept
 `--thread`; every command supports `--json`. Settings control the new-thread
 default, enforcement, read-only command handling, the corrective-message cap,
 the contract level, worker retention and the two fan-out caps. The worker
 execution and its presets are stored by the plugin and edited in Settings or
-with `bb orchestrator-mode worker`; `contract` prints the exact instructions a
+with `bb orchestrator-mode worker`; `scope` also writes the revision and stall
+budgets and the advisory judge opt-in; `contract` prints the exact instructions a
 thread receives.
 
 Requires bb 0.44+ and Plugin SDK 0.5.29+. Licensed under MIT.

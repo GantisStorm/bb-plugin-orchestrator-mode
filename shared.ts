@@ -23,6 +23,15 @@ export const DELEGATE_TOOL = "orchestrator_delegate";
  */
 export const REVIEW_TOOL = "orchestrator_review";
 
+/**
+ * The tool that runs a unit's independent check when that check never ran: a
+ * call cancelled before the checker started, a revision that finished after its
+ * review call gave up, or a checker that could not be spawned. Without it a
+ * `verify: true` record is fail-closed forever, which is a dead end rather than
+ * a safeguard.
+ */
+export const CHECK_TOOL = "orchestrator_check";
+
 /** What the orchestrator decided about a worker's output. */
 export const REVIEW_VERDICTS = ["accepted", "rejected"] as const;
 export type ReviewVerdict = (typeof REVIEW_VERDICTS)[number];
@@ -105,6 +114,35 @@ export interface WorkerExecution {
  */
 export const WORKER_PRESETS = ["build", "review", "research"] as const;
 export type WorkerPresetName = (typeof WORKER_PRESETS)[number];
+
+/**
+ * The checkout each unit kind defaults to under a `mixed` workspace. A build is
+ * the one kind that writes, so it gets its own branch; a review or a research
+ * unit only reads and belongs in the orchestrator's own checkout. This is a
+ * property of the kind, not of a stored execution preset: a scope that has
+ * saved no presets still gets the default, which is what `mixed` is for.
+ */
+export const KIND_WORKSPACES: Record<WorkerPresetName, "shared" | "worktree"> = {
+  build: "worktree",
+  review: "shared",
+  research: "shared",
+};
+
+/**
+ * Whether a kind gets an independent check unit when the scope does not force
+ * one. A build changes files, so its claim needs running; a review and a
+ * research unit are themselves the inspection.
+ */
+export const KIND_CHECKS: Record<WorkerPresetName, boolean> = {
+  build: true,
+  review: false,
+  research: false,
+};
+
+/** Whether a value is one of the unit kinds. */
+export function isWorkerKind(value: unknown): value is WorkerPresetName {
+  return isOneOf(WORKER_PRESETS, value);
+}
 
 /**
  * Whether a delegation may choose its own model. `pinned` is the default: every
@@ -1237,6 +1275,11 @@ export function isReadOnlyCommand(command: string): boolean {
   const { unquoted, live, segments } = scanCommandLine(stripStderrDiscard(stripHeredocBodies(trimmed)));
   // A redirect writes, whatever the program is. Only unquoted text counts: `echo 'a > b'` writes nothing.
   if (/(^|[^>])>(?!&)/.test(unquoted)) return false;
+  // `>&word` is bash's second spelling of an output redirect. A bare fd number
+  // or `-` duplicates or closes a descriptor and writes nothing, but any other
+  // word names a file, so `echo hi >& out.txt` is work. `&>file` is already
+  // caught above by the `>` that follows `&`.
+  if (/(^|[^<])>&[ \t]*(?!-|\d+(?:$|[\s;|&]))\S/.test(unquoted)) return false;
   if (/\btee\b/.test(unquoted)) return false;
   // `$(...)` and backticks run inside double quotes as well, so they are looked
   // for in every character the shell expands; `<( )`/`>( )` and `( )` are
@@ -1663,6 +1706,12 @@ interface InstructionInput {
   /** Which level of contract to emit. Defaults to `standard`. */
   preset?: ContractPresetId;
   /**
+   * How many automatic revisions one unit chain may spend. The contract must
+   * state the scope's own budget: promising a revision at `0`, or one where the
+   * scope allows three, is a contract the plugin refuses to honor.
+   */
+  maxRevisions?: number;
+  /**
    * Whether the contract invites per-delegation model choice. `pinned` — the
    * default — says the opposite: every worker runs on the stored execution, and
    * `delegate` refuses the arguments that would move one off it.
@@ -1720,34 +1769,54 @@ export function buildInstructions(input: InstructionInput): string {
     input.enforcement === "instruct"
       ? "This is a standing contract; nothing is watching your tool calls."
       : input.enforcement === "guard"
-        ? "A watchdog reads your timeline. Every direct-work act is recorded and reported back, and you will be told to re-delegate it."
-        : "A watchdog reads your timeline and STOPS the turn the moment you do direct work. Work you did yourself is thrown away.";
+        ? "A watchdog reads your timeline: every direct-work act is recorded and reported back, and you re-delegate it."
+        : "A watchdog reads your timeline and STOPS the turn on direct work. What you did yourself is thrown away.";
 
   const savedKinds = WORKER_PRESETS.filter(
     (name) => input.workerConfig?.presets?.[name] !== undefined,
   );
-  const savedPresets =
-    savedKinds.length === 0
-      ? ""
-      : ` Saved worker kinds: ${savedKinds.join(", ")}; name one as \`preset\` for that kind.`;
+  const kindNames = WORKER_PRESETS.join(", ");
+  /**
+   * What a unit kind decides, and what it does not. A kind always picks the
+   * workspace under `mixed` and whether a check runs; a stored execution for
+   * that kind is applied when one exists, so the orchestrator never has to
+   * translate a kind into a stored preset first.
+   */
+  const kindLine = `Name each unit's kind: \`${kindNames}\`. A build is checked; review and research check themselves.${savedKinds.length === 0 ? "" : ` A stored execution applies to ${savedKinds.join(", ")}.`}`;
 
   const preset = input.preset ?? "standard";
+  // The revision sentence names the scope's own budget. `0` is a real setting,
+  // so promising a revision there would describe work the plugin refuses.
+  const revisions = input.maxRevisions ?? 1;
+  // One self-contained clause: what happens to a failed unit, and who re-delegates
+  // the rest. A tail added on top of this read as two instructions at `0`.
+  const revised =
+    revisions === 0
+      ? "a failed build or `verify: true` unit is not revised automatically: the failure is reported and you re-delegate it yourself"
+      : revisions === 1
+        ? "a failed build or `verify: true` unit is revised once; re-delegate any other failed unit yourself"
+        : `a failed build or \`verify: true\` unit is revised up to ${revisions} times; re-delegate any other failed unit yourself`;
+
   // `delegate-only` takes the reading out of the orchestrator's hands entirely: the
   // question goes to a worker, and the shell goes away with it.
   const research =
     preset === "delegate-only"
       ? "\n   Even finding things out is a unit of work. Hand a worker the question instead of searching yourself."
       : "";
+  /** The same clause, capitalized for use at the start of a sentence. */
+  const revisionRule = `${revised[0]!.toUpperCase()}${revised.slice(1)}`;
   const reviewStep =
     preset === "review-heavy"
       ? `4. Every unit gets checked before you trust it: the plugin starts an independent check
    unit on each one. It runs what the unit claims (the tests, the command, the paths)
-   and reports raw output. Record a verdict with \`${REVIEW_TOOL}\`. Re-delegate a
-   failed check; never patch it yourself.`
-      : `4. Record a verdict on every worker with \`${REVIEW_TOOL}\`. Pass
-   \`verify: true\` for a unit whose result you cannot judge from its report: that
-   adds a check unit. Send a wrong or incomplete result back to a worker; never
-   patch it yourself.`;
+   and reports raw output. Record a verdict with \`${REVIEW_TOOL}\`.
+   ${revisionRule}. Never patch a result yourself.`
+      : `4. Record a verdict on every worker with \`${REVIEW_TOOL}\`. Request
+   \`verify: true\` on delegation (CLI: \`--verify\`) for an independent check.
+   A build is checked by default; ${revised}. Never patch it.
+   A unit whose check never ran is pending: run \`${CHECK_TOOL}\`; a failed or
+   unrun check refuses acceptance. An opted-in scope may add judge advice, never
+   a verdict.`;
 
   /**
    * What a worktree leaves behind, and how it lands. Only emitted when the scope
@@ -1756,13 +1825,13 @@ export function buildInstructions(input: InstructionInput): string {
    */
   const workspaceRule =
     input.workspace === "worktree"
-      ? `\n\n   Units run in their own worktrees, so nothing a worker writes reaches your\n   checkout until it is merged. To land one, delegate the merge as its own unit\n   with \`workspace: "shared"\`, naming the branch.`
+      ? `\n\n   Units run in their own worktrees, so nothing a worker writes reaches your\n   checkout until merged. Land one by delegating the merge as its own unit with\n   \`workspace: "shared"\`, naming the branch.`
       : input.workspace === "mixed"
-        ? `\n\n   Name where each unit runs: \`workspace: "shared"\` edits your checkout at once,\n   \`workspace: "worktree"\` keeps it on a branch. Give one to a unit that would\n   touch files another unit touches, or that should not disturb your tree. Land it\n   by delegating the merge as its own unit with \`workspace: "shared"\`.`
+        ? `\n\n   A unit's kind picks its checkout: a build gets a worktree, review or research\n   reads yours; \`workspace\` overrides that. Land one by delegating the merge\n   with \`workspace: "shared"\`.`
         : "";
 
   const commands = input.allowReadCommands && preset !== "delegate-only"
-    ? "Read-only shell commands are allowed for orientation. Literal stderr suppression (`2>/dev/null`) is allowed; other output redirects count as work."
+    ? "Read-only shell commands are allowed for orientation. `2>/dev/null` is allowed; other output redirects count as work."
     : "Only CLI delegation commands may run; read-only shell exploration is disabled.";
 
   /**
@@ -1771,7 +1840,7 @@ export function buildInstructions(input: InstructionInput): string {
    */
   const subagentRule =
     input.subagents === "all"
-      ? `\n\n   Subagents: all, including editing agents, are allowed within existing user\n   and parent authorisation. This grants no additional tools or permissions.`
+      ? `\n\n   Subagents: all, editing ones included, within existing user and parent\n   authorisation. This grants no extra tools or permissions.`
       : `\n\n   Start no subagents of your own: every unit goes through \`${DELEGATE_TOOL}\`.`;
 
   /**
@@ -1790,13 +1859,13 @@ export function buildInstructions(input: InstructionInput): string {
     ? `${refusedArgs.slice(0, -1).join(", ")} or ${refusedArgs[refusedArgs.length - 1]}`
     : refusedArgs[0];
   const modelBudget = pinnedPolicy
-    ? `${workerBudget(input.workerConfig)} Every worker runs on that execution${savedKinds.length === 0 ? "" : ", or on a stored kind it names as \`preset\`"}: do not pass ${refusedList} on a delegation.${savedPresets}`
+    ? `${workerBudget(input.workerConfig)} Every worker runs on that execution${savedKinds.length === 0 ? "" : ", or on a kind's stored execution"}: do not pass ${refusedList} on a delegation.`
     : `${workerBudget(input.workerConfig)} Override per delegation with \`model\`,
-\`provider\` (alias \`providerId\`), \`reasoning\` and \`permissionMode\`. Give a hard unit a stronger
-model, a mechanical one a cheaper one.${savedPresets}`;
+\`provider\` (alias \`providerId\`), \`reasoning\` and \`permissionMode\`. A hard unit
+can use a stronger model.`;
   const pinLine = pinnedPolicy
     ? ""
-    : "   Pin with `--provider <id> --model <id>`; pinning does not require turning this mode off.\n";
+    : "   Pin with `--provider <id> --model <id>`; no mode switch.\n";
 
   const reminderLines = (input.reminders ?? [])
     .slice(-5)
@@ -1809,7 +1878,7 @@ model, a mechanical one a cheaper one.${savedPresets}`;
   const render = (lines: readonly string[], extra = input.extra): string => `# ORCHESTRATOR MODE IS ON FOR THIS THREAD
 
 You are an orchestrator: you do not do the work. Every unit goes to a worker
-thread, and your output is the plan, the delegation and the synthesis.
+thread; your output is the plan, the delegation and the synthesis.
 
 ${watching}
 
@@ -1819,41 +1888,45 @@ ${watching}
 - Generating images yourself.
 - Running a command that changes anything: builds, installs, tests, commits,
   migrations, formatters.
-- Writing code yourself, even a one-line fix, even when a worker would be slower.
-- Fixing a worker's output by hand instead of sending it back.
+- Writing code yourself, even a one-line fix.
+- Fixing a worker's output by hand.
 
 ${commands}
 
 ## How you work instead
 ${workspaceRule}
-1. Understand the request. Read and search freely; ask when the goal is
+1. Understand the request: read and search freely, and ask if it is
    ambiguous.${research}
-2. Give each unit a self-contained brief: goal, context, constraints and
-   definition of done. A worker cannot see this conversation.
-3. Delegate with \`${DELEGATE_TOOL}\`; if unavailable, use
+2. Give each unit a self-contained brief: goal, context, constraints, done.
+   A worker cannot see this conversation.
+3. Delegate with \`${DELEGATE_TOOL}\`, else
    \`bb orchestrator-mode delegate --task 'complete brief'\`.
-   Quote briefs safely; \`--no-wait\` fans out independent units. A resumed session
-   may retain its original tool list.
+   Quote briefs safely; \`--no-wait\` fans out independent units and returns
+   while they run; a cancelled call starts no worker. A resumed session may keep
+   its old tools. Name \`after\` to hold a unit until each dependency
+   settles cleanly. ${kindLine}
 ${pinLine}${reviewStep}
-   Send corrections with \`bb thread tell <worker-id> ...\` (alias \`message\`) to
-   recorded workers; safely quoted messages or quoted stdin heredocs are delegation.
-5. Synthesise results and what remains. Link worker ids so the user can open them.
+   Corrections: \`bb thread tell <worker-id> ...\` reaches recorded workers;
+   safely quoted messages or quoted stdin heredocs are delegation.
+5. Synthesise results and what remains; link ids.
+   \`bb orchestrator-mode status\` counts live children from BB, and the ledger
+   separately; the ledger is not the live count.
 
 ## When you may act directly
 
-Only reading, searching, planning, asking, delegating and reporting. Before a
-tool that changes something, stop and delegate.${subagentRule}
+Only read, search, plan, ask, delegate and report. Before a changing tool, stop
+and delegate.${subagentRule}
 
-## Choosing the worker's model
+## Worker model
 
-${modelBudget} Ids come from
-\`bb provider list\` and \`bb provider models <provider>\`, both read-only.
+${modelBudget} Ids: \`bb provider list\`,
+\`bb provider models <provider>\`.
 
 ${extraBudget(extra)}## If you cannot delegate
 
 Say so plainly and stop: "I cannot do this without doing the work myself" is a
-correct answer, and doing the work is not. Do not argue with the mode; ask the
-user to turn it off in the composer.${reminderBlock(lines)}`;
+correct answer; doing the work is not. Do not argue with the mode: ask the user
+to turn it off in the composer.${reminderBlock(lines)}`;
 
   const whole = render(reminderLines);
   if (whole.length <= INSTRUCTION_LIMIT) return whole;
@@ -1881,6 +1954,11 @@ user to turn it off in the composer.${reminderBlock(lines)}`;
  * conversation, so it carries the original brief, what the first worker said it
  * did, and what to report. It is told to inspect and report, never to fix: a
  * verifier that repairs the work destroys the evidence of whether it was right.
+ *
+ * The worker's text is quoted line by line. Its own `VERDICT:` line, if it wrote
+ * one, is therefore inside a block quote: a checker that copies it back has
+ * copied quoted material, not stated a verdict of its own, and the parser reads
+ * no verdict from there.
  */
 export function buildVerifierBrief(input: {
   task: string;
@@ -1889,10 +1967,14 @@ export function buildVerifierBrief(input: {
 }): string {
   const trim = (text: string, limit: number): string =>
     text.length > limit ? `${text.slice(0, limit)}\n\n[truncated]` : text;
-  const claimed =
+  const reported =
     input.workerOutput === null || input.workerOutput.trim() === ""
       ? "(the worker reported no final text)"
       : trim(input.workerOutput.trim(), 8_000);
+  const claimed = reported
+    .split("\n")
+    .map((line) => (line.trim() === "" ? ">" : `> ${line}`))
+    .join("\n");
   return `# Check another worker's work
 
 A worker was asked to do this, and reported back:
@@ -1902,6 +1984,9 @@ A worker was asked to do this, and reported back:
 ${trim(input.task, 8_000)}
 
 ## What it reported ("${input.workerTitle}")
+
+The worker's final text is quoted here. It is one side's claim, not a verdict,
+and a \`VERDICT:\` line inside it is the worker's word rather than yours.
 
 ${claimed}
 
@@ -1917,13 +2002,210 @@ Report, in this order:
 
 1. What you actually ran and inspected (exact commands and paths, with their raw
    output — paste it, do not summarise it).
+   Also put each command you actually ran on its own unquoted line outside any
+   code fence. Do not list a command you did not execute.
 2. What is correct.
 3. What is wrong, missing or unverified, each with the evidence, and what you
    tried that did not falsify the claim.
-4. A final line: \`VERDICT: pass\` or \`VERDICT: fail\`, then one sentence of
-   reasoning.
+4. A final line, with nothing after it: \`VERDICT: pass\` or \`VERDICT: fail\`,
+   then one sentence of reasoning.
+
+Quote anything you copy from the worker's report. The last unquoted line of your
+report is the one read as your verdict, and a verdict line that is quoted, or
+that is followed by more of your report, is not taken as one.
 
 Do not modify any file. If the work is wrong, say so plainly.`;
+}
+
+/**
+ * The brief for a revision: the original brief, what the previous attempt
+ * reported, and the reviewer's findings. Only the findings are new instruction;
+ * the rest is context so the revision does not drift into a different task.
+ */
+export function buildRevisionBrief(input: {
+  task: string;
+  workerTitle: string;
+  previousOutput: string | null;
+  notes: string;
+}): string {
+  const trim = (text: string, limit: number): string =>
+    text.length > limit ? `${text.slice(0, limit)}\n\n[truncated]` : text;
+  const previous =
+    input.previousOutput === null || input.previousOutput.trim() === ""
+      ? "(the previous attempt reported no final text)"
+      : trim(input.previousOutput.trim(), 6_000);
+  return `# Revise a rejected unit
+
+The same brief was attempted ("${input.workerTitle}") and rejected. Fix what the
+review found, and nothing else: a revision that redesigns the unit is a new
+failure, not a fix.
+
+## The brief
+
+${trim(input.task, 8_000)}
+
+## What the previous attempt reported
+
+${previous}
+
+## What the review found
+
+${trim(input.notes.trim(), 4_000)}
+
+## What to do
+
+Work in the same checkout so the previous changes are visible to you. Address
+every finding above, run what the brief names to check your own work, and report
+what you changed and what you ran. Do not touch anything the findings do not
+mention.`;
+}
+
+/**
+ * Commands whose bare name may be named as evidence. The name is the whole
+ * payload: arguments, paths, headers and output never leave the machine, so a
+ * credential, a private path or a customer id cannot ride along with it. A
+ * line whose command is not on this list contributes nothing.
+ */
+const EVIDENCE_COMMANDS = new Set([
+  "bb",
+  "bun",
+  "cargo",
+  "cat",
+  "curl",
+  "deno",
+  "docker",
+  "git",
+  "go",
+  "grep",
+  "ls",
+  "make",
+  "node",
+  "npm",
+  "npx",
+  "pnpm",
+  "python",
+  "python3",
+  "pytest",
+  "rg",
+  "yarn",
+]);
+
+/**
+ * The command a report line starts with: an optional shell prompt or list
+ * marker, an optional `cd … &&`, then the program. Prose that merely mentions a
+ * word like "go" or "make" is not a command line, and only the program token is
+ * ever read — everything after it is left alone.
+ */
+const COMMAND_TOKEN =
+  /^(?:\s*(?:\$|>|\d+[.)]\s+|- )\s*)?(?:cd\s+[^\s&]+\s*&&\s*)?([A-Za-z0-9._/-]{1,200})(?=\s|$)/;
+
+/** The allowlisted program name a line starts with, or null. Never the arguments. */
+function evidenceCommand(line: string): string | null {
+  const found = COMMAND_TOKEN.exec(line);
+  if (found === null) return null;
+  const name = (found[1]!.split("/").pop() ?? "").toLowerCase();
+  return EVIDENCE_COMMANDS.has(name) ? name : null;
+}
+
+/** A list, heading, quote or task marker a report puts in front of a line. */
+const LINE_MARKERS = [/^#{1,6}\s+/, /^(?:[-*+]|\d+[.)])\s+/, /^>\s*/, /^\[[ xX]\]\s+/];
+
+/**
+ * The report lines that belong to whoever wrote the report, not to text it
+ * quoted. A check's brief embeds the worker's report, so a checker that echoes
+ * it can paste the worker's own `VERDICT:` line into its own output: everything
+ * inside a block quote or a fenced block is quoted material, and a caller that
+ * reads a verdict must not take one from there. Fence delimiters and quoted
+ * lines are dropped; the rest keeps its own markers, which each reader strips.
+ */
+export function unquotedReportLines(report: string): string[] {
+  const lines: string[] = [];
+  let fence: "`" | "~" | null = null;
+  for (const line of report.split("\n")) {
+    const trimmed = line.trimStart();
+    const delimiter = /^(`{3,}|~{3,})/.exec(trimmed);
+    if (delimiter !== null) {
+      const marker = delimiter[1]![0] as "`" | "~";
+      // A fence closes only with its own marker, so a ``` block may contain
+      // tildes and the other way round without ending early.
+      if (fence === null) fence = marker;
+      else if (fence === marker) fence = null;
+      continue;
+    }
+    if (fence !== null) continue;
+    // A blockquote can be nested behind list, heading or task markers.
+    let content = trimmed;
+    for (;;) {
+      const next = content.replace(/^(?:#{1,6}\s+|(?:[-*+]|\d+[.)])\s+|\[[ xX]\]\s+)/, "");
+      if (next === content) break;
+      content = next;
+    }
+    if (content.startsWith(">")) continue;
+    lines.push(line);
+  }
+  return lines;
+}
+
+/**
+ * A verdict line after its markers and emphasis are gone. The label may be
+ * wrapped in bold, code or a link's brackets, so the marks are allowed around it
+ * and after the word; anything else on the line is the reasoning that stays.
+ */
+const VERDICT_LINE =
+  /^[*_`~\s]*VERDICT[*_`~\s]*[:：][*_`~\s]*(pass|passed|fail|failed|failure|accepted|accept|rejected|reject)\b[*_`~\s]*(?:[-—:.,;]\s*)?(.*)$/i;
+
+/**
+ * The verdict a check report line states, read through the ordinary Markdown a
+ * report wraps it in (`**VERDICT: fail**`, `- VERDICT: pass`, `## VERDICT: failed`),
+ * or null when the line states none. Only the word and the reasoning after it are
+ * returned; the markup never reaches storage or an egress path.
+ */
+export function parseVerdictLine(line: string): { verdict: ReviewVerdict; reasoning: string } | null {
+  let text = line.trim();
+  // Markers nest ("- **VERDICT: fail**"), so strip until the line stops changing.
+  for (let guard = 0; guard < 8; guard += 1) {
+    const stripped = LINE_MARKERS.reduce((value, marker) => value.replace(marker, ""), text).trim();
+    const unmarked = stripped.replace(/^[*_`~]+\s*/, "");
+    if (unmarked === text) break;
+    text = unmarked;
+  }
+  const found = VERDICT_LINE.exec(text);
+  if (found === null) return null;
+  const word = found[1]!.toLowerCase();
+  const verdict: ReviewVerdict =
+    word === "pass" || word === "passed" || word === "accepted" || word === "accept"
+      ? "accepted"
+      : "rejected";
+  return { verdict, reasoning: found[2]!.replace(/^[*_`~\s]+|[*_`~\s]+$/g, "").trim() };
+}
+
+/**
+ * The minimized evidence sent to the advisory judge: the check's bare verdict
+ * token and the names of the allowlisted programs it reported running. Nothing
+ * else survives — no argument, path, header value, file content, output or
+ * reasoning sentence — so no credential form can be carried, in any spelling,
+ * and there is nothing left to redact. A report that names both a pass and a fail
+ * sends no verdict, a verdict copied out of a quoted or fenced block is not the
+ * checker's and sends none either, and one with no recognized command name sends
+ * nothing at all.
+ */
+export function minimizeCheckEvidence(report: string): string {
+  const verdicts = new Set<ReviewVerdict>();
+  const commands: string[] = [];
+  for (const raw of unquotedReportLines(report)) {
+    const line = raw.trim();
+    if (line === "") continue;
+    const found = parseVerdictLine(line);
+    if (found !== null) {
+      verdicts.add(found.verdict);
+      continue;
+    }
+    const command = evidenceCommand(line);
+    if (command !== null && !commands.includes(command)) commands.push(command);
+  }
+  if (commands.length === 0) return "";
+  const verdict = verdicts.size === 1 ? `VERDICT: ${[...verdicts][0] === "accepted" ? "pass" : "fail"}` : null;
+  return [...(verdict === null ? [] : [verdict]), `COMMANDS: ${commands.join(", ")}`].join("\n");
 }
 
 /**

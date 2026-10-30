@@ -8,11 +8,13 @@ import {
   WORKER_MODEL_POLICIES,
   buildInstructions,
   buildNudge,
+  buildVerifierBrief,
   classifyRow,
   defaultAppliesTo,
   isEnforcementLevel,
   isReadOnlyCommand,
   readMirror,
+  unquotedReportLines,
   writeMirror,
   type ContractPresetId,
   type EnforcementLevel,
@@ -298,6 +300,10 @@ describe("read-only command detection", () => {
     "ls & rm -rf build",
     "ls 2>&1 > out.txt",
     "ls &> out.txt",
+    // Bash's other output-redirect spelling. `>&1` duplicates a descriptor and
+    // writes nothing, but `>& word` names a file and truncates it.
+    "echo hi >& out.txt",
+    "cat a >& /tmp/out.txt",
     // Programs that read on their own and write when given the right argument.
     "date -s 2020-01-01",
     "hostname pwned",
@@ -335,6 +341,11 @@ describe("read-only command detection", () => {
       expect(isReadOnlyCommand(command)).toBe(false);
     });
   }
+
+  it("allows a descriptor duplication, which writes no file", () => {
+    expect(isReadOnlyCommand("ls >&2")).toBe(true);
+    expect(isReadOnlyCommand("cat f 2>&1")).toBe(true);
+  });
 });
 
 // Every case below is a defect that the oracle fuzzer (a real `/bin/bash` run
@@ -802,9 +813,9 @@ describe("the contract", () => {
     for (const enforcement of levels) {
       const text = buildInstructions({ enforcement, allowReadCommands: true, subagents });
       if (subagents === "all") {
-        expect(text).toContain("Subagents: all, including editing agents, are allowed");
-        expect(text).toContain("existing user\n   and parent authorisation");
-        expect(text).toContain("no additional tools or permissions");
+        expect(text).toContain("Subagents: all, editing ones included, within existing user");
+        expect(text).toContain("existing user and parent\n   authorisation");
+        expect(text).toContain("no extra tools or permissions");
       } else if (subagents === "none") {
         expect(text).toContain("Start no subagents of your own");
       } else {
@@ -862,38 +873,31 @@ describe("the contract", () => {
     }
   });
 
-  it("gives each level one idea: the check unit, or the shell", () => {
-    const strictStep = "Every unit gets checked before you trust it";
-    const onDemandStep = "`verify: true` for a unit whose result you cannot judge";
-    const delegated = "Even finding things out is a unit of work";
-    const contract = (preset: ContractPresetId, allowReadCommands = true) =>
-      buildInstructions({ enforcement: "guard", allowReadCommands, preset });
 
-    // standard: a check unit only where a report cannot settle a unit.
-    const standard = contract("standard");
-    expect(standard).toContain(onDemandStep);
-    expect(standard).not.toContain(strictStep);
-    expect(standard).toContain("Read-only shell commands");
-
-    // review-heavy: that check becomes mandatory, and the check runs the work rather
-    // than rereading it. Nothing else changes.
-    const reviewHeavy = contract("review-heavy");
-    expect(reviewHeavy).toContain(strictStep);
-    expect(reviewHeavy).toContain("runs what the unit claims");
-    expect(reviewHeavy).not.toContain(onDemandStep);
-    expect(reviewHeavy).not.toContain(delegated);
-    expect(reviewHeavy).toContain("Read-only shell commands");
-
-    // delegate-only: the reading goes to workers and the shell goes with it, whatever
-    // the read-only allowance says. The review step stays as standard's.
-    const delegateOnly = contract("delegate-only");
-    expect(delegateOnly).toContain(delegated);
-    expect(delegateOnly).toContain("Only CLI delegation commands may run");
-    expect(delegateOnly).not.toContain(strictStep);
-    expect(delegateOnly).toContain(onDemandStep);
+  it("states the scope's own revision budget instead of promising one", () => {
+    const contract = (maxRevisions?: number) =>
+      buildInstructions({ enforcement: "guard", allowReadCommands: true, maxRevisions });
+    // No value passed means the stored default: one revision.
+    expect(contract()).toContain("is revised once");
+    // `0` is a real setting, so the contract must not promise a revision.
+    expect(contract(0)).toContain("is not revised automatically");
+    expect(contract(0)).not.toContain("revised once");
+    expect(contract(2)).toContain("is revised up to 2 times");
+    expect(contract(3)).toContain("is revised up to 3 times");
+    expect(contract(3)).not.toContain("revised once");
+    // review-heavy opens the sentence with the same clause, so the budget is
+    // stated there too rather than only in the standard contract.
+    const strict = buildInstructions({
+      enforcement: "guard",
+      allowReadCommands: true,
+      preset: "review-heavy",
+      maxRevisions: 0,
+    });
+    expect(strict).toContain("A failed build or `verify: true` unit is not revised automatically");
+    expect(strict).not.toContain("revised once");
   });
 
-  it("names the saved worker kinds, and stays silent when none are stored", () => {
+  it("names the unit kinds always, and the stored executions only when they exist", () => {
     const withPresets = buildInstructions({
       enforcement: "guard",
       allowReadCommands: true,
@@ -905,14 +909,19 @@ describe("the contract", () => {
         },
       },
     });
-    expect(withPresets).toContain("Saved worker kinds: build, research");
-    expect(withPresets).toContain("name one as `preset`");
+    // A kind is a property of the work, so the contract names every kind even
+    // with no preset saved: that is what makes a mixed workspace usable.
+    expect(withPresets).toContain("Name each unit's kind: `build, review, research`");
+    expect(withPresets).toContain("A stored execution applies to build, research");
     // Enum order, not insertion order: build before research however the map was written.
-    expect(withPresets.indexOf("build")).toBeLessThan(withPresets.indexOf("research"));
+    expect(withPresets.indexOf("A stored execution applies to build")).toBeLessThan(
+      withPresets.indexOf("research."),
+    );
 
-    // Nothing saved means nothing advertised: the contract never invents a knob.
+    // Nothing saved means no execution is advertised; the kinds are still named.
     const without = buildInstructions({ enforcement: "guard", allowReadCommands: true, preset: "review-heavy" });
-    expect(without).not.toContain("Saved worker kinds");
+    expect(without).not.toContain("A stored execution applies to");
+    expect(without).toContain("Name each unit's kind");
     expect(without).not.toContain("`preset`");
   });
 
@@ -936,7 +945,7 @@ describe("the contract", () => {
     expect(pinned).toContain("Every worker runs on that execution");
     expect(pinned).toContain("do not pass `model`, `provider` or `reasoning`");
     expect(pinned).not.toContain("--provider <id> --model <id>");
-    expect(pinned).not.toContain("a mechanical one a cheaper one");
+    expect(pinned).not.toContain("A hard unit");
 
     const flexible = buildInstructions({
       enforcement: "guard",
@@ -945,8 +954,38 @@ describe("the contract", () => {
     });
     expect(flexible).toContain("`providerId`");
     expect(flexible).toContain("`model`");
+    expect(flexible).toContain("A hard unit");
     expect(flexible).toContain("--provider <id> --model <id>");
-    expect(flexible).toContain("pinning does not require turning this mode off");
+    expect(flexible).toContain("no mode switch");
+  });
+
+  it("states check recovery, gating, cancellation and the live child count", () => {
+    const text = buildInstructions({
+      enforcement: "guard",
+      allowReadCommands: true,
+      maxRevisions: 2,
+      workspace: "mixed",
+    });
+    // A check a call never ran is not a pass, and acceptance is refused without one.
+    expect(text).toContain("orchestrator_check");
+    expect(text).toContain("check never ran is pending");
+    expect(text).toContain("failed or\n   unrun check refuses acceptance");
+    // The scope's own revision budget is what the contract promises.
+    expect(text).toContain("revised up to 2 times");
+    // Dependencies gate on a clean settle, not merely on being spawned.
+    expect(text).toContain("`after`");
+    expect(text).toContain("settles cleanly");
+    // Cancellation starts nothing, and a no-wait call returns while it runs.
+    expect(text).toContain("cancelled call starts no worker");
+    expect(text).toContain("--no-wait");
+    // The judge is advice from an opted-in scope, never a verdict.
+    expect(text).toContain("opted-in scope");
+    expect(text).toContain("judge advice, never\n   a verdict");
+    // A kind decides the checkout, and the workspace argument overrides it.
+    expect(text).toContain("`workspace` overrides");
+    // Current children come from BB; the ledger is not that number.
+    expect(text).toContain("live children from BB, and the ledger");
+    expect(text).toContain("the ledger is not the live count");
   });
 
   it("keeps a stored kind reachable under the pinned default", () => {
@@ -960,8 +999,8 @@ describe("the contract", () => {
       },
     });
     expect(text).toContain("model `anthropic/claude-haiku-5-5`");
-    expect(text).toContain("or on a stored kind it names as `preset`");
-    expect(text).toContain("Saved worker kinds: research");
+    expect(text).toContain("or on a kind's stored execution");
+    expect(text).toContain("A stored execution applies to research");
   });
 
   it("only warns about the watchdog when one is running", () => {
@@ -1166,4 +1205,56 @@ describe("GET-only curl and gh api", () => {
       expect(isReadOnlyCommand(command)).toBe(false);
     });
   }
+});
+
+describe("report provenance", () => {
+  it("drops quoted lines, fenced blocks and their delimiters", () => {
+    const report = [
+      "own first",
+      "> quoted",
+      "   > nested quote",
+      "```",
+      "fenced",
+      "```",
+      "~~~ts",
+      "tilde fenced",
+      "~~~",
+      "own last",
+    ].join("\n");
+    expect(unquotedReportLines(report)).toEqual(["own first", "own last"]);
+  });
+  it("does not treat blockquotes nested in lists or headings as the checker's own lines", () => {
+    expect(unquotedReportLines(["- > VERDICT: pass", "1. > VERDICT: pass", "- [ ] > VERDICT: pass", "## > VERDICT: pass"].join("\n"))).toEqual([]);
+  });
+
+
+  it("drops the rest of an unclosed fence rather than reading it", () => {
+    expect(unquotedReportLines(["own", "```", "VERDICT: pass"].join("\n"))).toEqual(["own"]);
+  });
+
+  it("keeps a line that only mentions a marker inline", () => {
+    expect(unquotedReportLines(["the `code` span stays", ">not quoted? yes quoted"].join("\n"))).toEqual([
+      "the `code` span stays",
+    ]);
+  });
+});
+
+describe("the verifier brief", () => {
+  it("quotes the worker's report so its verdict is never the checker's", () => {
+    const brief = buildVerifierBrief({
+      task: "Fix the parser",
+      workerTitle: "Fix the parser",
+      workerOutput: ["Ran the suite.", "", "VERDICT: pass the parser works"].join("\n"),
+    });
+    expect(brief).toContain("> Ran the suite.");
+    expect(brief).toContain("> VERDICT: pass the parser works");
+    // Its verdict sits inside the quote, so no reader can take it as the
+    // checker's own line.
+    expect(brief).not.toMatch(/^VERDICT: pass the parser works$/m);
+  });
+
+  it("still reports an empty worker report without an empty quote", () => {
+    const brief = buildVerifierBrief({ task: "Fix it", workerTitle: "W", workerOutput: "   " });
+    expect(brief).toContain("> (the worker reported no final text)");
+  });
 });

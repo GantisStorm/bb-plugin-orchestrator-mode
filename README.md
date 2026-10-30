@@ -65,9 +65,12 @@ final report in the parent, and can open each worker to inspect its work.
 
 ### 🎛️ A composer switch
 
-Toggle the current thread from the composer or its `+` menu. The status strip
-shows the enforcement level and recent direct work; the draft gains a left-edge
-accent while the mode is on.
+Toggle the current thread from the composer or its `+` menu. The status surface
+shows the enforcement level, a small robot per current child in that child's
+state, the child-thread count BB reports right now, the delegation ledger kept
+separately, and the durable record status. Direct work the
+watchdog caught sits in its own red box, with the detail and a **Clear**
+action. The draft itself is never decorated.
 
 </td>
 <td width="50%" valign="top">
@@ -76,8 +79,12 @@ accent while the mode is on.
 
 The `orchestrator_delegate` tool creates a child thread from a self-contained
 brief and can wait for its result. Workers use the parent's environment and
-appear in the sidebar unless you request a hidden worker. Optional `providerId`
-and `model` pins are applied before the worker starts.
+appear in the sidebar unless you request a hidden worker. A unit names its
+`kind` (`build`, `review` or `research`), which picks its checkout under a
+`mixed` workspace and decides whether it is checked without needing a stored
+preset. Optional `providerId` and `model` pins are applied before the worker
+starts. Each worker's record keeps what was asked and what BB actually
+resolved, side by side.
 Existing sessions without that tool can use `bb orchestrator-mode delegate`.
 Follow-ups with `bb thread tell <worker-id>` (alias `message`) are delegation
 for recorded workers, including messages supplied through quoted stdin heredocs.
@@ -136,7 +143,7 @@ Open a thread and use **Orchestrator mode** in the composer to enable it.
 | --- | --- |
 | **Thread composer** | The delegation icon toggles that thread; use **More plugin actions** if the host groups buttons. |
 | **Composer `+` menu → Orchestrator mode** | The same toggle, including compact layouts. |
-| **Strip above the input** | Enforcement level, recent violations and a **Turn off** button. |
+| **Strip above the input** | Enforcement level, live children and their robot indicators, the recorded ledger separately, durable record status, direct work in a red box with **Clear**, a worker ledger (asked vs. ran), and **Turn off**. |
 | **Root new-thread composer** | Set whether qualifying new threads start as orchestrators. |
 | **Settings → Installed plugins → Orchestrator Mode** | Every setting, one scope at a time: Global, or the project the selector names. |
 
@@ -227,7 +234,10 @@ A scope's **Where workers run** row decides the checkout a delegation uses:
   `workspace: "shared"` or `workspace: "worktree"`, and the contract tells it to
   give a worktree to any unit that would touch files another unit is touching. A
   delegation that names neither is refused with both options spelled out, because a
-  silent default would make mixed behave like shared.
+  silent default would make mixed behave like shared. Naming a `kind` supplies that
+  default: a build gets a worktree, a review or research unit reads the
+  orchestrator's checkout. It is a property of the kind, not of a stored execution
+  preset, so a scope with no presets still works.
 
 A worktree only holds tracked files, so install what the repo needs from a
 committed `.bb-env-setup.sh` (see `bb guide environments`); until that runs, a
@@ -263,6 +273,7 @@ A single delegation overrides it with the tool's arguments:
 ```json
 {
   "task": "Rebuild the index and report timings",
+  "kind": "build",
   "model": "claude-opus-5-5",
   "reasoning": "high",
   "permissionMode": "full"
@@ -363,7 +374,41 @@ and report `VERDICT: pass` or `VERDICT: fail`, and told not to modify anything.
 A checker that repairs the work destroys the evidence it was asked for. Its
 thread is recorded as that delegation's evidence and its report comes back with
 the worker's. A check unit is not itself a unit to judge, so it does not add a
-second verdict to record.
+second verdict to record. A build kind is checked automatically.
+
+The check's parsed verdict is stored on the unit, read through the ordinary
+Markdown a report wraps it in (`**VERDICT: fail**`, `- VERDICT: pass`,
+`VERDICT: failed`). Only the checker's own text counts: the worker's report is
+handed over as a block quote, and a `VERDICT:` line inside a quote or a fenced
+block is that worker's claim, not the checker's. The checker's verdict must also
+be the last content line of its own report and the only one it states. A report
+that leaves no readable verdict, quotes one, states two, states both a pass and
+a fail, or never produced one is stored as a failure with the reason, so
+unreadable evidence never reads as a pass. An `accepted` verdict is refused while
+that stored verdict is a failure, and a dependent unit does not start on it: a
+pass in a model's report is not a verdict, and the plugin never records an
+acceptance itself.
+
+A failed check on a build unit (or a unit delegated with `verify: true`)
+re-delegates it once with the check's report as the revision brief, then checks
+the revision. A rejected **build** unit does the same with the reviewer's notes,
+when those notes are present, and with the rejected attempt's own final report
+carried into the brief so it fixes what exists instead of guessing at it; a
+rejected review or research unit is reported back
+for the orchestrator to re-delegate. Both are bounded by the scope's **Revisions
+per unit** (`0` reports instead) and by the unit chain's own spent count, run on
+the same execution and checkout, and consume a parallel slot like any worker. The
+per-turn cap does not count them, because they are this plugin's own decision.
+A revision that cannot start — cap reached, provider refused — is reported beside
+the finished result instead of replacing it, and its chain slot is handed back.
+
+One chain spends one budget: an automatic revision, a later rejection of any
+member and a revision of a revision all claim the same counter, atomically, so a
+capped chain cannot restart at 1. A revision whose own check passes resolves the
+chain: the original's failed check and recorded rejection stop blocking
+acceptance and dependent units, because the finding was fixed there. Claiming a
+new revision clears that resolution. A call that is cancelled, or a plugin that
+is disposing, starts no further worker, check or revision.
 
 ## Guardrails
 
@@ -384,6 +429,65 @@ read: `keep` (default) leaves every thread in the sidebar, `archive-checks`
 archives check units, `archive-all` archives every worker the orchestrator has
 read. Archiving is recoverable, and a worker is only archived after its output
 is already in the orchestrator's hands.
+
+Durable state is one row per thread with no shared budget, so no thread's
+history can crowd out another's. The arrays are working records with per-thread
+ceilings (100 violations, 50 delegations, 500 seen rows); every record a ceiling
+dropped is counted, and `bb orchestrator-mode status` reports the caps, the
+count actually lost and how many threads are retained. Nothing else is evicted,
+and deleting a thread removes its row.
+
+### Stall handling and execution provenance
+
+A worker whose thread records no progress — neither `updatedAt` nor its timeline
+sequence — for five minutes while `active` is assumed
+stalled and receives one continue-message on the same session, up to the scope's
+**Resumes for a stalled worker**. It is continued, never respawned, so a unit's
+side effects cannot run twice. When the budget is spent the worker is reported
+as stuck, with a note not to delegate that unit again while it may still finish.
+
+Every delegation record keeps the execution that was **asked for** next to the
+one BB **resolved**: the thread's provider and, once a provider session exists,
+its session snapshot model. BB exposes no reasoning level or service tier for a
+worker, so those are reported as "not reported" rather than echoed from the
+request. The strip's worker ledger and `status` show both lines.
+
+### Advisory judge
+
+`judgeAdvisory` is off by default and is a separate explicit opt-in from the
+OpenRouter key: the key alone sends nothing.
+
+Run `bb orchestrator-mode setup-jev` to open a secure prompt in BB with a masked
+field, a Show/Hide control, and explicit **Save key** and **Cancel** buttons.
+The bundled [setup-jev skill](skills/setup-jev/SKILL.md) wraps the same command.
+The plugin stores one key in an owner-only file beside BB's data directory. On
+upgrade, an existing BB secret setting is moved to that file. The key no longer
+appears in BB's plugin settings.
+
+The setup command accepts no key argument. Enter it only in the secure prompt,
+never in a shell argument, an environment variable, a log, or an agent chat.
+The prompt never displays a stored key; cancelling leaves it untouched. The
+settings panel reports only whether a key exists, and no copy is stored in `bb.db`.
+
+When both are set, a check unit's
+report gets a second opinion from Jev on OpenRouter's decisions endpoint. The
+answer is advice appended to the delegation result and never records, blocks or
+changes a verdict. The check evidence is reduced to structured metadata: its
+bare verdict token (`VERDICT: pass` or `VERDICT: fail`) and allowlisted program
+names (`COMMANDS: npm, git`). The OpenRouter key is sent for authentication.
+Evidence arguments, paths, header values, file contents and output are not sent,
+so no credential from the report —
+`-u user:pass`, an `Authorization: Basic …` or `Bearer …` header, a dotted JWT,
+a `--password` flag — can ride along in any spelling. A report that names no
+allowlisted program is not sent at all. Prose, the verdict's own reasoning
+sentence and quoted source stay local: a verdict token or program name inside a
+block quote or a fenced block belongs to whatever was quoted, so it is not sent
+as this check's evidence. Checkers are asked to list commands they actually ran
+on unquoted lines outside fences; if they do not, Jev may still be skipped.
+The request is bounded by what is left of
+the delegation's own deadline and by its cancellation, though it never fails the
+call: a refusal, an unreachable endpoint, an unusable answer or an expired
+deadline is reported as that failure in the result, not swallowed.
 
 ## The contract
 
@@ -461,10 +565,13 @@ bb orchestrator-mode off
 | Command | Does |
 | --- | --- |
 | `status [--thread <id>] [--json]` | Show mode, enforcement, violations, nudges and delegations. |
-| `delegate --task <brief> [--title <title>] [--provider <id>] [--model <id>] [--no-wait] [--timeout <seconds>] [--hidden] [--thread <id>] [--json]` | Run the same delegation action, with optional worker pins, when the native tool is unavailable. |
+| `setup-jev` | Open BB's secure prompt for the advisory judge's OpenRouter key. Takes no key argument; Save stores the one secret, Cancel changes nothing, and no key is printed or returned. |
+| `delegate --task <brief> [--title <title>] [--kind <kind>] [--workspace <shared\|worktree>] [--provider <id>] [--model <id>] [--verify] [--no-wait] [--timeout <seconds>] [--hidden] [--thread <id>] [--json]` | Delegate through the CLI; `--verify` runs an independent check after the worker finishes and cannot be combined with `--no-wait`. |
+| `review --worker <id> --verdict accepted\|rejected [--notes <text>] [--verified-by <id>] [--json]` | Record a worker verdict from the orchestrator's own shell, when the native tool is unavailable. No `--thread`: only the calling thread can judge its workers. |
+| `check --worker <id> [--json]` | Run the independent check a worker is still waiting for when the native tool is unavailable. Refuses a check that already stored a verdict. |
 | `on [--thread <id>] [--enforcement instruct\|guard\|block] [--json]` | Enable the thread, with an optional enforcement override. |
 | `off [--thread <id>] [--json]` | Disable the thread and clear its enforcement override. |
-| `scope [--global \| --project <id>] [--enforcement <level>] [--read-commands on\|off] [--max-nudges <n>] [--max-parallel <n>] [--max-per-turn <n>] [--contract-preset <standard\|review-heavy\|delegate-only>] [--retention <policy>] [--worker-workspace <shared\|worktree>] [--worker-provider <id>] [--worker-model <id>] [--clear-worker] [--rules <text>] [--clear-rules] [--inherit <key>] [--inherit-all] [--json]` | With `--global`, read or write the record every project inherits (settings only; the worker execution and rules have their own commands). With `--project`, read or write that project's overrides: settings, worker execution and appended rules. Without either, list every project that has any. |
+| `scope [--global \| --project <id>] [--enforcement <level>] [--read-commands on\|off] [--max-nudges <n>] [--max-parallel <n>] [--max-per-turn <n>] [--max-revisions <n>] [--max-stall-resumes <n>] [--judge-advisory on\|off] [--contract-preset <standard\|review-heavy\|delegate-only>] [--retention <policy>] [--worker-workspace <shared\|worktree>] [--worker-provider <id>] [--worker-model <id>] [--clear-worker] [--rules <text>] [--clear-rules] [--inherit <key>] [--inherit-all] [--json]` | With `--global`, read or write the record every project inherits (settings only; the worker execution and rules have their own commands). With `--project`, read or write that project's overrides: settings, worker execution and appended rules. Without either, list every project that has any. |
 | `contract [--thread <id>] [--rules <text>] [--clear-rules] [--json]` | Print the exact instructions this thread receives, or set and clear the project rules appended to them. |
 | `violations [--thread <id>] [--clear] [--json]` | List violations, or clear them and reset correction counters. |
 | `default [on\|off] [--json]` | Show or set the default for new threads. |
@@ -481,19 +588,35 @@ title, uppercased and colon-separated (`BUILD: Add a retry to src/retry.ts`,
 doing without opening the brief. A title that already names the preset is left
 alone, and a delegation without one is titled exactly as before.
 
-Two tools. `orchestrator_delegate({ task, title?, waitForResult?,
+Three tools. `orchestrator_delegate({ task, title?, waitForResult?,
 timeoutSeconds?, hidden?, workspace?, preset?, verify?, provider?, providerId?, model?,
-reasoning?, permissionMode? })` hands one unit to a worker, and
+reasoning?, permissionMode? })` hands one unit to a worker,
 `orchestrator_review({ workerThreadId, verdict, notes?, verifiedBy? })` records
-your verdict on the result. The watchdog expects one verdict per worker whose
-result was used.
+your verdict on the result, and `orchestrator_check({ workerThreadId })` runs the
+independent check a unit is still waiting for. The watchdog expects one verdict
+per worker whose result was used.
 
 If this session lacks the `orchestrator_review` tool, run
 `bb orchestrator-mode review --worker <id> --verdict accepted|rejected --notes "..."`
 from the orchestrator's own shell. It records the same verdict. It takes no `--thread`,
-so a worker cannot name its orchestrator and judge its own output.
+so a worker cannot name its orchestrator and judge its own output. Without
+`orchestrator_check`, `bb orchestrator-mode check --worker <id>` runs a pending
+check the same way. A unit that asked for a check and has none is pending, not
+passed: it cannot be accepted and no dependent unit starts on it until the check
+reports. One check runs per unit at a time, and a recovery check is bounded: at
+most two attempts, each charged to the turn's delegation budget, and none for a
+unit that ended in error or a chain a later revision already settled.
+
+A check claim records the checker thread as soon as BB spawns it, so an expired
+claim is reconciled rather than assumed dead. A checker that is still running
+keeps the unit and the call is refused with its id, a checker that settled has its
+real report recorded as the unit's evidence (fail-closed when it left no verdict),
+and only a run that never spawned a worker is released. A checker the ledger could
+not record — the state write failed after the spawn — is therefore never duplicated
+by a later recovery, and its silence is never read as a pass.
 The brief is required and limited to 20,000 characters; the title is limited to
-200. Waiting defaults to `true`, with a 900-second timeout (range 10–3,600).
+200. Waiting defaults to `true`, with a 900-second total timeout (range
+10–3,600) that the worker, its check unit and any revision share.
 `hidden` defaults to `false`. A timeout returns the worker's status and leaves it
 running. `workspace` picks where this one unit runs: `shared` or `worktree`, overriding the
 [worker workspace](#where-workers-run) setting for that call. Under a `mixed`
@@ -515,7 +638,14 @@ spawns are not retried with unpinned workers; an explicitly configured retry
 target still applies.
 
 The bundled [skill](skills/orchestrator-mode/SKILL.md) explains the mode, delegation
-and CLI; enabled sessions receive the contract directly.
+and CLI. Enabling an active turn sends the contract as a steering message. An
+existing idle ACP/OMP session may resume with its old instructions and tool list,
+even after a runtime stop; the enabled status alone does not prove the contract
+was delivered. The CLI fallback remains available, but cannot make the session
+follow a contract it never received. The separate
+[setup-jev skill](skills/setup-jev/SKILL.md) is the manual, agent-safe route to
+storing the advisory judge key: it runs `bb orchestrator-mode setup-jev` and
+never handles the credential itself.
 
 ## Scope
 
@@ -577,6 +707,9 @@ CLI, and the composer toggles.
 | `workerSubagents` | `blocked` | Inject the no-onward-delegation rule, or omit it with `allowed`; neither value grants tools or changes permission mode. |
 | `maxParallelWorkers` | `8` | Refuse a delegation while this many workers are running. `0` removes the cap. |
 | `maxDelegationsPerTurn` | `20` | Refuse a delegation once a turn has delegated this many. `0` removes the cap. |
+| `maxRevisions` | `1` | Re-delegations one unit chain may spend after a failed check or a rejected review. `0` reports the failure instead. |
+| `maxStallResumes` | `1` | Resume messages one worker may receive after five minutes with no recorded progress, shared by every waiter watching it, before it is reported as stuck. A resume continues the same session. |
+| `judgeAdvisory` | `false` | Explicit opt-in for the advisory judge. A stored OpenRouter key alone sends nothing; it is the key **and** this value. |
 
 Every row except `defaultForNewThreads` is read and written in the selected
 scope, and the defaults above are the built-in record a fresh install starts
@@ -626,16 +759,16 @@ bb plugin dev
 ```text
 server.ts   settings, storage, dispatch hook, watchdog, delegation, RPC and CLI
 shared.ts   pure policy, command classification and contract text
-app.tsx     composer toggle, status strip and menu fallback
+app.tsx     composer toggle, status strip, settings section and secure setup prompt
 assets/     canonical delegation icon used by BB
-skills/     bundled agent skill
+skills/     bundled agent skills (orchestrator-mode, setup-jev)
 docs/       README logo, screenshots and design notes
 ```
 
 Tests exercise the pure policy, backend behaviour through the SDK's fake plugin
-host, and composer surfaces through React render tests. They cover state
+host, and composer and setup surfaces through React render tests. They cover state
 mirroring, default eligibility, grace turns, read-only commands, delegation,
-enforcement, RPC and CLI behaviour.
+enforcement, RPC, CLI and the secure key prompt.
 
 `PLUGIN_OVERVIEW.md` is the store listing. Keep it in step with this README,
 the bundled skill and `bb.description` in `package.json`. Keep generated `dist/`

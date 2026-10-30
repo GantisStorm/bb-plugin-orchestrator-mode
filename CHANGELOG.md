@@ -8,12 +8,63 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 
 ### Added
 
+- `bb orchestrator-mode delegate --verify` runs an independent check for a
+  waited CLI delegation, including research and review units.
+- Move the advisory judge key from BB's settings form to an owner-only file.
+  Existing keys migrate automatically; `setup-jev` remains the entry point.
+- Ask checkers to list their executed commands outside fenced blocks so the
+  privacy filter can recognize the program names without sending arguments.
+
+- `orchestrator_check` (and `bb orchestrator-mode check --worker <id>`) runs an
+  independent check a unit is still waiting for. A manual rejection now revises the
+  unit *and* checks the revision, so a revised unit can be accepted and used as a
+  dependency instead of being refused forever. A check that cannot start, or a
+  call cancelled before it starts, leaves the record honestly pending and names
+  this command as the way forward.
 - `bb orchestrator-mode review` records a worker verdict from the orchestrator's own
   shell, for sessions that lack the `orchestrator_review` tool. It takes no `--thread`
   override, so a worker cannot judge its own output.
+- A unit `kind` (`build`, `review`, `research`) picks where the unit runs under a
+  `mixed` workspace — a build gets its own worktree, review and research read the
+  orchestrator's checkout — and decides whether it is checked. A kind needs no
+  stored execution preset; a stored execution for that kind is applied when one
+  exists.
+- Stalled workers are detected and resumed. A worker that reports no activity for
+  five minutes with no recorded progress while `active` receives a continue-message on the same session, up
+  to the scope's **Resumes for a stalled worker**, and is reported as stuck when
+  that budget is spent. The worker is never respawned, so its side effects cannot
+  run twice.
+- A rejected or failed-checked build unit — and any unit delegated with
+  `verify: true` — is re-delegated with the reviewer's findings, then checked
+  again, bounded by the scope's **Revisions per unit**.
+  `orchestrator_review accepted` is refused while the stored check verdict is a
+  failure, so a pass in a model's report is never treated as a verdict.
+- Dependencies gate on outcome, not just status: an errored dependency, a
+  rejected review or a failed check stops the dependent unit, a duplicate id is
+  refused, and a recorded cycle is refused with the path that closes it.
+- Delegation records keep what was asked for next to what BB resolved (provider,
+  and the provider session's model when one exists). Reasoning level and service
+  tier are reported as not reported instead of echoed from the request.
+- The composer status surface is redesigned: one small robot per recent worker in
+  that worker's state, real worker counts, a worker ledger with asked and ran
+  executions, the durable retention status, and direct work in its own red box
+  with a **Clear** action.
+- `get_state` and `bb orchestrator-mode status` report worker counts, accepted and
+  rejected decisions, effective and unconfirmed executions, the per-thread record
+  caps, records already lost to those caps, and retained thread count.
 
 ### Changed
 
+- A delegation's full brief is retained (up to the tool's 20,000-character
+  limit), because a rejected unit is re-delegated from that record; the old
+  400-character copy would have handed a revision a different task.
+- The advisory judge is an explicit scope opt-in (`judgeAdvisory`), not merely a
+  stored key. The report evidence is reduced to the check's bare verdict token
+  and allowlisted program names (`COMMANDS: npm, git`). Arguments, paths, report
+  headers, output and quoted source are excluded. The OpenRouter key is sent
+  separately for authentication. A report that names
+  no allowlisted program is not sent at all, and the request is bounded by what
+  is left of the delegation's deadline and by its cancellation.
 - A blocked worker's subagent launches are watched. The watchdog reads each
   worker's timeline and sends a correction message when it starts a subagent,
   within the scope's reminder budget. Before this, the rule was only injected.
@@ -22,9 +73,133 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 - `read-only` is removed from orchestrator subagents. It behaved exactly like `none`, while
   its help promised reading agents that were never allowed. `none` is the default, and a
   stored `read-only` falls back to it.
+- The orchestrator contract, the `orchestrator-mode` skill and the tool descriptions now state
+  the behaviour the build actually has: dependency gating on a clean settle (`after`), check
+  recovery and its two-attempt budget, cancellation and `--no-wait`, the judge as opt-in advice
+  that never records a verdict, the kind/workspace checkout rule, and the difference between
+  current children and the ledger. The contract grew inside its 4096-character `configure`
+  budget by trimming the same text, so the worst-case build — longest model id, every preset,
+  five reminders, a project-rules block at the cap — still fits with its tail intact.
 
 ### Fixed
 
+- Keep an expired check claim when the 200-row child listing may be incomplete,
+  instead of starting a duplicate checker that could already be running.
+
+- One independent check per unit at a time. The check slot is reserved, and the
+  claim written, in one serialized mutation before any checker starts, so two
+  calls — or a call racing a checker a delegation left running — cannot both
+  spawn one. A revision's own check takes that claim before it starts its
+  checker, so a recovery call cannot duplicate it in the window where the
+  revision already reads as idle. A result is stored only by the checker the
+  unit is still bound to, so a stale pass cannot overwrite a newer failure.
+- `orchestrator_check` refuses a unit that ended in error, and a chain a later
+  revision already settled, instead of checking work that never finished or
+  re-rolling a fixed finding. A failing check whose run started before the chain
+  was settled does not unsettle it.
+- Recovery checks are bounded to two attempts per unit, each charged to the
+  turn's delegation budget; a reservation that never becomes a worker refunds
+  its attempt. Cancellation after the claim is taken starts no worker.
+- A checker that was spawned but could not be written to the ledger keeps its
+  claim and is named in the result, instead of running untracked. Its
+  process-local parallel reservation is handed back, so one failed write cannot
+  spend a slot for the life of the process, while the checker itself stays
+  counted against the cap from its own thread status until it settles. Check
+  units now settle their record's status and are archived under `archive-checks`
+  like any other check.
+- Releasing a revision that never started now restores the chain resolution the
+  claim cleared, so a cancelled or refused revision no longer leaves a previously
+  settled chain permanently unsettled. A prior resolution that *is* the rejected
+  record is not restored: an explicit rejection of the attempt that settled the
+  chain keeps it unsettled, which is what the rejection means.
+- One revision chain spends one budget. The spent count lives on the chain's
+  root and is read, checked and incremented in one serialized mutation, so an
+  automatic check-driven revision, a later manual rejection of any member and a
+  revision of a revision cannot each draw the scope's full allowance. With
+  `maxRevisions: 5`, a chain that kept failing used to buy up to 9 revisions and
+  repeat `(revision 2)` titles.
+- A check verdict is read through ordinary Markdown (`**VERDICT: fail**`,
+  `- VERDICT: pass`, `VERDICT: failed`), and a report that leaves no readable
+  verdict, states both, produced no text or never started a checker is stored as
+  a failure with the reason. Before, those reports parsed as no verdict, so
+  `orchestrator_review accepted` was allowed and dependent units started on the
+  unit anyway.
+- A check's verdict must now be the checker's own: a `VERDICT:` line inside a
+  block quote or fenced block — where the worker's report is handed over — is
+  the worker's claim and no longer gates acceptance. The checker's verdict must
+  also be the only one it states and the last content line of its own report,
+  because the verifier brief now quotes the worker's report and asks for exactly
+  that. A verdict the checker echoed unquoted, with its own report after it, is
+  rejected as untrustworthy instead of being read as a pass. The minimized
+  advisory evidence follows the same rule, so a quoted verdict or command name
+  is never sent as this check's evidence.
+- An expired check claim is no longer attributed to the newest same-titled
+  child. Every check unit is spawned with `checkFor` metadata naming the unit it
+  inspects, which survives a failed ledger write. If metadata cannot be read,
+  the call refuses rather than guessing from a title. Ambiguous or unattributed
+  candidates also refuse. Before, one unit's checker could be bound as another's
+  evidence when two units shared a title.
+- A manual revision brief now carries the rejected attempt's final report, read
+  from its thread, instead of telling the revision the previous attempt reported
+  nothing. Only the cause of an unreadable report is logged, never its text.
+- A cancelled call or a disposing plugin starts no further worker: the initial
+  spawn, the check unit, the revision and the fallback retry all refuse once the
+  call is aborted. Cancelling during the advisory judge could still spawn a
+  revision.
+- A unit that asked for an independent check and has none — a call cancelled or a
+  plugin disposed before the check started — is refused for acceptance and as a
+  dependency instead of reading as a pass. Cancelling while a manual revision
+  was being set up hands back both its chain slot and its parallel claim.
+- A revision that passes its own check, or that the orchestrator accepts,
+  resolves its chain: the original's failed check and recorded rejection stop
+  refusing acceptance and dependent units, instead of forcing the orchestrator to
+  name the revision id forever. Claiming a new revision clears the resolution.
+- A delegation's timeout now bounds the whole call: the worker, its check unit
+  and every revision share one deadline. Before, each nested wait got the full
+  timeout again, so a 900-second call could block well past its own deadline.
+- A revision keeps its parallel-fan-out reservation until its own record is
+  written, so a check queued in that window can no longer let the cap be
+  exceeded by one. A revision whose worker started but whose record failed is
+  reported as that, not as one that never ran.
+- The settings page reports the judge key's own state ("Key stored" /
+  "No key stored") instead of "Judge on" beside "Advisory judge off" when a key
+  is stored but the scope has not opted in.
+- `bb orchestrator-mode on --json`, `off --json` and `violations --clear --json`
+  report the durable retained-thread count, as `status` already did.
+- The contract no longer tells the orchestrator that a failed review or research
+  unit is never revised: a unit delegated with `verify: true` is checked and
+  revised once, and the text now says so.
+- An `>&` output redirect (`echo hi >& out.txt`) is work again. The classifier
+  skipped any `>` followed by `&`, so a file could be truncated with no violation;
+  descriptor duplication (`>&2`, `2>&1`) still writes no file and stays read-only.
+- A failed timeline-head read no longer judges the thread's pre-enable history.
+  Enabling marks the thread's cursor as unknown, and the first readable scan
+  seeds it and judges nothing, instead of seeding `0` and classifying the past.
+- A running worker is no longer mistaken for a settled one. A timed-out or
+  errored wait with the worker still `active` is reported as running, started no
+  check unit against unfinished work and is never archived; running workers keep
+  counting against the parallel cap; and the review gate only asks for verdicts on
+  workers that have actually finished.
+- Saving the advisory judge key reports a failed write (an over-long key, or a
+  refused secret write) instead of leaving an unhandled rejection with the draft
+  on screen.
+- The checks that guard the advisory judge now send only minimized evidence and
+  report refusals, unreachable endpoints and unusable answers as named failures.
+- The advisory judge draws on what is left of the delegation's deadline and on
+  its cancellation. Before, its request had neither, so a stalled OpenRouter
+  endpoint held a call past the timeout it advertised; an expired or cancelled
+  call now names that and sends nothing.
+- The contract states the scope's own **Revisions per unit** budget instead of
+  promising one revision. At `0` it now says no automatic revision runs, and at
+  two or more it names the count, instead of contradicting the setting.
+- A rejected unit that asked for `verify: true` is revised like a build, keeping
+  its kind and its check rule, and a unit outside that rule is told why no
+  revision ran instead of being skipped in silence. Before, only a `build` kind
+  was revised through `orchestrator_review`, so a checked review or research
+  unit was dropped without a word.
+- `docs/DESIGN.md` no longer claims a 300-thread eviction that was removed in
+  favour of one durable row per thread; it now documents the real per-thread
+  record caps and the lost-record counters.
 - A `delegate-only` contract's watchdog now refuses shell reads too, matching
   the contract, which runs no shell commands.
 - One worker provider that cannot list its models no longer stalls the worker catalog. The
@@ -54,8 +229,28 @@ All notable changes to Orchestrator Mode are documented here. The format follows
   file rather than in the database, and is never returned to the frontend.
 - The advisory judge asks Jev on OpenRouter's decisions endpoint with a typed question, the
   way Jev is served. It used to post to `/api/v1/chat/completions` with a model that endpoint
-  does not carry, so it could never answer. It sends only the check unit's report, capped at
-  4,000 characters, and still never records a verdict.
+  does not carry, so it could never answer. It sends only minimized structured metadata — the
+  check's verdict token and the names of the allowlisted programs it says it ran — never the
+  report body, arguments, paths or output, and still never records a verdict.
+- The composer strip reports the delegation ledger as the current worker count. Two children in
+  the sidebar could read as "21 workers, 20 finished, 1 running" because the numbers came from
+  this thread's records. It now shows **children**, read live from BB's own thread tree through
+  `threads.list` with `parentThreadId`, `includeHidden` and `archived: false`, paged until a short
+  page makes the total exact: `threads.count` takes no `includeHidden`, so its total left every
+  hidden child out of the count. A tree that fills every page is probed with one more row — exact
+  when none is there, unknown when one is, instead of a count that is silently short. `running` is
+  `starting`/`active`/`stopping`. The ledger is labelled as history and never substituted for the
+  live count; when BB cannot be read, the count says unknown with the reason. `status` reports both
+  lines, and the strip marks the live count with a shape-coded dot (hollow idle, filled running,
+  dashed unknown) plus text, so color is never the only signal.
+- A check claim now records the checker thread as soon as BB spawns it, written and retried on
+  its own so ownership survives a failed ledger write. An expired claim is reconciled against
+  BB before another check may start: a checker still running keeps the unit and the call is
+  refused, a checker that settled has its real report parsed and stored (fail-closed when it
+  left no verdict), and only a run that never produced a worker is released. An unrecorded
+  checker can no longer be duplicated after the claim's TTL.
+- The advisory judge key is entered through `setup-jev`, stored in an owner-only
+  file and never returned in a status response.
 
 ## 0.1.4 - 2026-10-18
 

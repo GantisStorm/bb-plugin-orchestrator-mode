@@ -1,50 +1,518 @@
-/* bb-plugin-orchestrator-mode — frontend styles.
+/* bb-plugin-orchestrator-mode — composer status surface.
  *
- * Colors come from the host theme's live CSS variables via Tailwind token
- * classes. These rules style the mode indicator and controls, not the user's
- * editable draft.
+ * Operate surface: the reader is mid-session and needs the state of the thread
+ * at a glance. Everything here styles the plugin's own indicator; the user's
+ * editable draft is never touched. Colors are the host theme's live tokens, so
+ * the strip matches whatever theme BB is running.
  */
 
-.orch-strip {
+.orch {
+  --orch-border: var(--color-border, rgba(128, 128, 128, 0.32));
+  --orch-muted: var(--color-muted-foreground, color-mix(in srgb, currentColor 62%, transparent));
+  --orch-surface: var(--color-card, color-mix(in srgb, currentColor 4%, transparent));
+  --orch-danger: var(--color-destructive, #b42318);
+  --orch-accent: var(--color-primary, currentColor);
   display: flex;
-  align-items: flex-start;
-  gap: 0.5rem;
-  border-radius: 0.5rem;
-  border: 1px solid var(--color-border, rgba(128, 128, 128, 0.35));
-  border-left-width: 3px;
-  padding: 0.5rem 0.625rem;
+  flex-direction: column;
+  gap: 0.4375rem;
+  padding: 0.5625rem 0.6875rem;
+  border: 1px solid var(--orch-border);
+  border-radius: 0.75rem;
+  background: color-mix(in srgb, var(--orch-surface) 94%, transparent);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.06);
   font-size: 0.75rem;
-  line-height: 1.35rem;
+  line-height: 1.4;
 }
 
-.orch-strip[data-violations="true"] {
-  border-color: var(--color-destructive, #b91c1c);
+.orch:focus-within {
+  border-color: color-mix(in srgb, var(--orch-accent) 45%, var(--orch-border));
 }
 
-.orch-strip__body {
+.orch__head {
+  display: flex;
+  align-items: center;
+  gap: 0.4375rem;
+  min-width: 0;
+}
+
+.orch__mark {
+  width: 1rem;
+  height: 1rem;
+  flex: none;
+  color: var(--orch-accent);
+}
+
+.orch__heading {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
   min-width: 0;
   flex: 1;
 }
 
-.orch-strip__title {
+.orch__title {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.orch__chip {
+  flex: none;
+  padding: 0 0.375rem;
+  border: 1px solid var(--orch-border);
+  border-radius: 999px;
+  font-size: 0.625rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  line-height: 1.5;
+  text-transform: uppercase;
+  color: var(--orch-muted);
+}
+
+.orch__chip[data-level="block"] {
+  border-color: color-mix(in srgb, var(--orch-danger) 55%, transparent);
+  color: var(--orch-danger);
+}
+
+.orch__chip[data-level="guard"] {
+  border-color: color-mix(in srgb, var(--orch-accent) 45%, transparent);
+  color: var(--orch-accent);
+}
+
+.orch__off {
+  flex: none;
+  height: 1.625rem;
+  padding: 0 0.5rem;
+  font-size: 0.6875rem;
+}
+
+.orch__lede,
+.orch__empty {
+  margin: 0;
+  color: var(--orch-muted);
+  font-size: 0.6875rem;
+  line-height: 1.45;
+  max-width: 72ch;
+}
+
+/* The crew: one robot per child thread BB has right now, in that child's own
+   status color. Finished work belongs to the ledger below, not to this row. */
+.orch__crew {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.orch__bot {
+  display: inline-flex;
+  width: 1.25rem;
+  height: 1.25rem;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.25rem;
+  color: var(--orch-muted);
+}
+
+.orch__bot svg {
+  width: 1.125rem;
+  height: 1.125rem;
+  display: block;
+}
+
+.orch__bot[data-state="running"] {
+  color: var(--orch-accent);
+  background: color-mix(in srgb, var(--orch-accent) 12%, transparent);
+  animation: orch-breathe 2.4s ease-in-out infinite;
+}
+
+/* A child thread has a status, not a verdict: running, idle, or failed. */
+.orch__bot[data-state="failed"] {
+  color: var(--orch-danger);
+  background: color-mix(in srgb, var(--orch-danger) 10%, transparent);
+}
+
+/* Idle is the resting look: the child exists and is counted, and is not
+   working. */
+.orch__bot[data-state="idle"] {
+  color: var(--orch-muted);
+}
+
+/* A hidden child is still a child and still counted. The label says it is
+   hidden, so the dip in weight is not the only signal. */
+.orch__bot[data-hidden="true"] {
+  opacity: 0.7;
+}
+
+.orch__more {
+  font-size: 0.6875rem;
+  color: var(--orch-muted);
+  font-variant-numeric: tabular-nums;
+  padding-left: 0.125rem;
+}
+
+@keyframes orch-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orch__bot[data-state="running"] {
+    animation: none;
+  }
+
+  .orch__count[data-live="true"] .orch__dot {
+    animation: none;
+  }
+}
+
+.orch__stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+  color: var(--orch-muted);
+  font-size: 0.6875rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.orch__stats b {
+  color: inherit;
+  font-weight: 600;
+  font-size: 0.75rem;
+}
+
+.orch__stats [data-live="true"] b {
+  color: var(--orch-accent);
+}
+
+/* Two counts that answer different questions: BB's live child tree, and the
+   records this thread keeps. A plain hairline separates them; the live count
+   stays first because it is the one that is a fact about right now. */
+.orch__counts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.125rem 0.875rem;
+}
+
+.orch__count {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3125rem;
+}
+
+/* The dot carries state as fill and border, and the words beside it name that
+   state, so color is never the only signal. Idle is hollow, running is filled
+   and breathing, unknown is dashed: three shapes, not three tints. */
+.orch__dot {
+  flex: none;
+  width: 0.375rem;
+  height: 0.375rem;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  background: transparent;
+}
+
+.orch__count[data-live="true"] .orch__dot {
+  border-color: var(--orch-accent);
+  background: var(--orch-accent);
+  animation: orch-breathe 2.4s ease-in-out infinite;
+}
+
+.orch__dot[data-state="unknown"] {
+  border-style: dashed;
+  border-color: var(--orch-muted);
+}
+
+.orch__unknown {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3125rem;
+}
+
+/* History sits behind a rule, so it cannot be read as the current count. */
+.orch__stats--ledger {
+  padding-left: 0.625rem;
+  border-left: 1px solid var(--orch-border);
+}
+
+/* The warning box: the only loud thing on the strip, and only when it is true. */
+.orch__alert {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.4375rem 0.5625rem;
+  border: 1px solid color-mix(in srgb, var(--orch-danger) 60%, transparent);
+  border-radius: 0.5rem;
+  background: color-mix(in srgb, var(--orch-danger) 9%, var(--orch-surface));
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--orch-danger) 18%, transparent);
+}
+
+.orch__alert-head {
   display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.orch__alert-title {
+  display: inline-flex;
+  align-items: center;
   gap: 0.375rem;
+  color: var(--orch-danger);
+  font-size: 0.75rem;
   font-weight: 600;
 }
 
-.orch-strip__detail {
-  margin-top: 0.125rem;
-  opacity: 0.78;
+.orch__alert-count {
+  min-width: 1.125rem;
+  padding: 0 0.25rem;
+  border-radius: 999px;
+  background: var(--orch-danger);
+  color: var(--color-background, #fff);
+  font-size: 0.625rem;
+  font-weight: 700;
+  line-height: 1.4;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
 }
 
-.orch-strip__acts {
+.orch__alert-clear {
+  height: 1.5rem;
+  padding: 0 0.375rem;
+  font-size: 0.6875rem;
+  color: var(--orch-danger);
+}
+
+.orch__alert-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
   display: flex;
   flex-direction: column;
-  gap: 0.125rem;
-  margin-top: 0.25rem;
+  gap: 0.0625rem;
+  color: color-mix(in srgb, var(--orch-danger) 70%, currentColor);
+  font-size: 0.6875rem;
+}
+
+.orch__alert-list li {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.orch__ledger {
+  border-top: 1px solid var(--orch-border);
+  padding-top: 0.375rem;
+}
+
+.orch__ledger > summary {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  cursor: pointer;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  color: var(--orch-muted);
+  list-style: none;
+}
+
+.orch__ledger > summary::-webkit-details-marker {
+  display: none;
+}
+
+.orch__ledger > summary::before {
+  content: "▸";
+  flex: none;
+  font-size: 0.625rem;
+  line-height: 1;
+  transition: transform 120ms ease-out;
+}
+
+.orch__ledger[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.orch__ledger-label {
+  flex: 1;
+  min-width: 0;
+}
+
+.orch__ledger-count {
+  flex: none;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.orch__ledger ul {
+  margin: 0.3125rem 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.orch__ledger li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.0625rem;
+  padding-left: 0.75rem;
+  font-size: 0.6875rem;
+}
+
+.orch__ledger-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.orch__ledger-name {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.orch__ledger-state {
+  flex: none;
+  color: var(--orch-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.orch__ledger-state[data-state="running"] {
+  color: var(--orch-accent);
+}
+
+.orch__ledger-state[data-state="rejected"],
+.orch__ledger-state[data-state="failed"] {
+  color: var(--orch-danger);
+}
+
+.orch__ledger-run,
+.orch__ledger-ran {
+  color: var(--orch-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.orch__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.125rem 0.75rem;
+  border-top: 1px solid var(--orch-border);
+  padding-top: 0.375rem;
+  color: var(--orch-muted);
+  font-size: 0.625rem;
+  font-variant-numeric: tabular-nums;
 }
 
 .orch-toggle[aria-pressed="true"] {
   color: var(--color-primary, currentColor);
+}
+
+.orch-toggle:focus-visible,
+.orch__off:focus-visible,
+.orch__alert-clear:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--orch-accent) 60%, transparent);
+  outline-offset: 1px;
+}
+
+/* The `setup-jev` prompt: one secret, one decision. It renders inside BB's
+   dialog chrome, so it owns its rhythm and field treatment only. The reader is
+   here once, to paste a key: the label, the reveal control and the error sit in
+   one column, and the buttons stay at the end of the same reading line. */
+.jev {
+  --jev-border: var(--color-border, rgba(128, 128, 128, 0.32));
+  --jev-muted: var(--color-muted-foreground, color-mix(in srgb, currentColor 62%, transparent));
+  --jev-surface: var(--color-card, color-mix(in srgb, currentColor 4%, transparent));
+  --jev-danger: var(--color-destructive, #b42318);
+  --jev-accent: var(--color-primary, currentColor);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+.jev__lede {
+  margin: 0;
+  max-width: 65ch;
+  color: var(--jev-muted);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.jev__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3125rem;
+}
+
+.jev__label {
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.jev__control {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.jev__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 2rem;
+  padding: 0 0.5rem;
+  border: 1px solid var(--jev-border);
+  border-radius: 0.375rem;
+  background: var(--jev-surface);
+  color: inherit;
+  caret-color: var(--jev-accent);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  outline: none;
+}
+
+.jev__input::selection {
+  background: color-mix(in srgb, var(--jev-accent) 30%, transparent);
+}
+
+.jev__input:focus-visible {
+  border-color: color-mix(in srgb, var(--jev-accent) 55%, var(--jev-border));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--jev-accent) 55%, transparent);
+}
+
+.jev__input[aria-invalid="true"] {
+  border-color: color-mix(in srgb, var(--jev-danger) 65%, transparent);
+}
+
+.jev__input:disabled {
+  opacity: 0.6;
+}
+
+.jev__error {
+  margin: 0;
+  max-width: 65ch;
+  color: var(--jev-danger);
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+.jev__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.375rem;
 }

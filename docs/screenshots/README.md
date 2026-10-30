@@ -1,7 +1,9 @@
 # Screenshot notes
 
 Real BB renders, captured on 1 October 2026 with this plugin installed from
-this checkout (`bb plugin install path:$PWD`).
+this checkout (`bb plugin install path:$PWD`). They predate the redesigned
+status surface (worker robots, counts and the red direct-work box), so refresh
+them with the recipe below before publishing a release that shows it.
 
 Each image is a full browser viewport at 1440×900 CSS pixels, device pixel
 ratio 2, so the files are 2880 px wide. Nothing was drawn, mocked or composited.

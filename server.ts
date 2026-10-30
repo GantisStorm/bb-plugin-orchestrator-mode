@@ -25,12 +25,16 @@ import {
   type PluginCliContext,
 } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { judgeSecretStore } from "./judge-secret";
 import { childMessageQueue, CHILD_BATCH_WAIT_REASON } from "./child-message-queue";
 import {
+  CHECK_TOOL,
   CONTRACT_PRESETS,
   DEFAULT_ENFORCEMENT,
   DELEGATE_TOOL,
   ENFORCEMENT_LEVELS,
+  KIND_CHECKS,
+  KIND_WORKSPACES,
   ORCHESTRATOR_SUBAGENT_POLICIES,
   PINNED_DELEGATION_FIELDS,
   PERMISSION_MODES,
@@ -53,8 +57,12 @@ import {
   buildInstructions,
   buildNudge,
   buildReviewNudge,
+  buildRevisionBrief,
   buildVerifierBrief,
   classifyRow,
+  minimizeCheckEvidence,
+  parseVerdictLine,
+  unquotedReportLines,
   subagentsOf,
   defaultAppliesTo,
   isEnforcementLevel,
@@ -81,10 +89,55 @@ import {
   type WorkerSubagentPolicy,
 } from "./shared";
 
-export { DELEGATE_TOOL };
+export { CHECK_TOOL, DELEGATE_TOOL };
 
 /** Realtime channel the composer surfaces listen on. */
 const STATE_CHANGED = "orchestrator-state";
+
+/**
+ * The app renderer `setup-jev` names in `bb.ui.requestInput`, and the bounds of
+ * the key that form may return. The key is never a CLI option, never part of a
+ * form payload, never logged and never part of a result: `readJudgeKey` below is
+ * the only code that reads it out of a submission, and the caller holds it only
+ * for the length of one settings write.
+ */
+const SETUP_JEV_RENDERER = "setup-jev";
+/** Below this, a submitted value cannot be an API key, so nothing is stored. */
+const JUDGE_KEY_MIN_LENGTH = 8;
+/** Above this, the submission is refused rather than stored and reported. */
+const JUDGE_KEY_MAX_LENGTH = 512;
+
+/**
+ * The only shape `setup-jev` accepts from the form: `{ key: string }` meeting
+ * both bounds and containing no whitespace or control character. Nothing else in
+ * the submission is read, and no refusal repeats what was submitted: the value
+ * must not reach stdout, stderr, the transcript or this plugin's log.
+ */
+function readJudgeKey(value: unknown): string {
+  const submitted =
+    value !== null && typeof value === "object" && !Array.isArray(value)
+      ? (value as { key?: unknown }).key
+      : undefined;
+  if (typeof submitted !== "string") {
+    throw new PluginCliError("the form did not submit a key, so nothing was stored", {
+      code: "invalid_key",
+    });
+  }
+  const key = submitted.trim();
+  if (key.length < JUDGE_KEY_MIN_LENGTH || key.length > JUDGE_KEY_MAX_LENGTH) {
+    throw new PluginCliError(
+      `the submitted key is not usable (expected ${JUDGE_KEY_MIN_LENGTH}–${JUDGE_KEY_MAX_LENGTH} characters), so nothing was stored`,
+      { code: "invalid_key" },
+    );
+  }
+  if (/[\s\x00-\x1f\x7f]/.test(key)) {
+    throw new PluginCliError(
+      "the submitted key is not usable (it contains whitespace or a control character), so nothing was stored",
+      { code: "invalid_key" },
+    );
+  }
+  return key;
+}
 
 /**
  * The global settings record: every thread-behaviour setting, plus the composer
@@ -129,77 +182,248 @@ const MAX_DELEGATIONS = 50;
  */
 const MAX_CHILD_THREADS = 200;
 
+/**
+ * The statuses BB shows a child thread as still working: `starting` before its
+ * first turn, `active` during one, `stopping` while it is being wound down.
+ * Archived and deleted children are dropped before these are counted, so a
+ * count is a count of current children.
+ */
+const RUNNING_CHILD_STATUSES = ["starting", "active", "stopping"] as const;
+const RUNNING_CHILD_STATUS_SET = new Set<string>(RUNNING_CHILD_STATUSES);
+
+/**
+ * How the live child count is read. `threads.count` cannot answer it: the count
+ * route takes no `includeHidden`, so a hidden child — a worker kept out of the
+ * sidebar, which still runs and still holds a slot — is silently missing from
+ * its total. The list route does take `includeHidden` and pages through
+ * `limit`/`offset`, so the count accumulates pages until a short page proves
+ * the end.
+ *
+ * Three full pages of 200 bound one read at 600 children. A parent past that
+ * is proved inexact by one probing row and reported unknown: a count that might
+ * be short is worse than "unknown", because the strip would present it as
+ * fact.
+ */
+const CHILD_COUNT_PAGE_SIZE = 200;
+const CHILD_COUNT_MAX_PAGES = 3;
+
+/**
+ * How long one live child-count read is reused, so a burst of state reads (a
+ * realtime event per mutation, plus every panel that mounts) does not turn into
+ * a burst of BB queries. Counts are points in time, not durable facts.
+ */
+const CHILD_COUNT_TTL_MS = 2_000;
+
+/** BB's current thread tree under one orchestrator, or why it could not be read. */
+export interface ChildCounts {
+  available: boolean;
+  /** Direct children that are not archived or deleted; hidden children count. */
+  total: number;
+  running: number;
+  error: string | null;
+}
+
 export interface JudgeOpinion {
   agrees: boolean;
   rationale: string;
 }
 
+/** Whether the advisory judge answered, and why not when it did not. */
+export type JudgeOutcome = { ok: true; opinion: JudgeOpinion } | { ok: false; error: string };
+
 /**
  * An advisory second opinion on a check unit's report, from Jev through
  * OpenRouter. It only adds text to the result: it never records a verdict,
- * blocks a unit or stops a turn. Any failure returns null, so a missing or
- * broken judge changes nothing.
+ * blocks a unit or stops a turn. A failure is reported to the orchestrator as
+ * the failure it was, so a broken key or endpoint is visible instead of silent.
  *
  * Jev is not a chat model. OpenRouter serves it on the decisions endpoint
  * (`/api/alpha/decisions`) with a typed question, and answers with a
  * probability — never prose. The old call to `/api/v1/chat/completions` named a
- * model that endpoint does not serve, so it could not succeed. The report is
- * sent there, capped at 4,000 characters, and nothing else is transmitted.
+ * model that endpoint does not serve, so it could not succeed.
+ *
+ * Only {@link minimizeCheckEvidence} is sent: the verdict token and the bare
+ * names of the allowlisted programs the report says it ran. Arguments, paths,
+ * header values, output and the verdict's reasoning sentence stay local, so no
+ * credential can be carried in any spelling.
+ *
+ * The call draws from the delegation's own deadline and its cancellation, so a
+ * stalled endpoint cannot outlive the call that advertised a timeout.
  */
 const JEV_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions";
 const JEV_MODEL = "typesafe/jev-1.13";
-const JEV_REPORT_LIMIT = 4_000;
+/** A hard cap on the advisory call, so it can never be the longest wait in a delegation. */
+const JEV_TIMEOUT_MS = 30_000;
+
+/** What the caller already spent, so the judge cannot outlive the call it serves. */
+export interface JudgeBudget {
+  /** What is left of the delegation's deadline. Absent means {@link JEV_TIMEOUT_MS} alone. */
+  remainingMs?: number;
+  /** The call's cancellation. */
+  signal?: AbortSignal;
+}
 
 export async function judgeCheckVerdict(
   key: string,
   checkOutput: string,
   fetchImpl: typeof fetch = fetch,
-): Promise<JudgeOpinion | null> {
-  if (key === "" || checkOutput.trim() === "") return null;
+  budget: JudgeBudget = {},
+): Promise<JudgeOutcome> {
+  if (key === "") return { ok: false, error: "no OpenRouter key is stored" };
+  if (budget.signal?.aborted === true) {
+    return { ok: false, error: "the call was cancelled, so the advisory judge was not asked" };
+  }
+  const budgetMs =
+    budget.remainingMs === undefined ? JEV_TIMEOUT_MS : Math.min(budget.remainingMs, JEV_TIMEOUT_MS);
+  if (budgetMs <= 0) {
+    return { ok: false, error: "the call's deadline passed, so the advisory judge was not asked" };
+  }
+  const evidence = minimizeCheckEvidence(checkOutput);
+  if (evidence === "") {
+    return {
+      ok: false,
+      error:
+        "the check named no program that can be sent safely (only an allowlisted program name and the pass/fail verdict are sent, never arguments, paths or output)",
+    };
+  }
+  // One controller carries both bounds: the deadline timer and the caller's
+  // cancellation. `fetch` is given only this signal, so an endpoint that hangs
+  // is cut off by the same deadline the rest of the call runs on.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), budgetMs);
+  const cancelled = () => controller.abort();
+  budget.signal?.addEventListener("abort", cancelled, { once: true });
+  const stopped = (): string =>
+    budget.signal?.aborted === true
+      ? "the call was cancelled while the advisory judge was waiting"
+      : `OpenRouter did not answer within ${Math.round(budgetMs / 1000)}s`;
   try {
-    const response = await fetchImpl(JEV_DECISIONS_URL, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: JEV_MODEL,
-        state: checkOutput.slice(0, JEV_REPORT_LIMIT),
-        questions: {
-          verified: {
-            type: "noul",
-            instructions:
-              "Does this report show that the work it describes was actually run or checked, rather than only claimed?",
+    let response: Response;
+    try {
+      response = await fetchImpl(JEV_DECISIONS_URL, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: JEV_MODEL,
+          state: evidence,
+          questions: {
+            verified: {
+              type: "noul",
+              instructions:
+                "Does this report show that the work it describes was actually run or checked, rather than only claimed?",
+            },
           },
-        },
-      }),
-    });
-    if (!response.ok) return null;
-    const body = (await response.json()) as { answers?: { verified?: { noul?: unknown } } };
+        }),
+        signal: controller.signal,
+      });
+    } catch (cause) {
+      if (controller.signal.aborted) return { ok: false, error: `${stopped()}, so no opinion was produced` };
+      return { ok: false, error: `OpenRouter could not be reached (${cause instanceof Error ? cause.message : String(cause)})` };
+    }
+    if (!response.ok) {
+      return { ok: false, error: `OpenRouter refused the request (HTTP ${response.status})` };
+    }
+    let body: { answers?: { verified?: { noul?: unknown } } };
+    try {
+      body = (await response.json()) as typeof body;
+    } catch {
+      if (controller.signal.aborted) return { ok: false, error: `${stopped()}, so no opinion was produced` };
+      return { ok: false, error: "OpenRouter's answer was not JSON" };
+    }
     const probability = body.answers?.verified?.noul;
-    if (typeof probability !== "number" || !Number.isFinite(probability)) return null;
+    if (typeof probability !== "number" || !Number.isFinite(probability)) {
+      return { ok: false, error: "OpenRouter's answer carried no probability" };
+    }
     const bounded = Math.min(1, Math.max(0, probability));
     return {
-      agrees: bounded >= 0.5,
-      rationale: `Jev put ${Math.round(bounded * 100)}% on the report showing the work was actually verified.`,
+      ok: true,
+      opinion: {
+        agrees: bounded >= 0.5,
+        rationale: `Jev put ${Math.round(bounded * 100)}% on the report showing the work was actually verified.`,
+      },
     };
-  } catch {
-    return null;
+  } finally {
+    clearTimeout(timer);
+    budget.signal?.removeEventListener("abort", cancelled);
   }
 }
 
+/** A report line that carries content: not blank, and not a Markdown rule. */
+function contentLine(line: string): boolean {
+  const trimmed = line.trim();
+  return trimmed !== "" && !/^(?:[-*_=—]\s*){3,}$/.test(trimmed);
+}
+
 /**
- * The verdict a check unit ends with: `VERDICT: pass` or `VERDICT: fail` as its
- * last such line. Null when the check left no verdict, so nothing is recorded
- * on its behalf and the orchestrator reads the report itself.
+ * The verdict a check unit ends with, read from the one `VERDICT: pass|fail`
+ * line the checker itself stated, through the ordinary Markdown a report wraps
+ * it in. `verdict: null` means fail closed, because acceptance and dependants
+ * both read this result and silence must not read as a pass:
+ *
+ * - a `VERDICT:` line inside a block quote or a fence is the report the checker
+ *   was handed, not the checker's own word;
+ * - a report that states two verdicts, or both a pass and a fail, is ambiguous;
+ * - the checker's verdict must be the last content line of its own text. The
+ *   brief asks for exactly that, and a verdict with more report after it cannot
+ *   be told apart from one the checker echoed from the worker's report.
  */
-export function parseCheckVerdict(text: string): { verdict: ReviewVerdict; reasoning: string } | null {
-  let found: { verdict: ReviewVerdict; reasoning: string } | null = null;
-  for (const line of text.split("\n")) {
-    const match = /^\s*VERDICT:\s*(pass|fail)\b\s*[-—:.]?\s*(.*)$/i.exec(line);
-    if (match) {
-      found = { verdict: match[1]!.toLowerCase() === "pass" ? "accepted" : "rejected", reasoning: match[2]!.trim() };
-    }
+export function parseCheckVerdict(text: string): { verdict: ReviewVerdict | null; reasoning: string } {
+  // Only the checker's own content lines, in order: the last one is where the
+  // protocol puts the verdict, and the position is what makes that checkable.
+  const content = unquotedReportLines(text)
+    .filter(contentLine)
+    .map((line) => parseVerdictLine(line));
+  const stated: NonNullable<(typeof content)[number]>[] = [];
+  for (const found of content) {
+    if (found !== null) stated.push(found);
   }
-  return found;
+  if (stated.length === 0) {
+    return {
+      verdict: null,
+      reasoning:
+        text.trim() === ""
+          ? "the check produced no report, so it holds no verdict"
+          : "the check left no line that reads `VERDICT: pass` or `VERDICT: fail`",
+    };
+  }
+  const accepted = stated.some((found) => found.verdict === "accepted");
+  const rejected = stated.some((found) => found.verdict === "rejected");
+  if (accepted && rejected) {
+    return {
+      verdict: null,
+      reasoning: "the check reported both a pass and a fail, so its result is ambiguous",
+    };
+  }
+  if (stated.length > 1) {
+    return {
+      verdict: null,
+      reasoning: "the check stated more than one verdict line, so which one it means is ambiguous",
+    };
+  }
+  const only = stated[0]!;
+  if (only !== content[content.length - 1]) {
+    return {
+      verdict: null,
+      reasoning:
+        "the check's verdict is not its final line, so it cannot be told apart from a verdict it quoted",
+    };
+  }
+  return only;
+}
+
+/**
+ * Whether a check result may be written for a unit. The checker that produced it
+ * must still be the one the unit is bound to: a checker a newer attempt replaced
+ * must not overwrite the newer failure with an old pass, and a write from a check
+ * that never started (no checker) is only accepted while nothing is bound.
+ */
+export function checkWriteAllowed(
+  boundChecker: string | null | undefined,
+  checkerId: string | undefined,
+): boolean {
+  const bound =
+    boundChecker === null || boundChecker === undefined || boundChecker === "" ? null : boundChecker;
+  return checkerId === undefined ? bound === null : bound === checkerId;
 }
 
 export interface Delegation {
@@ -235,6 +459,82 @@ export interface Delegation {
     serviceTier: string | null;
     permissionMode: string | null;
   } | null;
+  /**
+   * What the worker actually ran on, read back from BB rather than assumed. A
+   * field BB does not report stays null and is named in `unreported`, so the UI
+   * never presents a request as a fact.
+   */
+  resolved?: ResolvedExecution | null;
+  /**
+   * The unit asked for an independent check (`verify: true`) or the scope gave
+   * it one. A rejected unit is revised on the same rule the check uses, so this
+   * has to survive the spawn that recorded it.
+   */
+  verify?: boolean;
+  /** The unit kind this delegation named, so a revision can keep it. */
+  kind?: WorkerPresetName | null;
+  /** The worker ids this unit waited for before it started. */
+  after?: string[];
+  /** This worker revises another unit, and which one. */
+  revisionOf?: string | null;
+  /**
+   * The original unit this worker's revision chain belongs to. Every revision in
+   * a chain names the same root, so the chain's spent budget and its outcome live
+   * on one record whatever order the revisions came in.
+   */
+  revisionRoot?: string | null;
+  /**
+   * Revisions this chain has spent, kept on the chain's root; a revision also
+   * carries the count it was written at, so a trimmed root still has a figure.
+   */
+  revisions?: number;
+  /**
+   * The revision that settled this chain: its own check passed, or the
+   * orchestrator accepted it. A new attempt clears it. Kept on the root, so the
+   * original's failed check is a fixed finding rather than a permanent refusal.
+   */
+  resolvedBy?: string | null;
+  /**
+   * When the resolution above was recorded, so a check that was already running
+   * when it landed cannot take it back.
+   */
+  resolvedAt?: number | null;
+  /** The independent check's parsed verdict and report, when one ran. */
+  check?: {
+    verdict: ReviewVerdict;
+    detail: string;
+    at: number;
+    /** Why this record is fail-closed when the check left no verdict it can stand behind. */
+    problem?: string | null;
+  } | null;
+  /** Timeline scans that found no progress and the resume messages sent. */
+  stallResumes?: number;
+  /**
+   * Recovery checks this unit has spent. Each run is a whole worker, so the
+   * count is durable and capped by {@link MAX_CHECK_ATTEMPTS}; a failed start
+   * hands its attempt back because no worker ran.
+   */
+  checkAttempts?: number;
+  /**
+   * The check that owns this unit right now: the reservation taken before its
+   * worker starts, then the checker's own id once that worker exists. Two calls
+   * cannot both check one unit. `threadId` names the checker as soon as BB
+   * spawns it, so an expired claim can be reconciled against the live thread
+   * instead of silently handing a possibly running checker's work to a second
+   * one; only a claim that never became a worker is released on expiry.
+   */
+  checkClaim?: { token: string; at: number; threadId?: string | null } | null;
+}
+
+/** What a worker resolved to when it actually started, and what BB could not tell us. */
+export interface ResolvedExecution {
+  providerId: string | null;
+  model: string | null;
+  /** `session` when the model came from the provider session snapshot, `thread` when only the provider was readable. */
+  source: "thread" | "session";
+  at: number;
+  /** Fields BB exposes nowhere for a worker, so the request is all anyone can show. */
+  unreported: string[];
 }
 
 export interface ThreadState {
@@ -278,6 +578,23 @@ export interface ThreadState {
    * A worker never runs the mode, so its subagent launches are watched through this link.
    */
   workerOf: string | null;
+  /**
+   * Records this thread has already lost to a per-thread cap, counted as they
+   * were dropped. Durable storage keeps every thread, but these arrays are
+   * working records with a ceiling, and a silent loss is what makes a status
+   * line misleading.
+   */
+  lost?: {
+    violations: number;
+    delegations: number;
+    seenRows: number;
+  };
+  /**
+   * Set when the timeline head could not be read while enabling. The first
+   * successful scan then seeds the cursor before judging anything, so a failed
+   * read can never turn pre-enable history into violations.
+   */
+  headUnknown?: boolean;
 }
 
 const delegationSchema = z.object({
@@ -300,6 +617,44 @@ const delegationSchema = z.object({
       reasoningLevel: z.string().nullable(),
       serviceTier: z.string().nullable(),
       permissionMode: z.string().nullable(),
+    })
+    .nullable()
+    .optional(),
+  resolved: z
+    .object({
+      providerId: z.string().nullable(),
+      model: z.string().nullable(),
+      source: z.enum(["thread", "session"]),
+      at: z.number(),
+      unreported: z.array(z.string()),
+    })
+    .nullable()
+    .optional(),
+  verify: z.boolean().optional(),
+  kind: z.enum(WORKER_PRESETS).nullable().optional(),
+  after: z.array(z.string()).optional(),
+  revisionOf: z.string().nullable().optional(),
+  revisionRoot: z.string().nullable().optional(),
+  revisions: z.number().optional(),
+  resolvedBy: z.string().nullable().optional(),
+  resolvedAt: z.number().nullable().optional(),
+  check: z
+    .object({
+      verdict: z.enum(REVIEW_VERDICTS),
+      detail: z.string(),
+      at: z.number(),
+      problem: z.string().nullable().optional(),
+    })
+    .nullable()
+    .optional(),
+  stallResumes: z.number().optional(),
+  checkAttempts: z.number().optional(),
+  checkClaim: z
+    .object({
+      token: z.string(),
+      at: z.number(),
+      /** The checker thread this claim owns, once one exists. */
+      threadId: z.string().nullable().optional(),
     })
     .nullable()
     .optional(),
@@ -374,6 +729,42 @@ const stateSchema = z.object({
   unreviewed: z.number(),
   /** Delegations whose result the orchestrator accepted, as a ratio's numerator. */
   reviewed: z.number(),
+  /** The worker ledger, counted from the same records the strip lists. */
+  workers: z.object({
+    total: z.number(),
+    running: z.number(),
+    settled: z.number(),
+    accepted: z.number(),
+    rejected: z.number(),
+    /** Settled and still owed a verdict. */
+    waiting: z.number(),
+    /** Workers whose request BB could not confirm, so the UI says so. */
+    unconfirmed: z.number(),
+  }),
+  /**
+   * BB's own thread tree for this orchestrator, read live: direct children that
+   * are not archived or deleted. This is the only honest answer to "how many
+   * children are there now", so it is never derived from the ledger; when BB
+   * cannot be read it says so instead of reporting a record count.
+   */
+  children: z.object({
+    available: z.boolean(),
+    total: z.number(),
+    running: z.number(),
+    error: z.string().nullable(),
+  }),
+  /**
+   * Durable storage keeps every thread. These are the per-thread record caps and
+   * how much this thread has already lost to them, so a report can be honest
+   * about what is no longer there.
+   */
+  retention: z.object({
+    threads: z.number(),
+    caps: z.object({ delegations: z.number(), violations: z.number(), seenRows: z.number() }),
+    lost: z.object({ delegations: z.number(), violations: z.number(), seenRows: z.number() }),
+  }),
+  /** Whether a judge key is stored and the advisory judge was opted into. */
+  judge: z.object({ configured: z.boolean(), advisory: z.boolean() }),
 });
 
 /** A project id, as the scope RPCs take it. */
@@ -393,6 +784,9 @@ const SETTINGS_KEYS = [
   "childMessageDelivery",
   "orchestratorSubagents",
   "workerSubagents",
+  "maxRevisions",
+  "maxStallResumes",
+  "judgeAdvisory",
 ] as const;
 const settingsKeySchema = z.enum(SETTINGS_KEYS);
 
@@ -410,6 +804,12 @@ const settingsViewSchema = z.object({
   childMessageDelivery: z.enum(["queued", "immediate"]),
   orchestratorSubagents: z.enum(ORCHESTRATOR_SUBAGENT_POLICIES),
   workerSubagents: z.enum(WORKER_SUBAGENT_POLICIES),
+  /** Revisions a rejected or failed-check build unit gets, per unit chain. */
+  maxRevisions: z.number(),
+  /** Resume messages a worker with no timeline progress may receive. */
+  maxStallResumes: z.number(),
+  /** Explicit opt-in for sending minimized check evidence to the advisory judge. */
+  judgeAdvisory: z.boolean(),
 });
 
 export type SettingsViewDto = z.infer<typeof settingsViewSchema>;
@@ -466,7 +866,6 @@ export const rpcContract = defineRpcContract({
     output: contractSchema,
   },
   get_judge: { input: z.null(), output: judgeStatusSchema },
-  set_judge_key: { input: z.object({ key: z.string().max(300).nullable() }).strict(), output: judgeStatusSchema },
   get_worker_execution: { input: z.null(), output: workerConfigSchema },
   set_worker_execution: {
     input: workerConfigSchema.nullable(),
@@ -637,21 +1036,9 @@ export default async function plugin(bb: BbPluginApi) {
   let catalog: WorkerCatalog = { providers: [], models: [], unavailable: [] };
   let catalogReady = false;
 
-  /**
-   * The advisory judge's OpenRouter key, as a real secret setting: BB keeps it in
-   * an owner-only file under the plugin's own directory, never in `bb.db` and
-   * never in a response to the frontend. A KV row is readable by every plugin and
-   * lives in the database, which is not where a credential belongs.
-   */
-  const judgeSettings = bb.settings.define({
-    judgeKey: {
-      type: "string",
-      label: "OpenRouter key for the advisory judge",
-      description:
-        "Used only to ask Jev for a second opinion on a check unit's report. Stored as a secret, never shown again.",
-      secret: true,
-    },
-  });
+  const judgeStore = judgeSecretStore(bb.server.experimental_dataDir);
+  judgeStore.migrate();
+  let judgeKeyPresent = judgeStore.read() !== null;
 
   /** The settings that shape thread behaviour, after a scope's values are validated. */
   interface SettingsView {
@@ -669,6 +1056,12 @@ export default async function plugin(bb: BbPluginApi) {
     orchestratorSubagents: OrchestratorSubagentPolicy;
     /** Whether this scope's workers may start subagents of their own. */
     workerSubagents: WorkerSubagentPolicy;
+    /** Revisions one unit chain may spend on a rejected or failed check. */
+    maxRevisions: number;
+    /** Resume messages one stalled worker may receive before it is reported as stuck. */
+    maxStallResumes: number;
+    /** Whether minimized check evidence may be sent to the advisory judge. */
+    judgeAdvisory: boolean;
   }
 
   /** The global record: what every project inherits, plus the composer default. */
@@ -699,6 +1092,9 @@ export default async function plugin(bb: BbPluginApi) {
     childMessageDelivery: "queued",
     orchestratorSubagents: "none",
     workerSubagents: "blocked",
+    maxRevisions: 1,
+    maxStallResumes: 1,
+    judgeAdvisory: false,
   };
 
   /**
@@ -833,8 +1229,7 @@ export default async function plugin(bb: BbPluginApi) {
   ): SettingsView {
     return {
       enforcement: isEnforcementLevel(values.enforcement) ? values.enforcement : base.enforcement,
-      allowReadCommands:
-        values.allowReadCommands === undefined ? base.allowReadCommands : values.allowReadCommands === true,
+      allowReadCommands: flagOf(values.allowReadCommands, base.allowReadCommands),
       maxNudges:
         values.maxNudges === undefined ? base.maxNudges : capOf(values.maxNudges, base.maxNudges),
       maxParallelWorkers:
@@ -867,7 +1262,29 @@ export default async function plugin(bb: BbPluginApi) {
       workerSubagents: isOneOf(WORKER_SUBAGENT_POLICIES, values.workerSubagents)
         ? values.workerSubagents
         : base.workerSubagents,
+      maxRevisions:
+        values.maxRevisions === undefined
+          ? base.maxRevisions
+          : Math.min(5, capOf(values.maxRevisions, base.maxRevisions)),
+      maxStallResumes:
+        values.maxStallResumes === undefined
+          ? base.maxStallResumes
+          : Math.min(5, capOf(values.maxStallResumes, base.maxStallResumes)),
+      judgeAdvisory: flagOf(values.judgeAdvisory, base.judgeAdvisory),
     };
+  }
+
+  /**
+   * A boolean setting from the RPC's own value union. The settings UI sends a
+   * select's string (`"on"` and `"off"` are its labels), so both spellings are
+   * accepted; a value that is neither keeps the base instead of silently
+   * writing `false`, which is what made the consent switch a no-op.
+   */
+  function flagOf(value: unknown, base: boolean): boolean {
+    if (typeof value === "boolean") return value;
+    if (value === "true") return true;
+    if (value === "false") return false;
+    return base;
   }
 
   /** A fan-out cap: a non-negative whole number, or the fallback when unusable. */
@@ -1224,6 +1641,7 @@ export default async function plugin(bb: BbPluginApi) {
       workerConfig: workerFor(project),
       extra: rulesFor(project),
       preset: settings.contractPreset,
+      maxRevisions: settings.maxRevisions,
       modelPolicy: settings.workerModelPolicy,
       workspace: settings.workerWorkspace,
       subagents: settings.orchestratorSubagents,
@@ -1286,6 +1704,18 @@ export default async function plugin(bb: BbPluginApi) {
   const countStateRows = stateDb.prepare<[], { n: number }>("SELECT COUNT(*) AS n FROM thread_state");
 
   /**
+   * How many threads durable state holds. A storage failure must not fail a read
+   * that is only reporting a count, so an unreadable table answers 0.
+   */
+  function retainedThreadCount(): number {
+    try {
+      return countStateRows.get()?.n ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
    * Claims this process has made but not yet recorded. A cap check that counted
    * only the recorded delegations would let two simultaneous claims both pass,
    * so in-flight claims are counted too. `turn` tracks the ones that count
@@ -1309,6 +1739,43 @@ export default async function plugin(bb: BbPluginApi) {
     };
     if (next.parallel === 0 && next.turn === 0) pendingClaims.delete(threadId);
     else pendingClaims.set(threadId, next);
+  }
+
+  /**
+   * Check units this process spawned whose ledger row never landed. The durable
+   * check claim, not this reservation, is what stops a second check, so the
+   * process-local slot must not outlive the failed write: one such write per
+   * checker would otherwise spend a parallel slot for the life of the process and
+   * refuse every later delegation on the thread. The checker is a real running
+   * worker, though, so it keeps counting toward the cap until BB reports it
+   * settled, which {@link pruneStrayCheckers} notices before the cap is read.
+   */
+  const strayCheckers = new Map<string, { ownerThreadId: string; countPerTurn: boolean }>();
+
+  /**
+   * Drop stray-checker entries that no longer hold a slot. A checker the ledger
+   * now records is dropped because the ledger's own status counts it from then
+   * on. One whose status BB cannot read is dropped too: it cannot be shown to be
+   * running, its durable claim still stops a duplicate check, and keeping it
+   * would recreate the leak this map exists to avoid. Reads happen only for this
+   * orchestrator, and only when a cap is actually being counted.
+   */
+  async function pruneStrayCheckers(threadId: string, state: ThreadState): Promise<void> {
+    for (const [checkerId, entry] of strayCheckers) {
+      if (entry.ownerThreadId !== threadId) continue;
+      if (state.delegations.some((delegation) => delegation.threadId === checkerId)) {
+        strayCheckers.delete(checkerId);
+        continue;
+      }
+      let status: string | null;
+      try {
+        status = (await bb.sdk.threads.get({ threadId: checkerId })).status ?? null;
+      } catch {
+        strayCheckers.delete(checkerId);
+        continue;
+      }
+      if (!isRunningStatus(status)) strayCheckers.delete(checkerId);
+    }
   }
 
   /**
@@ -1432,23 +1899,27 @@ export default async function plugin(bb: BbPluginApi) {
       violationNudges: typeof state.violationNudges === "number" ? state.violationNudges : 0,
       reviewNudges: typeof state.reviewNudges === "number" ? state.reviewNudges : 0,
       workerOf: typeof state.workerOf === "string" ? state.workerOf : null,
+      lost: {
+        violations: countOf(state.lost?.violations),
+        delegations: countOf(state.lost?.delegations),
+        seenRows: countOf(state.lost?.seenRows),
+      },
+      headUnknown: state.headUnknown === true,
     };
   }
 
-  /** Whether a judge key is stored. The value is read here and never returned. */
-  async function judgeKeyConfigured(): Promise<boolean> {
-    const { judgeKey } = await judgeSettings.get();
-    return typeof judgeKey === "string" && judgeKey !== "";
+  /** A stored counter: a non-negative integer, or 0. */
+  function countOf(value: unknown): number {
+    return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
   }
 
-  /**
-   * The OpenRouter key, or null when none is stored. Read at call time so a key
-   * saved from the settings section is used by the next check without a reload.
-   * Never logged, never returned to the frontend.
-   */
+  async function judgeKeyConfigured(): Promise<boolean> {
+    judgeKeyPresent = judgeStore.read() !== null;
+    return judgeKeyPresent;
+  }
+
   async function judgeKey(): Promise<string | null> {
-    const { judgeKey: key } = await judgeSettings.get();
-    return typeof key === "string" && key !== "" ? key : null;
+    return judgeStore.read();
   }
 
   /**
@@ -1564,9 +2035,13 @@ export default async function plugin(bb: BbPluginApi) {
   function toDto(
     threadId: string,
     state: ThreadState | undefined,
+    children: ChildCounts,
     settings: SettingsView = settingsFor(null),
+    retainedThreads = 0,
   ): OrchestratorStateDto {
     const base = state ?? emptyState(Date.now());
+    const delegations = trimDelegations(base.delegations);
+    const settled = delegations.filter((delegation) => isSettledStatus(delegation.status));
     return {
       enabled: state?.enabled ?? false,
       enforcement: base.enforcement,
@@ -1585,13 +2060,47 @@ export default async function plugin(bb: BbPluginApi) {
       maxDelegationsPerTurn: settings.maxDelegationsPerTurn,
       unreviewed: unreviewedOf(base.delegations).length,
       reviewed: base.delegations.filter((delegation) => delegation.verdict != null).length,
+      workers: {
+        total: delegations.length,
+        running: delegations.filter((delegation) => isRunningStatus(delegation.status)).length,
+        settled: settled.length,
+        accepted: delegations.filter((delegation) => delegation.verdict === "accepted").length,
+        rejected: delegations.filter((delegation) => delegation.verdict === "rejected").length,
+        waiting: settled.filter((delegation) => needsVerdict(delegation)).length,
+        unconfirmed: delegations.filter((delegation) => delegation.resolved == null).length,
+      },
+      children,
+      retention: {
+        threads: retainedThreads,
+        caps: { delegations: MAX_DELEGATIONS, violations: MAX_VIOLATIONS, seenRows: MAX_SEEN_ROWS },
+        lost: {
+          delegations: base.lost?.delegations ?? 0,
+          violations: base.lost?.violations ?? 0,
+          seenRows: base.lost?.seenRows ?? 0,
+        },
+      },
+      judge: { configured: judgeKeyPresent, advisory: settings.judgeAdvisory },
     };
   }
 
-  /** Settled, unjudged, and not a check unit: a delegation the orchestrator still owes a verdict. */
+  /** Statuses in which a worker has finished, one way or the other. */
+  function isSettledStatus(status: string | null): boolean {
+    return status === "idle" || status === "error";
+  }
+
+  /** Statuses in which a worker is still consuming a parallel slot. */
+  function isRunningStatus(status: string | null): boolean {
+    return status === null || status === "active" || status === "starting" || status === "pending" || status === "stopping";
+  }
+
+  /**
+   * Settled, unjudged, and not a check unit: a delegation the orchestrator still
+   * owes a verdict. A worker still running is not owed one yet, so a review
+   * reminder cannot arrive before there is anything to review.
+   */
   function needsVerdict(delegation: Delegation): boolean {
     return (
-      delegation.status !== null &&
+      isSettledStatus(delegation.status) &&
       delegation.verdict == null &&
       // A check unit is evidence for the unit it checks: judging the checker
       // as well would double the ceremony without adding a decision.
@@ -1639,7 +2148,7 @@ export default async function plugin(bb: BbPluginApi) {
   /** Read the thread's current timeline head so a scan starts after it. */
   async function timelineHead(
     threadId: string,
-  ): Promise<{ seq: number; turnId: string | null }> {
+  ): Promise<{ seq: number; turnId: string | null; ok: boolean }> {
     try {
       const timeline = await bb.sdk.threads.timeline({ threadId });
       const response = timeline as { maxSeq?: unknown; rows?: unknown };
@@ -1648,10 +2157,17 @@ export default async function plugin(bb: BbPluginApi) {
           ? response.maxSeq
           : 0;
       const rows = asScanRows(response.rows);
-      return { seq, turnId: rows.length === 0 ? null : (rows[rows.length - 1]!.turnId ?? null) };
+      return {
+        seq,
+        turnId: rows.length === 0 ? null : (rows[rows.length - 1]!.turnId ?? null),
+        ok: true,
+      };
     } catch (cause) {
+      // A head this build could not read says nothing about where the history
+      // ends. Reporting `ok: false` lets the enable path defer the cursor instead
+      // of starting at 0, which would judge the whole thread as fresh work.
       bb.log.warn(`timeline head read failed for ${threadId}: ${String(cause)}`);
-      return { seq: 0, turnId: null };
+      return { seq: 0, turnId: null, ok: false };
     }
   }
 
@@ -1662,7 +2178,9 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<ThreadState> {
     // Seeding the sequence head when turning on means historical work in an
     // existing thread is never retroactively flagged.
-    const head = enabled ? await timelineHead(threadId) : { seq: 0, turnId: null };
+    const head = enabled
+      ? await timelineHead(threadId)
+      : { seq: 0, turnId: null, ok: true };
     // A thread with a turn in flight loses that turn AND the next one to the
     // session lag; an idle thread loses only the next one.
     let graceTurnIds: string[] = [];
@@ -1684,6 +2202,9 @@ export default async function plugin(bb: BbPluginApi) {
       enforcement,
       enabledAt: enabled ? (current.enabledAt ?? new Date().toISOString()) : null,
       lastSeq: enabled ? head.seq : current.lastSeq,
+      // With no readable head, the first successful scan seeds the cursor before
+      // it judges anything (see `scan`), so nothing from before this point counts.
+      headUnknown: enabled ? !head.ok : false,
       graceTurnIds: enabled ? graceTurnIds : current.graceTurnIds,
       graceSlots: enabled ? graceSlots : current.graceSlots,
       nudgeCount: enabled ? current.nudgeCount : 0,
@@ -1754,13 +2275,15 @@ export default async function plugin(bb: BbPluginApi) {
     waitForResult: z
       .boolean()
       .optional()
-      .describe("Wait for the worker to finish and return its result. Default true."),
+      .describe(
+        "Wait for the worker to finish and return its result. Default true. `false` returns once the unit is spawned, so independent units fan out; its check then waits for `orchestrator_check`. A cancelled call starts no worker.",
+      ),
     after: z
       .array(z.string().trim().min(1).max(200))
       .max(20)
       .optional()
       .describe(
-        "Worker thread ids this unit depends on. It starts only once each of them is idle, so independent units run in parallel and a dependent unit waits for its inputs. Only this orchestrator's own workers are accepted.",
+        "Worker thread ids this unit depends on. It starts only once each dependency has settled cleanly: idle, not errored, and not rejected by its own check or review. Only this orchestrator's own workers are accepted, and a dependency cycle is refused.",
       ),
     timeoutSeconds: z
       .number()
@@ -1768,7 +2291,9 @@ export default async function plugin(bb: BbPluginApi) {
       .min(10)
       .max(3600)
       .optional()
-      .describe("How long to wait. Default 900."),
+      .describe(
+        "Total time for this call, including its check unit and any revision. Default 900.",
+      ),
     hidden: z
       .boolean()
       .optional()
@@ -1777,13 +2302,19 @@ export default async function plugin(bb: BbPluginApi) {
       .enum(WORKER_WORKSPACES)
       .optional()
       .describe(
-        "Where this unit runs: `shared` (the orchestrator's own checkout) or `worktree` (its own git worktree and branch, which stays out until a merge unit brings it in). Default: the plugin setting, except under `mixed`, where every delegation has to name one.",
+        "Where this unit runs: `shared` (the orchestrator's own checkout) or `worktree` (its own git worktree and branch, which stays out until a merge unit brings it in). Default: the plugin setting. Under `mixed`, the unit's `kind` picks the checkout and `workspace` overrides it.",
+      ),
+    kind: z
+      .enum(WORKER_PRESETS)
+      .optional()
+      .describe(
+        "What kind of unit this is: `build`, `review` or `research`. A kind picks where the unit runs under a `mixed` workspace (a build gets its own worktree; a review or research unit reads this checkout), decides whether it gets an independent check (a build does), and applies that kind's stored execution when one exists. It needs no stored preset.",
       ),
     preset: z
       .enum(WORKER_PRESETS)
       .optional()
       .describe(
-        "A named execution preset stored in the plugin settings. Under the default `pinned` it is the only way to give this unit a different execution, because raw `model`, `provider` and `reasoning` are refused; under `flexible` this call's own arguments apply on top of it. Ask for one that is stored; the error names the ones that are.",
+        "A named execution preset stored in the plugin settings. Under the default `pinned` it is the only way to give this unit a raw model change, because `model`, `provider` and `reasoning` are refused; under `flexible` this call's own arguments apply on top of it. A `kind` already applies its stored execution for you, so a preset is only needed to force one that is stored.",
       ),
     verify: z
       .boolean()
@@ -1832,6 +2363,7 @@ export default async function plugin(bb: BbPluginApi) {
       timeoutSeconds,
       hidden,
       workspace,
+      kind,
       preset,
       verify,
       model,
@@ -1845,22 +2377,76 @@ export default async function plugin(bb: BbPluginApi) {
     if (threadId === undefined) {
       throw new Error("orchestrator_delegate needs a thread context.");
     }
-    // A dependent unit starts only after each named input has finished. A
-    // dependency that failed stops this unit too: starting on a broken input
-    // would hand the worker a result it cannot trust.
+    const parent = await bb.sdk.threads.get({ threadId });
+    const projectId = contextProjectId ?? parent.projectId;
+    /**
+     * One deadline for the whole call. The worker, its check unit and every
+     * revision share it, so `timeoutSeconds` bounds the call rather than each
+     * wait inside it.
+     */
+    const timeoutMs = Math.min(Math.max(timeoutSeconds ?? 900, 10), 3600) * 1000;
+    const deadlineMs = Date.now() + timeoutMs;
+    const remainingMs = (): number => Math.max(0, deadlineMs - Date.now());
+    /**
+     * Whether this call may start another worker. Read as a function so a check
+     * after an await sees the current state instead of a narrowed earlier one.
+     */
+    const cancelled = (): boolean => disposed || signal?.aborted === true;
+    /**
+     * A dependent unit starts only after each named input has finished
+     * cleanly. Failed, rejected or unchecked-as-failing inputs stop this unit
+     * too: starting on a broken input would hand the worker a result it cannot
+     * trust. The graph is the recorded one, so a cycle is refused instead of
+     * waiting forever.
+     */
     if (after !== undefined && after.length > 0) {
-      const own = new Set((await getState(threadId))?.delegations.map((delegation) => delegation.threadId) ?? []);
-      const foreign = after.filter((id) => !own.has(id));
+      const recorded = (await getState(threadId))?.delegations ?? [];
+      const known = new Map(recorded.map((delegation) => [delegation.threadId, delegation]));
+      const foreign = after.filter((id) => !known.has(id));
       if (foreign.length > 0) {
         throw new Error(`These are not this orchestrator's workers, so they cannot be dependencies: ${foreign.join(", ")}`);
       }
-      const deadlineMs = Date.now() + (timeoutSeconds ?? 900) * 1000;
+      const repeated = after.filter((id, index) => after.indexOf(id) !== index);
+      if (repeated.length > 0) {
+        throw new Error(`Name each dependency once: ${[...new Set(repeated)].join(", ")} is listed more than once.`);
+      }
+      const cycle = findDependencyCycle(recorded, after);
+      if (cycle !== null) {
+        throw new Error(
+          `These dependencies form a cycle (${cycle.join(" -> ")}), so this unit would wait on itself. Break the chain and delegate the units in order instead.`,
+        );
+      }
       for (const id of after) {
-        const remainingMs = Math.max(1000, deadlineMs - Date.now());
-        await bb.sdk.threads.wait({ threadId: id, status: "idle", timeoutMs: remainingMs, signal }).catch(() => undefined);
-        const status = (await bb.sdk.threads.get({ threadId: id })).status;
-        if (status !== "idle") {
-          throw new Error(`Dependency ${id} did not finish cleanly (status: ${status}), so this unit did not start.`);
+        const settledDependency = await waitForWorker(id, remainingMs(), {
+          ownerThreadId: threadId,
+          maxResumes: settingsFor(projectId).maxStallResumes,
+          ...(signal === undefined ? {} : { signal }),
+        });
+        if (settledDependency.status !== "idle") {
+          const dependency = (await getState(threadId))?.delegations.find((entry) => entry.threadId === id) ?? known.get(id);
+          const why =
+            dependency?.failure ??
+            (settledDependency.running
+              ? `it was still ${settledDependency.status ?? "running"} when the deadline passed`
+              : `status ${settledDependency.status ?? "unknown"}`);
+          throw new Error(`Dependency ${id} did not finish cleanly (${why}), so this unit did not start.`);
+        }
+        const currentDelegations = (await getState(threadId))?.delegations ?? recorded;
+        const dependency = currentDelegations.find((entry) => entry.threadId === id) ?? known.get(id);
+        if (dependency === undefined) continue;
+        // A chain a later revision resolved is fixed work, so its original's
+        // failure no longer stops a dependent unit.
+        const resolved = resolvedByOf(dependency, currentDelegations) !== null;
+        if (dependency.verdict === "rejected" && !resolved) {
+          throw new Error(
+            `Dependency ${id} was rejected${dependency.notes === null || dependency.notes === undefined ? "" : ` (${dependency.notes})`}, so this unit did not start on it. Re-delegate that unit first.`,
+          );
+        }
+        const blocked = checkBlockReason(dependency, currentDelegations);
+        if (blocked !== null) {
+          throw new Error(
+            `Dependency ${id} cannot be used because ${blocked}, so this unit did not start on it. Re-delegate that unit with the check's findings first.`,
+          );
         }
       }
     }
@@ -1876,8 +2462,6 @@ export default async function plugin(bb: BbPluginApi) {
      * own, so under it every delegation has to say, which is the whole point of
      * the mode: the orchestrator decides per unit.
      */
-    const parent = await bb.sdk.threads.get({ threadId });
-    const projectId = contextProjectId ?? parent.projectId;
     // A review-heavy scope checks every unit, so the check is the scope's rule, not an option the orchestrator can skip.
     const reviewHeavy = settingsFor(projectId).contractPreset === "review-heavy";
     if (reviewHeavy && verify === false) {
@@ -1886,23 +2470,36 @@ export default async function plugin(bb: BbPluginApi) {
     if (reviewHeavy && waitForResult === false) {
       throw new Error("This scope is review-heavy, so every unit is checked once it finishes. Keep waitForResult true.");
     }
-    // A build unit is checked by default: the review loop is on for every unit
+    /**
+     * The unit kind. `preset` is the older spelling of the same thing: it names
+     * a kind and, when one is stored, that kind's execution. A kind is a
+     * property of the work, not of a stored execution, so it needs no preset to
+     * pick a checkout or a check.
+     */
+    if (kind !== undefined && preset !== undefined && kind !== preset) {
+      throw new Error(
+        `kind \`${kind}\` and preset \`${preset}\` name different unit kinds; pass one, or make them match.`,
+      );
+    }
+    const unitKind: WorkerPresetName | undefined = kind ?? preset;
+    const scopeWorkspace = settingsFor(projectId).workerWorkspace;
+    // In a mixed scope the kind picks its own checkout: a build writes its own
+    // branch, while a review or research unit only reads the orchestrator's own
+    // checkout. A unit with no workspace and no kind still has to name one.
+    const kindWorkspace = unitKind === undefined ? undefined : KIND_WORKSPACES[unitKind];
+    if (workspace === undefined && scopeWorkspace === "mixed" && kindWorkspace === undefined) {
+      throw new Error(
+        "This scope runs workers in both checkouts, so each delegation names where it runs: `workspace: \"shared\"` uses the orchestrator's own checkout, so its edits are visible at once, and `workspace: \"worktree\"` gives the unit its own branch, which stays out until a merge unit brings it in. Or pass a `kind` (build, review or research) and the workspace follows it.",
+      );
+    }
+    const unitWorkspace = workspace ?? (scopeWorkspace === "mixed" ? kindWorkspace : scopeWorkspace);
+    // A build unit is checked by default: the review loop is on for every kind
     // that changes files. A check needs the result, so a unit that does not wait
     // is left unchecked rather than refused.
     const checkUnit =
-      verify === true || reviewHeavy || (preset === "build" && verify !== false && waitForResult !== false);
-    const scopeWorkspace = settingsFor(projectId).workerWorkspace;
-    // In a mixed scope a named kind picks its own checkout: a build writes its own
-    // branch, while a review or research unit only reads the orchestrator's checkout.
-    // A unit with no workspace and no kind still has to name one.
-    const kindWorkspace: "shared" | "worktree" | undefined =
-      preset === "build" ? "worktree" : preset === undefined ? undefined : "shared";
-    if (workspace === undefined && scopeWorkspace === "mixed" && kindWorkspace === undefined) {
-      throw new Error(
-        "This scope runs workers in both checkouts, so each delegation names where it runs: `workspace: \"shared\"` uses the orchestrator's own checkout, so its edits are visible at once, and `workspace: \"worktree\"` gives the unit its own branch, which stays out until a merge unit brings it in. Or pass a `preset` (build, review or research) and the workspace follows it.",
-      );
-    }
-    const unitWorkspace = workspace ?? (scopeWorkspace === "mixed" ? kindWorkspace! : scopeWorkspace);
+      verify === true ||
+      reviewHeavy ||
+      (unitKind !== undefined && KIND_CHECKS[unitKind] && verify !== false && waitForResult !== false);
     /**
      * The machine a new worktree belongs on: the orchestrator's own, so the unit
      * sees the same host as the thread that handed it the work. An environment
@@ -1945,7 +2542,7 @@ export default async function plugin(bb: BbPluginApi) {
      * alone, so the prefix is never doubled.
      */
     const baseTitle = title?.trim() || task.trim().split("\n")[0]!.slice(0, 120);
-    const presetPrefix = preset === undefined ? null : `${preset.toUpperCase()}:`;
+    const presetPrefix = unitKind === undefined ? null : `${unitKind.toUpperCase()}:`;
     const workerTitle =
       presetPrefix === null || baseTitle.toUpperCase().startsWith(presetPrefix)
         ? baseTitle
@@ -1997,6 +2594,10 @@ export default async function plugin(bb: BbPluginApi) {
         );
       }
       presetExec = stored;
+    } else if (unitKind !== undefined) {
+      // A kind is not a stored preset: its execution applies when the scope has
+      // saved one, and otherwise the unit simply runs on the default execution.
+      presetExec = workerConfig.presets?.[unitKind] ?? {};
     }
 
     // Per-delegation arguments win over a preset, which wins over the worker
@@ -2031,8 +2632,24 @@ export default async function plugin(bb: BbPluginApi) {
       exec: WorkerExecution,
       workerLabel: string,
       environment: ReturnType<typeof environmentFor>,
-      options: { brief?: string; verifierFor?: string; pluginInitiated?: boolean } = {},
+      options: {
+        brief?: string;
+        verifierFor?: string;
+        pluginInitiated?: boolean;
+        revisionOf?: string;
+        /** The chain's root unit, carried so the budget stays on one record. */
+        revisionRoot?: string;
+        /** The chain depth this revision is, recorded as the spend at this point. */
+        revisionDepth?: number;
+        kind?: WorkerPresetName;
+        after?: string[];
+      } = {},
     ): Promise<{ id: string; environmentId: string | null }> {
+      // One choke point: no path in this call spawns a worker after the call was
+      // cancelled or the plugin was disposed.
+      if (cancelled()) {
+        throw new Error("the call was cancelled, so no worker was started");
+      }
       const countPerTurn = options.pluginInitiated !== true;
       await assertWithinBudget(orchestratorId, countPerTurn, targetProjectId);
       try {
@@ -2051,23 +2668,54 @@ export default async function plugin(bb: BbPluginApi) {
           ...(Object.keys(exec).length === 0
             ? {}
             : { executionInputSources: executionSources(exec) }),
-          pluginMetadata: { workerFor: orchestratorId },
+          // A check unit names the unit it inspects, so a ledger write that fails
+          // still leaves definitive ownership in BB rather than only a title.
+          pluginMetadata: {
+            workerFor: orchestratorId,
+            ...(options.verifierFor === undefined ? {} : { checkFor: options.verifierFor }),
+          },
         });
         await mutateState(spawned.id, (current) => ({ ...current, workerOf: orchestratorId }));
-        await mutateState(orchestratorId, (current) => ({
-          ...current,
-          delegations: trimDelegations([
+        await mutateState(orchestratorId, (current) => {
+          const delegations = trimDelegations([
             ...current.delegations,
             {
               threadId: spawned.id,
               title: workerLabel,
-              task: (options.brief ?? task).slice(0, 400),
+              // The full brief, because a rejected unit is re-delegated from this
+              // record: a truncated brief would hand the revision a different task.
+              task: (options.brief ?? task).slice(0, 20_000),
               createdAt: Date.now(),
               status: null,
               ...(options.verifierFor === undefined
                 ? {}
                 : { verifierFor: options.verifierFor, verifiedBy: null, verdict: null }),
+              ...(options.revisionOf === undefined
+                ? {}
+                : {
+                    revisionOf: options.revisionOf,
+                    revisionRoot: options.revisionRoot ?? options.revisionOf,
+                    revisions: options.revisionDepth ?? 0,
+                  }),
+              ...(checkUnit && options.verifierFor === undefined ? { verify: true } : {}),
+              kind: options.kind ?? unitKind ?? null,
+              ...(options.after === undefined || options.after.length === 0
+                ? {}
+                : { after: options.after }),
               environmentId: spawned.environmentId ?? null,
+              // What BB reports at spawn. The provider is readable immediately,
+              // so a worker nobody waits for is not "unconfirmed" forever; a
+              // later settle fills in the model from the session snapshot.
+              resolved:
+                spawned.providerId === null || spawned.providerId === undefined
+                  ? null
+                  : {
+                      providerId: spawned.providerId,
+                      model: null,
+                      source: "thread" as const,
+                      at: Date.now(),
+                      unreported: ["reasoningLevel", "serviceTier"],
+                    },
               execution: {
                 providerId: spawned.providerId ?? exec.providerId ?? null,
                 model: exec.model ?? null,
@@ -2076,8 +2724,18 @@ export default async function plugin(bb: BbPluginApi) {
                 permissionMode: exec.permissionMode ?? null,
               },
             },
-          ]),
-        }));
+          ]);
+          const dropped = current.delegations.length + 1 - delegations.length;
+          return {
+            ...current,
+            delegations,
+            lost: {
+              violations: current.lost?.violations ?? 0,
+              seenRows: current.lost?.seenRows ?? 0,
+              delegations: (current.lost?.delegations ?? 0) + Math.max(0, dropped),
+            },
+          };
+        });
         return { id: spawned.id, environmentId: spawned.environmentId ?? null };
       } finally {
         // However the spawn ended, its claim stops counting against the caps.
@@ -2085,56 +2743,44 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
 
-    interface Settled {
-      status: string | null;
-      output: string | null;
-      /** Still working when the deadline passed. */
-      running: boolean;
-    }
-
-    /** Wait for one worker, record how it settled, and read what it said. */
-    async function settle(workerId: string, timeoutMs: number): Promise<Settled> {
-      const deadline = Date.now() + timeoutMs;
-      try {
-        await bb.sdk.threads.wait({ threadId: workerId, status: "idle", timeoutMs, signal });
-      } catch {
-        // `wait` matches one status and polls, so an errored thread never
-        // reaches `idle`: the server rejects the wait immediately with
-        // "will not reach idle by waiting alone" rather than holding until the
-        // timeout. That rejection is what notices a failure promptly, and the
-        // status read below then decides whether to retry. A timeout lands
-        // here too, which is why the status is read either way.
-      }
-      let status: string | null = null;
-      try {
-        status = (await bb.sdk.threads.get({ threadId: workerId })).status;
-      } catch {
-        status = null;
-      }
+    /**
+     * Wait for one worker, resuming it when it is stalled, record how it
+     * settled, and read what it said. The stall budget comes from the scope, and
+     * the resume continues the same session: a stalled worker is never replaced,
+     * so its side effects cannot run twice.
+     */
+    async function settle(workerId: string, signal?: AbortSignal): Promise<SettledWorker> {
+      const settled = await waitForWorker(workerId, remainingMs(), {
+        ownerThreadId: orchestratorId,
+        maxResumes: settingsFor(projectId).maxStallResumes,
+        ...(signal === undefined ? {} : { signal }),
+      });
       await mutateState(orchestratorId, (current) => ({
         ...current,
         delegations: current.delegations.map((delegation) =>
-          delegation.threadId === workerId ? { ...delegation, status } : delegation,
+          delegation.threadId === workerId
+            ? {
+                ...delegation,
+                status: settled.status,
+              }
+            : delegation,
         ),
       }));
-      if (Date.now() >= deadline && status !== "idle" && status !== "error") {
-        return { status, output: null, running: true };
-      }
-      let output: string | null = null;
-      try {
-        const result = await bb.sdk.threads.output({ threadId: workerId });
-        output = (result as { output?: string | null }).output ?? null;
-      } catch (cause) {
-        bb.log.warn(`worker output read failed for ${workerId}: ${String(cause)}`);
-      }
-      await maybeArchive(orchestratorId, workerId);
-      return { status, output, running: false };
+      await recordResolved(orchestratorId, workerId);
+      if (!settled.running) await maybeArchive(orchestratorId, workerId);
+      return settled;
     }
 
     /** The text the orchestrator gets back about one finished worker. */
-    function report(workerId: string, settled: Settled): string {
+    function report(workerId: string, settled: SettledWorker): string {
       if (settled.running) {
-        return `Worker ${workerId} is still running after ${Math.round(timeoutMs / 1000)}s (status: ${settled.status ?? "unknown"}). Delegate the next unit, or wait and check it again. Do not start doing its work yourself.`;
+        const window = `${Math.round(STALL_WINDOW_MS / 60_000)} minutes`;
+        const resumed = settled.stalled
+          ? `It recorded no progress for over ${window}, and its resume budget is spent, so no further resume was sent.`
+          : settled.resumes === 0
+            ? `It is still recording progress, so no resume was sent.`
+            : `It recorded no progress for over ${window}, so ${settled.resumes === 1 ? "a resume message was" : `${settled.resumes} resume messages were`} sent to the same worker.`;
+        return `Worker ${workerId} is still running after ${Math.round(timeoutMs / 1000)}s (status: ${settled.status ?? "unknown"}). ${resumed} Delegate the next unit, or wait and check it again. Do not start doing its work yourself, and do not delegate the same unit a second time: it may still finish.`;
       }
       const trimmed = (settled.output ?? "").trim();
       const body =
@@ -2161,21 +2807,53 @@ export default async function plugin(bb: BbPluginApi) {
         { pluginInitiated: true },
       );
       const retryId = retry.id;
-      const settled = await settle(retryId, timeoutMs);
+      const settled = await settle(retryId, signal);
       return `${reason} Re-delegated the same brief on \`${target}\` as worker ${retryId}.\n\n${await finish(retryId, `${workerTitle} (${label})`, settled)}`;
+    }
+
+    interface CheckRun {
+      id: string | null;
+      /** The parsed verdict, or null when the check left none. */
+      verdict: ReviewVerdict | null;
+      /** Text appended to the delegation result. */
+      text: string;
+      /** The check's report, used as the reviewer's notes for a revision. */
+      report: string;
+    }
+
+    /**
+     * Store a check's result on the unit it inspected. Acceptance and dependants
+     * both read this record, so a check that could not produce a verdict it can
+     * stand behind is stored as `rejected` with `problem` naming why: silence must
+     * never read as a pass.
+     */
+    async function storeCheck(
+      workerId: string,
+      checkerId: string | undefined,
+      verdict: ReviewVerdict,
+      report: string,
+      problem: string | null,
+      checkerStatus?: string | null,
+    ): Promise<void> {
+      await storeCheckFor(orchestratorId, workerId, checkerId, verdict, report, problem, checkerStatus);
     }
 
     /**
      * Spawn a second worker to check the first one's work, on the same
      * execution, and hand its report back with the worker's. The check unit
      * is recorded as evidence for `workerId` and is not itself a unit the
-     * orchestrator has to judge.
+     * orchestrator has to judge. Its parsed verdict is stored on the unit, so a
+     * later acceptance cannot pretend the check passed.
      */
     async function runVerifier(
       workerId: string,
       workerLabel: string,
       workerOutput: string | null,
-    ): Promise<string> {
+    ): Promise<CheckRun> {
+      // A cancelled call or a disposed plugin must not start another worker.
+      if (cancelled()) {
+        return { id: null, verdict: null, report: "", text: "\n\nThe call was cancelled, so no check unit was started." };
+      }
       const brief = buildVerifierBrief({ task, workerTitle: workerLabel, workerOutput });
       const verifierExec = reconcile({ ...workerExec });
       let verifierId: string;
@@ -2185,43 +2863,89 @@ export default async function plugin(bb: BbPluginApi) {
             brief,
             verifierFor: workerId,
             pluginInitiated: true,
+            kind: "review",
           })
         ).id;
       } catch (cause) {
         bb.log.warn(`check unit for ${workerId} could not start: ${String(cause)}`);
-        return `\n\nNo check unit ran: ${String(cause)}`;
+        const why = `no check unit could start (${String(cause)})`;
+        await storeCheck(workerId, undefined, "rejected", "", why);
+        return { id: null, verdict: null, report: "", text: `\n\nNo check unit ran: ${String(cause)}. That leaves this unit unverified, so it cannot be accepted and dependent units will not start on it.` };
       }
+      // Bind the checker before it can report: a stale check cannot overwrite a
+      // newer result, and a recovery cannot start a second checker while this
+      // one is still live.
       await mutateState(orchestratorId, (current) => ({
         ...current,
         delegations: current.delegations.map((delegation) =>
-          delegation.threadId === workerId ? { ...delegation, verifiedBy: verifierId } : delegation,
+          delegation.threadId === workerId
+            ? {
+                ...delegation,
+                verifiedBy: verifierId,
+                checkClaim: { token: verifierId, at: Date.now(), threadId: verifierId },
+              }
+            : delegation,
         ),
       }));
-      const checked = await settle(verifierId, timeoutMs);
-      const verdict = (checked.output ?? "").trim();
-      // The check's verdict is advice. The orchestrator still judges the unit, so
-      // it is reported in the result and never recorded on the worker.
-      const parsed = checked.running ? null : parseCheckVerdict(checked.output ?? "");
+      const checkStartedAt = Date.now();
+      const checked = await settle(verifierId, signal);
+      const report = (checked.output ?? "").trim();
+      // The check's verdict is evidence. The orchestrator still judges the unit;
+      // the plugin records the check's own result so it can gate acceptance.
+      const parsed = checked.running ? null : parseCheckVerdict(report);
+      const problem =
+        checked.running
+          ? cancelled()
+            ? "the call was cancelled while the check unit was still running"
+            : "the check unit was still running when the call's deadline passed"
+          : parsed === null || parsed.verdict === null
+            ? (parsed?.reasoning ?? "the check left no verdict")
+            : null;
+      await storeCheck(workerId, verifierId, parsed?.verdict ?? "rejected", report, problem, checked.status);
+      // A chain's outcome follows its latest check: a pass settles it, a fail
+      // takes the earlier resolution back, and a check still running settles
+      // nothing yet.
+      await recordChainOutcome(
+        orchestratorId,
+        workerId,
+        parsed === null ? undefined : parsed.verdict === "accepted" ? workerId : null,
+        { since: checkStartedAt },
+      );
       let advice =
-        parsed === null
-          ? ""
+        parsed === null || parsed.verdict === null
+          ? `\n\nThe check left no verdict this plugin can trust (${problem}), so it counts as failed: you cannot accept this unit, and dependent units will not start on it.`
           : `\n\nThe check's verdict is ${parsed.verdict === "accepted" ? "pass" : "fail"}. You still judge this unit with orchestrator_review.`;
-      // The advisory judge reads the check's report only when a key is stored and
-      // the check gave a verdict. Its opinion is text, never a recorded verdict.
-      const key = parsed === null ? null : await judgeKey();
-      if (key !== null) {
-        const opinion = await judgeCheckVerdict(key, checked.output ?? "");
-        if (opinion !== null) {
-          advice += `\nAdvisory judge: ${opinion.agrees ? "agrees" : "disagrees"}. ${opinion.rationale}`;
+      // The advisory judge is opt-in per scope and additionally needs a stored
+      // key. Only minimized evidence leaves the machine, and a failure is named
+      // instead of disappearing. It draws on what is left of this call's
+      // deadline and on the call's cancellation, so a stalled endpoint cannot
+      // hold a delegation past the timeout it advertised.
+      if (parsed !== null && parsed.verdict !== null && settingsFor(projectId).judgeAdvisory) {
+        const key = await judgeKey();
+        if (key === null) {
+          advice += "\nAdvisory judge: not asked, because no OpenRouter key is stored.";
+        } else {
+          const outcome = await judgeCheckVerdict(key, report, fetch, {
+            remainingMs: remainingMs(),
+            ...(signal === undefined ? {} : { signal }),
+          });
+          advice += outcome.ok
+            ? `\nAdvisory judge: ${outcome.opinion.agrees ? "agrees" : "disagrees"}. ${outcome.opinion.rationale}`
+            : `\nAdvisory judge: failed — ${outcome.error}.`;
         }
       }
-      return `\n\nCheck unit ${verifierId} ran the same brief.${advice}${
-        checked.running
-          ? " It is still running, so check it before you accept the work."
-          : verdict === ""
-            ? " It produced no final text, so open it before you accept the work."
-            : `\n\n${verdict.length > 8_000 ? `${verdict.slice(0, 8_000)}\n\n[truncated]` : verdict}`
-      }`;
+      return {
+        id: verifierId,
+        verdict: parsed?.verdict ?? null,
+        report,
+        text: `\n\nCheck unit ${verifierId} ran the same brief.${advice}${
+          checked.running
+            ? ` ${cancelled() ? "The call was cancelled while it was still running" : "It was still running when the deadline passed"}, so its check is recorded as failed until it reports.`
+            : report === ""
+              ? " It produced no final text, so its check is recorded as failed."
+              : `\n\n${report.length > 8_000 ? `${report.slice(0, 8_000)}\n\n[truncated]` : report}`
+        }`,
+      };
     }
 
     /**
@@ -2244,26 +2968,107 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
 
-    /** The worker's report, plus an independent check when one was asked for. */
+    /**
+     * The worker's report, an independent check when one was asked for, and a
+     * revision when that check fails. A revision is this plugin's own decision,
+     * so it does not count against the fan-out caps; it is bounded by the
+     * scope's revision budget and never loops.
+     */
     async function finish(
       workerId: string,
       workerLabel: string,
-      settled: Settled,
+      settled: SettledWorker,
     ): Promise<string> {
-      const reported = `${report(workerId, settled)}${await worktreeNote(workerEnvironmentId)}`;
+      let text = `${report(workerId, settled)}${await worktreeNote(workerEnvironmentId)}`;
       // Checking a worker that never ran is pointless: there is nothing to
       // inspect, and the orchestrator has to re-delegate that unit anyway.
-      if (!checkUnit || settled.running || settled.status === "error") return reported;
-      return `${reported}${await runVerifier(workerId, workerLabel, settled.output)}`;
+      if (!checkUnit || settled.running || settled.status === "error") return text;
+      const revisionEligible = unitKind === "build" || verify === true;
+      const maxRevisions = settingsFor(projectId).maxRevisions;
+      let targetId = workerId;
+      let targetLabel = workerLabel;
+      let targetSettled = settled;
+      for (;;) {
+        // A cancelled call or a disposed plugin starts no further worker, check
+        // or revision: the work the user stopped is not spent on another one.
+        if (cancelled()) {
+          text += "\n\nThe call was cancelled, so no further check or revision ran.";
+          return text;
+        }
+        const check = await runVerifier(targetId, targetLabel, targetSettled.output);
+        text += check.text;
+        if (check.verdict !== "rejected" || !revisionEligible) return text;
+        // A check that failed while the call was being cancelled still buys no
+        // revision, and the consumer is told why none ran.
+        if (cancelled()) {
+          text += "\n\nThe call was cancelled, so no further check or revision ran.";
+          return text;
+        }
+        // The chain depth is claimed atomically against the durable record, so
+        // two rejections cannot both read the same spent count and pass.
+        const claim = await claimRevision(orchestratorId, targetId, maxRevisions);
+        if (claim === null) {
+          text += `\nThe revision budget (${maxRevisions}) is spent, so this unit is reported as rejected: record it and re-delegate the unit to a worker.`;
+          return text;
+        }
+        const depth = claim.depth;
+        const brief = buildRevisionBrief({
+          task,
+          workerTitle: targetLabel,
+          previousOutput: targetSettled.output,
+          notes: check.report,
+        });
+        // The claim was taken after the check; a cancellation that landed while
+        // it was being taken hands the slot back instead of spawning a worker.
+        if (cancelled()) {
+          await releaseRevision(orchestratorId, targetId, claim.previousResolvedBy, claim.previousResolvedAt);
+          text += `\nThe call was cancelled, so revision ${depth} did not start.`;
+          return text;
+        }
+        let revision: { id: string; environmentId: string | null };
+        try {
+          revision = await spawnWorker(
+            workerExec,
+            `${workerTitle} (revision ${depth})`,
+            environmentFor(workerEnvironmentId),
+            {
+              brief,
+              pluginInitiated: true,
+              revisionOf: targetId,
+              revisionRoot: claim.rootId,
+              revisionDepth: depth,
+            },
+          );
+        } catch (cause) {
+          // The unit finished and its check ran, so a revision that cannot
+          // start is reported beside the result instead of replacing it. The
+          // claim is handed back: an unstarted revision spent nothing.
+          await releaseRevision(orchestratorId, targetId, claim.previousResolvedBy, claim.previousResolvedAt);
+          const why = cause instanceof Error ? cause.message : String(cause);
+          text += `\nThe check failed, but the revision could not start: ${why}. Record the unit as rejected and re-delegate it yourself.`;
+          return text;
+        }
+        const revisionSettled = await settle(revision.id, signal);
+        text += `\n\nThe check failed, so the unit was re-delegated on the same execution as revision ${depth}: worker ${revision.id}${
+          revisionSettled.running
+            ? " (still running)"
+            : ` (status ${revisionSettled.status ?? "unknown"})`
+        }.`;
+        if (revisionSettled.running || revisionSettled.status === "error") return text;
+        targetId = revision.id;
+        targetLabel = `${workerLabel} (revision ${depth})`;
+        targetSettled = revisionSettled;
+      }
     }
 
-    const timeoutMs = Math.min(Math.max(timeoutSeconds ?? 900, 10), 3600) * 1000;
     const fallback = workerConfig.fallback;
     let workerId: string;
     /** The checkout the unit's workers run in, reused by its check unit and retry. */
     let workerEnvironmentId: string | null = null;
     try {
-      const spawned = await spawnWorker(workerExec, workerTitle, environmentFor(null));
+      const spawned = await spawnWorker(workerExec, workerTitle, environmentFor(null), {
+        ...(after !== undefined && after.length > 0 ? { after } : {}),
+      });
       workerId = spawned.id;
       workerEnvironmentId = spawned.environmentId;
     } catch (cause) {
@@ -2284,7 +3089,7 @@ export default async function plugin(bb: BbPluginApi) {
       return `Delegated without waiting.\nWorker thread ${workerId}, titled "${workerTitle}"\nCheck on it later and fold its result into your report.${retry}${await worktreeNote(workerEnvironmentId)}`;
     }
 
-    const first = await settle(workerId, timeoutMs);
+    const first = await settle(workerId, signal);
     if (first.running || first.status !== "error") {
       return await finish(workerId, workerTitle, first);
     }
@@ -2323,13 +3128,29 @@ export default async function plugin(bb: BbPluginApi) {
     verdict: ReviewVerdict,
     notes: string | undefined,
     verifiedBy: string | undefined,
+    signal?: AbortSignal,
   ): Promise<string> {
     const state = await getState(threadId);
     const known = state?.delegations ?? [];
-    if (!known.some((delegation) => delegation.threadId === workerThreadId)) {
+    const target = known.find((delegation) => delegation.threadId === workerThreadId);
+    if (target === undefined) {
       const ids = known.map((delegation) => delegation.threadId).join(", ");
       throw new Error(
         `This thread has no worker ${workerThreadId}.${ids === "" ? " It has delegated nothing yet." : ` Workers it delegated: ${ids}.`}`,
+      );
+    }
+    // An independent check that failed is evidence against the work. Accepting
+    // anyway would turn the check into decoration, and the plugin never records
+    // acceptance itself: a pass in a model's report is not a verdict. A chain a
+    // later revision resolved is the exception: the finding was fixed there.
+    const blocked = checkBlockReason(target, known);
+    if (verdict === "accepted" && blocked !== null) {
+      throw new Error(
+        `Worker ${workerThreadId} cannot be accepted on its report: ${blocked}. ${
+          target.verify === true && (target.check === null || target.check === undefined || target.check.problem != null)
+            ? `If its check never ran, run \`${CHECK_TOOL}\` for it to run that check now; otherwise reject it explicitly to have a corrected unit delegated.`
+            : `Re-delegate it with the check's findings (record rejected, and the plugin re-delegates the build unit once), or reject it explicitly and re-delegate a corrected unit.`
+        }`,
       );
     }
     const updated = await mutateState(threadId, (current) => ({
@@ -2346,6 +3167,11 @@ export default async function plugin(bb: BbPluginApi) {
           : delegation,
       ),
     }));
+    // Accepting a revision settles its chain: the original's failed check and
+    // recorded rejection no longer refuse acceptance or a dependent unit.
+    if (verdict === "accepted" && target.revisionOf != null) {
+      await recordChainOutcome(threadId, workerThreadId, target.threadId);
+    }
     // Recording a verdict is the moment the orchestrator demonstrably read the
     // result, which is what retention waits for.
     await maybeArchive(threadId, workerThreadId);
@@ -2358,9 +3184,16 @@ export default async function plugin(bb: BbPluginApi) {
       remaining === 0
         ? " Every worker has a verdict."
         : ` ${remaining} worker${remaining === 1 ? "" : "s"} still unjudged.`;
-    return verdict === "rejected"
-      ? `Recorded rejected for ${workerThreadId}. Re-delegate that unit to a worker. Do not fix it yourself.${tail}`
-      : `Recorded accepted for ${workerThreadId}.${tail}`;
+    if (verdict === "accepted") {
+      return `Recorded accepted for ${workerThreadId}.${tail}`;
+    }
+    // A rejected build unit is re-delegated here, with the reviewer's notes,
+    // inside the scope's revision budget. The orchestrator is told what ran.
+    const revision = await reviseRejected(threadId, target, notes, signal).catch((cause) => {
+      bb.log.warn(`revision after rejecting ${workerThreadId} failed: ${String(cause)}`);
+      return `\nNo revision ran: ${String(cause)}.`;
+    });
+    return `Recorded rejected for ${workerThreadId}. Do not fix it yourself.${revision}${tail}`;
   }
 
   bb.agents.registerTool({
@@ -2388,7 +3221,9 @@ export default async function plugin(bb: BbPluginApi) {
         .string()
         .max(2_000)
         .optional()
-        .describe("What you checked and what you concluded."),
+        .describe(
+          "What you checked and what you concluded. On a rejected build unit these notes are the revision brief, so name what is wrong and what to change.",
+        ),
       verifiedBy: z
         .string()
         .min(1)
@@ -2396,11 +3231,38 @@ export default async function plugin(bb: BbPluginApi) {
         .optional()
         .describe("The check unit's thread id, when one ran."),
     }),
-    async execute({ workerThreadId, verdict, notes, verifiedBy }, { threadId }) {
+    async execute({ workerThreadId, verdict, notes, verifiedBy }, { threadId, signal }) {
       if (threadId === undefined) {
         throw new Error(`${REVIEW_TOOL} needs a thread context.`);
       }
-      return recordVerdict(threadId, workerThreadId, verdict, notes, verifiedBy);
+      return recordVerdict(threadId, workerThreadId, verdict, notes, verifiedBy, signal);
+    },
+  });
+
+  bb.agents.registerTool({
+    name: CHECK_TOOL,
+    description:
+      "Run the independent check a worker is still waiting for. Use it only for a worker the plugin reports as pending its check, such as a revision whose review call ended before its check ran.",
+    instructions:
+      "A unit that asks for an independent check but has none is pending, not passed. When a worker is pending its check, run orchestrator_check for it instead of accepting it or re-delegating the same unit. If that check is still running, or a checker exists that the ledger does not name, the call is refused and the unit stays claimed: nothing is duplicated, and a checker that settled is recorded from what it actually reported.",
+    presentation: {
+      label: {
+        pending: "Running a worker's independent check",
+        completed: "Ran a worker's independent check",
+      },
+    },
+    parameters: z.object({
+      workerThreadId: z
+        .string()
+        .min(1)
+        .max(120)
+        .describe("The worker thread whose pending independent check to run."),
+    }),
+    async execute({ workerThreadId }, { threadId, signal }) {
+      if (threadId === undefined) {
+        throw new Error(`${CHECK_TOOL} needs a thread context.`);
+      }
+      return recoverCheck(threadId, workerThreadId, signal);
     },
   });
 
@@ -2438,7 +3300,7 @@ export default async function plugin(bb: BbPluginApi) {
         ? undefined
         : state.violations.slice(-5).map((violation) => violation.detail);
     return {
-      tools: [DELEGATE_TOOL, REVIEW_TOOL],
+      tools: [DELEGATE_TOOL, REVIEW_TOOL, CHECK_TOOL],
       skills: [],
       instructions: buildInstructions({
         enforcement,
@@ -2447,6 +3309,7 @@ export default async function plugin(bb: BbPluginApi) {
         workerConfig: workerFor(context.project.id),
         extra: rulesFor(context.project.id),
         preset: settings.contractPreset,
+        maxRevisions: settings.maxRevisions,
         modelPolicy: settings.workerModelPolicy,
         workspace: settings.workerWorkspace,
         subagents: settings.orchestratorSubagents,
@@ -2496,6 +3359,7 @@ export default async function plugin(bb: BbPluginApi) {
             enforcement: null,
             enabledAt: new Date().toISOString(),
             lastSeq: head.seq,
+            headUnknown: !head.ok,
             graceTurnIds: head.turnId === null ? [] : [head.turnId],
             graceSlots: 1,
           }));
@@ -2601,7 +3465,8 @@ export default async function plugin(bb: BbPluginApi) {
     const scanThread = await bb.sdk.threads.get({ threadId }).catch(() => null);
     const scanSettings = settingsFor(scanThread?.projectId);
     const providerId = scanThread?.providerId;
-    const state = await getState(threadId);
+    const stored = await getState(threadId);
+    const state = await refreshWorkerRecords(threadId, stored);
     if (state !== undefined && !state.enabled && state.workerOf !== null) {
       await scanWorker(threadId, state, providerId, scanSettings);
       return;
@@ -2609,6 +3474,24 @@ export default async function plugin(bb: BbPluginApi) {
     if (state === undefined || !state.enabled) return;
     const enforcement = effectiveEnforcement(state);
     if (enforcement === "instruct") return;
+    // The cursor could not be seeded when the mode was switched on. Seed it from
+    // the first readable timeline and judge nothing in that scan: an unknown
+    // head must never be read as "everything so far is new".
+    if (state.headUnknown === true) {
+      try {
+        const head = await timelineHead(threadId);
+        if (!head.ok) return;
+        await mutateState(threadId, (current) => ({
+          ...current,
+          lastSeq: Math.max(current.lastSeq, head.seq),
+          headUnknown: false,
+        }));
+        bb.log.info(`seeded ${threadId} at sequence ${head.seq} after an unreadable head`);
+      } catch (cause) {
+        bb.log.warn(`head seeding failed for ${threadId}: ${String(cause)}`);
+      }
+      return;
+    }
 
     const timeline = await bb.sdk.threads.timeline({
       threadId,
@@ -2741,13 +3624,34 @@ export default async function plugin(bb: BbPluginApi) {
 
     if (fresh.length === 0 && maxSeq === state.lastSeq) return;
 
-    const updated = await mutateState(threadId, (current) => ({
-      ...current,
-      lastSeq: Math.max(current.lastSeq, maxSeq),
-      graceTurnIds,
-      seenRowIds: [...current.seenRowIds, ...rows.map(seenKey)].slice(-MAX_SEEN_ROWS),
-      violations: [...current.violations, ...fresh].slice(-MAX_VIOLATIONS),
-    }));
+    const updated = await mutateState(threadId, (current) => {
+      // A scan re-delivers rows it already classified. Appending them again
+      // inflated the "dropped" counter and evicted unique keys early, so only a
+      // key the ring does not already hold is recorded.
+      const seen = [...current.seenRowIds];
+      const known = new Set(seen);
+      for (const row of rows) {
+        const key = seenKey(row);
+        if (known.has(key)) continue;
+        known.add(key);
+        seen.push(key);
+      }
+      const violations = [...current.violations, ...fresh];
+      const keptSeen = seen.slice(-MAX_SEEN_ROWS);
+      const keptViolations = violations.slice(-MAX_VIOLATIONS);
+      return {
+        ...current,
+        lastSeq: Math.max(current.lastSeq, maxSeq),
+        graceTurnIds,
+        seenRowIds: keptSeen,
+        violations: keptViolations,
+        lost: {
+          violations: (current.lost?.violations ?? 0) + (violations.length - keptViolations.length),
+          delegations: current.lost?.delegations ?? 0,
+          seenRows: (current.lost?.seenRows ?? 0) + (seen.length - keptSeen.length),
+        },
+      };
+    });
     if (fresh.length === 0) return;
 
     bb.log.warn(
@@ -2795,11 +3699,19 @@ export default async function plugin(bb: BbPluginApi) {
       started.push(...names);
       launchTurn = row.turnId ?? row.id;
     }
-    const updated = await mutateState(threadId, (current) => ({
-      ...current,
-      lastSeq: Math.max(current.lastSeq, maxSeq),
-      seenRowIds: seen.slice(-MAX_SEEN_ROWS),
-    }));
+    const updated = await mutateState(threadId, (current) => {
+      const kept = seen.slice(-MAX_SEEN_ROWS);
+      return {
+        ...current,
+        lastSeq: Math.max(current.lastSeq, maxSeq),
+        seenRowIds: kept,
+        lost: {
+          violations: current.lost?.violations ?? 0,
+          delegations: current.lost?.delegations ?? 0,
+          seenRows: (current.lost?.seenRows ?? 0) + (seen.length - kept.length),
+        },
+      };
+    });
     if (started.length === 0 || updated === undefined) return;
     if (updated.lastNudgeTurnId === launchTurn || updated.nudgeCount >= settings.maxNudges) return;
     const names = [...new Set(started)].map((name) => `\`${name}\``).join(", ");
@@ -2933,7 +3845,1635 @@ export default async function plugin(bb: BbPluginApi) {
           : delegation,
       ),
     }));
+    // The session snapshot now names the model, which only exists once the
+    // worker has run; the spawn-time record has the provider alone.
+    if (isSettledStatus(status)) await recordResolved(owner, workerThreadId);
     await checkReviews(owner);
+  }
+
+  /**
+   * BB's current children of one orchestrator, read live. A child is current
+   * when BB's own list would show it: not archived, not deleted. Hidden threads
+   * count, because a hidden child still runs and still burns a slot.
+   *
+   * The count comes from `threads.list` with `includeHidden`, paged by
+   * `limit`/`offset`: `threads.count` accepts no `includeHidden`, so its total
+   * leaves every hidden child out. A short page ends the walk and makes the
+   * total exact. A read that fills every page is checked with one more row and
+   * answered as unavailable when that row exists, because a capped total would
+   * understate the tree. Any failed page does the same: a partial count would
+   * be a number nobody can act on, and the ledger is never substituted for it.
+   */
+  const childCountCache = new Map<string, { at: number; value: ChildCounts }>();
+  const childCountPending = new Map<string, Promise<ChildCounts>>();
+
+  async function readChildCounts(threadId: string): Promise<ChildCounts> {
+    const seen = new Set<string>();
+    let total = 0;
+    let running = 0;
+    const absorb = (children: Awaited<ReturnType<typeof bb.sdk.threads.list>>): void => {
+      for (const child of children) {
+        // The route already leaves archived and deleted threads out of a
+        // filtered read. A host that returns one anyway must not inflate the
+        // number the strip presents as fact.
+        if (child.archivedAt !== null || child.deletedAt !== null) continue;
+        // An offset read taken while a child is being created can repeat a row
+        // across the page boundary; the same thread is still one child.
+        if (seen.has(child.id)) continue;
+        seen.add(child.id);
+        total += 1;
+        if (RUNNING_CHILD_STATUS_SET.has(child.status)) running += 1;
+      }
+    };
+    for (let page = 0; page < CHILD_COUNT_MAX_PAGES; page += 1) {
+      const children = await bb.sdk.threads.list({
+        parentThreadId: threadId,
+        includeHidden: true,
+        archived: false,
+        limit: CHILD_COUNT_PAGE_SIZE,
+        offset: page * CHILD_COUNT_PAGE_SIZE,
+      });
+      absorb(children);
+      if (children.length < CHILD_COUNT_PAGE_SIZE) {
+        return { available: true, total, running, error: null };
+      }
+    }
+    // Every page was full. One row past the cap proves whether the walk stopped
+    // at the end of the tree or only at its budget.
+    const beyond = await bb.sdk.threads.list({
+      parentThreadId: threadId,
+      includeHidden: true,
+      archived: false,
+      limit: 1,
+      offset: CHILD_COUNT_MAX_PAGES * CHILD_COUNT_PAGE_SIZE,
+    });
+    const more = beyond.some((child) => child.archivedAt === null && child.deletedAt === null);
+    if (!more) return { available: true, total, running, error: null };
+    return {
+      available: false,
+      total: 0,
+      running: 0,
+      error: `BB lists more than ${CHILD_COUNT_MAX_PAGES * CHILD_COUNT_PAGE_SIZE} current children, so the count would be short`,
+    };
+  }
+
+  async function childCountsOf(threadId: string): Promise<ChildCounts> {
+    const cached = childCountCache.get(threadId);
+    if (cached !== undefined && Date.now() - cached.at < CHILD_COUNT_TTL_MS) return cached.value;
+    const pending = childCountPending.get(threadId);
+    if (pending !== undefined) return pending;
+    const read = (async (): Promise<ChildCounts> => {
+      try {
+        const value = await readChildCounts(threadId);
+        childCountCache.set(threadId, { at: Date.now(), value });
+        return value;
+      } catch (cause) {
+        // Cached like a success: a state read that fires per event must not turn
+        // a failing host into a query storm. The label says unknown either way.
+        const value: ChildCounts = {
+          available: false,
+          total: 0,
+          running: 0,
+          error: cause instanceof Error ? cause.message : String(cause),
+        };
+        childCountCache.set(threadId, { at: Date.now(), value });
+        return value;
+      } finally {
+        childCountPending.delete(threadId);
+      }
+    })();
+    childCountPending.set(threadId, read);
+    return read;
+  }
+
+  /**
+   * Bring every worker record that can still change up to date from BB. The
+   * `thread.idle`/`thread.failed` events cover waited-on workers, but a worker
+   * delegated with `waitForResult: false` may settle with no such event in this
+   * process; without this refresh it would count as running forever and hold a
+   * parallel slot it no longer uses. Only records that currently look running
+   * are read, so a settled ledger costs nothing.
+   */
+  async function refreshWorkerRecords(
+    threadId: string,
+    state: ThreadState | undefined,
+  ): Promise<ThreadState | undefined> {
+    if (state === undefined) return state;
+    const running = state.delegations.filter((delegation) => isRunningStatus(delegation.status));
+    if (running.length === 0) return state;
+    const read: ({ id: string; status: string; prior: string | null } | null)[] = await Promise.all(
+      running.map(async (delegation) => {
+        try {
+          const thread = await bb.sdk.threads.get({ threadId: delegation.threadId });
+          return { id: delegation.threadId, status: thread.status, prior: delegation.status };
+        } catch {
+          // A deleted or unreadable worker keeps its last known state.
+          return null;
+        }
+      }),
+    );
+    const changed = read.filter(
+      (entry): entry is { id: string; status: string; prior: string | null } =>
+        entry !== null && entry.status !== entry.prior,
+    );
+
+    if (changed.length === 0) return state;
+    const next = await mutateState(threadId, (current) => ({
+      ...current,
+      delegations: current.delegations.map((delegation) => {
+        const update = changed.find((entry) => entry.id === delegation.threadId);
+        return update === undefined ? delegation : { ...delegation, status: update.status };
+      }),
+    }));
+    for (const entry of changed) {
+      if (!isRunningStatus(entry.status)) await recordResolved(threadId, entry.id);
+    }
+    // Read the records back: `recordResolved` wrote after `next` was captured.
+    return (await getState(threadId)) ?? next ?? state;
+  }
+
+  /**
+   * A cycle reachable from the requested dependencies, as the path that closes
+   * it, or null. The recorded graph is the authority: an edge is a delegation's
+   * `after` list, and a node revisited on the current path is the cycle.
+   */
+  function findDependencyCycle(
+    delegations: readonly Delegation[],
+    requested: readonly string[],
+  ): string[] | null {
+    const edges = new Map<string, readonly string[]>();
+    for (const delegation of delegations) {
+      edges.set(delegation.threadId, delegation.after ?? []);
+    }
+    const settledNodes = new Set<string>();
+    const visit = (id: string, path: readonly string[]): string[] | null => {
+      const at = path.indexOf(id);
+      if (at >= 0) return [...path.slice(at), id];
+      if (settledNodes.has(id)) return null;
+      settledNodes.add(id);
+      const next = [...path, id];
+      for (const dependency of edges.get(id) ?? []) {
+        const found = visit(dependency, next);
+        if (found !== null) return found;
+      }
+      return null;
+    };
+    for (const id of requested) {
+      const found = visit(id, []);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+
+  /**
+   * A poll slice for a worker that is still running. `threads.wait` holds until
+   * the deadline, so a stall check needs the wait broken into slices.
+   */
+  const STALL_POLL_MS = 15_000;
+  /**
+   * How long a running worker may record no progress before the plugin treats
+   * it as stalled. Progress is an advance of the thread's own `updatedAt` or of
+   * its timeline sequence, so a provider turn that is genuinely reasoning is not
+   * steered while a hung turn is still caught; the window is deliberately
+   * longer than one slow model turn.
+   */
+  const STALL_WINDOW_MS = 300_000;
+  /**
+   * The resume message. It continues the same session and the same unit, so no
+   * second worker is spawned and no side effect is repeated; a stall resume is
+   * only ever sent to a worker whose status is `active` and whose thread has
+   * recorded no progress for the whole window.
+   */
+  const STALL_RESUME_TEXT =
+    "You appear to have stopped before finishing this unit. Continue from where you are, do not restart the work, and report what you ran and what you changed.";
+
+  interface SettledWorker {
+    status: string | null;
+    output: string | null;
+    /** Still working when the deadline passed. */
+    running: boolean;
+    /** Stopped waiting on a worker whose window elapsed with no resume budget left. */
+    stalled: boolean;
+    /** Resume messages this wait sent. The durable count includes them. */
+    resumes: number;
+  }
+
+  /**
+   * Take one resume from a worker's durable budget. The count lives on the
+   * delegation record and is claimed inside the same serialized mutation, so
+   * two waiters watching the same worker — its own settle and a dependent's
+   * `after` check — share one budget instead of one each.
+   */
+  async function claimStallResume(
+    ownerThreadId: string,
+    workerId: string,
+    maxResumes: number,
+  ): Promise<boolean> {
+    let claimed = false;
+    await mutateState(ownerThreadId, (current) => {
+      const delegation = current.delegations.find((entry) => entry.threadId === workerId);
+      if (delegation === undefined) return current;
+      const spent = delegation.stallResumes ?? 0;
+      if (spent >= maxResumes) return current;
+      claimed = true;
+      return {
+        ...current,
+        delegations: current.delegations.map((entry) =>
+          entry.threadId === workerId ? { ...entry, stallResumes: spent + 1 } : entry,
+        ),
+      };
+    });
+    return claimed;
+  }
+
+  /** The worker's timeline sequence: any advance is recorded progress. */
+  async function workerProgress(workerId: string): Promise<number> {
+    try {
+      const timeline = await bb.sdk.threads.timeline({ threadId: workerId });
+      const maxSeq = (timeline as { maxSeq?: unknown }).maxSeq;
+      return typeof maxSeq === "number" && Number.isFinite(maxSeq) ? maxSeq : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Wait for a worker's promise, but stop waiting when the tool call is
+   * cancelled. The wait itself is left to settle on its own: aborting is not
+   * permission to stop the worker, only to stop blocking the caller.
+   */
+  async function waitOrAbort(promise: Promise<unknown>, signal: AbortSignal | undefined): Promise<void> {
+    if (signal === undefined) {
+      await promise;
+      return;
+    }
+    if (signal.aborted) return;
+    let wake: (() => void) | undefined;
+    const aborted = new Promise<void>((resolve) => {
+      wake = () => resolve();
+      signal.addEventListener("abort", wake, { once: true });
+    });
+    try {
+      await Promise.race([promise.then(() => undefined, () => undefined), aborted]);
+    } finally {
+      if (wake !== undefined) signal.removeEventListener("abort", wake);
+    }
+  }
+
+  /**
+   * Wait for one worker, resuming it when it is genuinely stalled, and read what
+   * it said. A resume is sent only for `active` with no recorded progress for
+   * {@link STALL_WINDOW_MS}, at most `maxResumes` times across every waiter, and
+   * through `threads.send` on the same session: a stalled worker is continued,
+   * never duplicated, so its side effects are not repeated. Cancelling the tool
+   * call stops the wait and the resumes, never the worker.
+   */
+  async function waitForWorker(
+    workerId: string,
+    timeoutMs: number,
+    options: { ownerThreadId: string; maxResumes: number; signal?: AbortSignal },
+  ): Promise<SettledWorker> {
+    const deadline = Date.now() + timeoutMs;
+    const signal = options.signal;
+    let status: string | null = null;
+    let lastActivity = Date.now();
+    let lastUpdatedAt = 0;
+    let lastSeq = -1;
+    let resumes = 0;
+    let stalled = false;
+    while (true) {
+      const iterationStart = Date.now();
+      const remaining = deadline - Date.now();
+      if (remaining <= 0 || (signal !== undefined && signal.aborted)) break;
+      try {
+        await waitOrAbort(
+          bb.sdk.threads.wait({
+            threadId: workerId,
+            status: "idle",
+            timeoutMs: Math.min(remaining, STALL_POLL_MS),
+          }),
+          signal,
+        );
+      } catch {
+        // An errored thread rejects the wait instead of reaching idle, and a
+        // timeout lands here too. The status read below decides which.
+      }
+      if (signal !== undefined && signal.aborted) break;
+      let info: { status: string; updatedAt: number } | null = null;
+      try {
+        const thread = await bb.sdk.threads.get({ threadId: workerId });
+        info = { status: thread.status, updatedAt: thread.updatedAt };
+        status = thread.status;
+      } catch {
+        info = null;
+      }
+      if (status === null || status === "idle" || status === "error" || disposed) break;
+      if (info !== null && info.updatedAt > lastUpdatedAt) {
+        lastUpdatedAt = info.updatedAt;
+        lastActivity = Date.now();
+      }
+      // Only a live turn can be stalled; `starting` and `pending` are waiting on
+      // the machine, and `stopping` is on its way out. Timeline progress counts
+      // as progress even when `updatedAt` has not moved.
+      if (status === "active") {
+        const seq = await workerProgress(workerId);
+        if (seq > lastSeq) {
+          lastSeq = seq;
+          lastActivity = Date.now();
+        }
+      }
+      if (status === "active" && Date.now() - lastActivity >= STALL_WINDOW_MS) {
+        const claimed = await claimStallResume(options.ownerThreadId, workerId, options.maxResumes);
+        if (!claimed) {
+          stalled = true;
+          break;
+        }
+        try {
+          await bb.sdk.threads.send({
+            threadId: workerId,
+            mode: "auto",
+            input: [{ type: "text", text: STALL_RESUME_TEXT, mentions: [] }],
+          });
+          resumes += 1;
+          lastActivity = Date.now();
+          bb.log.warn(
+            `worker ${workerId} recorded no progress for ${Math.round(STALL_WINDOW_MS / 1000)}s; sent resume ${resumes} (budget ${options.maxResumes})`,
+          );
+        } catch (cause) {
+          bb.log.warn(`stall resume for ${workerId} failed: ${String(cause)}`);
+          break;
+        }
+      }
+      // A wait that resolved immediately — a rejected wait, or a host that
+      // returns at once — must not turn this into a spin. A real wait already
+      // spent its slice, so this only pauses the fast path.
+      if (Date.now() - iterationStart < 1_000) {
+        const pause = Math.min(5_000, Math.max(0, deadline - Date.now()));
+        if (pause > 0) {
+          await waitOrAbort(new Promise<void>((resolve) => setTimeout(resolve, pause)), signal);
+        }
+      }
+    }
+    if (status !== "idle" && status !== "error") {
+      try {
+        status = (await bb.sdk.threads.get({ threadId: workerId })).status;
+      } catch {
+        // Keep the last status read; it is still the most recent fact.
+      }
+    }
+    const running = status !== "idle" && status !== "error";
+    let output: string | null = null;
+    if (!running) {
+      try {
+        const result = await bb.sdk.threads.output({ threadId: workerId });
+        output = (result as { output?: string | null }).output ?? null;
+      } catch (cause) {
+        bb.log.warn(`worker output read failed for ${workerId}: ${String(cause)}`);
+      }
+    }
+    return { status, output, running, stalled, resumes };
+  }
+
+  /**
+   * What a worker actually ran on, read back from BB. The provider comes from
+   * the thread; the model comes from the provider session's snapshot, which is
+   * the only resolved-model field BB exposes. Reasoning level and service tier
+   * are reported by neither, so they are named as unreported rather than echoed
+   * from the request.
+   */
+  async function captureResolved(workerId: string): Promise<ResolvedExecution | null> {
+    let providerId: string | null = null;
+    try {
+      providerId = (await bb.sdk.threads.get({ threadId: workerId })).providerId ?? null;
+    } catch {
+      providerId = null;
+    }
+    let model: string | null = null;
+    try {
+      const context = await bb.sdk.threads.context({ threadId: workerId });
+      model = context.usage?.snapshot?.model ?? null;
+    } catch {
+      model = null;
+    }
+    if (providerId === null && model === null) return null;
+    return {
+      providerId,
+      model,
+      source: model === null ? "thread" : "session",
+      at: Date.now(),
+      unreported: ["reasoningLevel", "serviceTier"],
+    };
+  }
+
+  /** Store what a worker resolved to on its delegation record. */
+  async function recordResolved(ownerThreadId: string, workerId: string): Promise<void> {
+    const resolved = await captureResolved(workerId);
+    if (resolved === null) return;
+    await mutateState(ownerThreadId, (current) => ({
+      ...current,
+      delegations: current.delegations.map((delegation) =>
+        delegation.threadId === workerId ? { ...delegation, resolved } : delegation,
+      ),
+    }));
+  }
+
+  /** A stored execution record back in the shape `threads.spawn` takes. */
+  function executionFromRecord(record: Delegation["execution"]): WorkerExecution {
+    if (record === null || record === undefined) return {};
+    return {
+      ...(record.providerId === null ? {} : { providerId: record.providerId }),
+      ...(record.model === null ? {} : { model: record.model }),
+      ...(record.reasoningLevel === null || !isOneOf(REASONING_LEVELS, record.reasoningLevel)
+        ? {}
+        : { reasoningLevel: record.reasoningLevel }),
+      ...(record.serviceTier === null || !isOneOf(SERVICE_TIERS, record.serviceTier)
+        ? {}
+        : { serviceTier: record.serviceTier }),
+      ...(record.permissionMode === null || !isOneOf(PERMISSION_MODES, record.permissionMode)
+        ? {}
+        : { permissionMode: record.permissionMode }),
+    };
+  }
+
+  /** How long a rejection-driven revision is waited on. The same 900 s a delegation defaults to. */
+  const REVISION_WAIT_MS = 900_000;
+
+  /** Recovery checks one unit may spend. Each one is a whole worker, so this is small. */
+  const MAX_CHECK_ATTEMPTS = 2;
+
+  /**
+   * How long a check claim holds before another run may take the unit over: long
+   * enough for a checker to report within its own wait, short enough that a
+   * checker that died without reporting cannot wedge the unit.
+   */
+  const CHECK_CLAIM_TTL_MS = REVISION_WAIT_MS + 120_000;
+
+  /** Distinguishes two claims taken in the same millisecond. */
+  let checkTokenSeq = 0;
+
+  /**
+   * Store a check's result on the unit it inspected, and mark the checker it came
+   * from as settled, in one write. Acceptance and dependants both read this
+   * record, so a check that could not produce a verdict it can stand behind is
+   * stored as `rejected` with `problem` naming why: silence must never read as a
+   * pass. `checkerId` is the check unit that produced it; a write from a checker
+   * a newer attempt replaced is refused, so a stale pass cannot undo a newer
+   * failure. Returns whether the result was stored.
+   */
+  async function storeCheckFor(
+    ownerThreadId: string,
+    workerId: string,
+    checkerId: string | undefined,
+    verdict: ReviewVerdict,
+    report: string,
+    problem: string | null,
+    checkerStatus?: string | null,
+  ): Promise<boolean> {
+    let stored = false;
+    await mutateState(ownerThreadId, (current) => {
+      const unit = current.delegations.find((delegation) => delegation.threadId === workerId);
+      if (unit === undefined || !checkWriteAllowed(unit.verifiedBy, checkerId)) return current;
+      stored = true;
+      return {
+        ...current,
+        delegations: current.delegations.map((delegation) => {
+          if (delegation.threadId === workerId) {
+            return {
+              ...delegation,
+              check: {
+                verdict,
+                detail: report.slice(0, 4_000),
+                at: Date.now(),
+                ...(problem === null ? {} : { problem }),
+              },
+              // The claim ends with the result it was held for. The binding stays,
+              // so a superseded checker's late write is still refused.
+              checkClaim: null,
+            };
+          }
+          // A checker that has settled stops counting as running, in the same
+          // write that stores what it found.
+          if (
+            checkerId !== undefined &&
+            delegation.threadId === checkerId &&
+            checkerStatus !== undefined &&
+            checkerStatus !== null
+          ) {
+            return { ...delegation, status: checkerStatus };
+          }
+          return delegation;
+        }),
+      };
+    });
+    return stored;
+  }
+
+  /** A recovery check this process has reserved, before its worker exists. */
+  interface CheckReservation {
+    /** The claim this run holds until its verdict is stored. */
+    token: string;
+    /** The attempt number this run spends. */
+    attempt: number;
+  }
+
+  /**
+   * Take a unit's one check slot before its worker starts. The eligibility rules,
+   * the attempt budget and the write happen in one serialized mutation, so two
+   * concurrent calls cannot both see a free unit and both spawn a checker, and a
+   * claim from a live checker blocks a second one. Refusals are returned as text
+   * because they are the orchestrator's correction, not an internal failure.
+   */
+  async function reserveCheck(
+    ownerThreadId: string,
+    unitId: string,
+    liveStatus: string | null,
+  ): Promise<CheckReservation | { refuse: string }> {
+    // An expired claim is not assumed dead: reconcile it against the checker BB
+    // knows before another one may start. This costs a read only once a claim
+    // has actually outlived its TTL.
+    const stale = await reconcileStaleClaim(ownerThreadId, unitId);
+    if (stale !== null) return { refuse: stale };
+    const token = `check-${Date.now().toString(36)}-${(checkTokenSeq += 1).toString(36)}`;
+    let outcome: CheckReservation | { refuse: string } | null = null;
+    await mutateState(ownerThreadId, (current) => {
+      const unit = current.delegations.find((entry) => entry.threadId === unitId);
+      if (unit === undefined) {
+        outcome = { refuse: `This thread has no worker ${unitId}.` };
+        return current;
+      }
+      const claim = unit.checkClaim ?? null;
+      if (claim !== null && Date.now() - claim.at < CHECK_CLAIM_TTL_MS) {
+        outcome = {
+          refuse: `Worker ${unitId} already has a check in flight (${claim.token}), so no second one was started. Wait for it to finish; an expired claim is reconciled against its checker rather than duplicated.`,
+        };
+        return current;
+      }
+      const checker = current.delegations.find(
+        (entry) => entry.verifierFor === unitId && isRunningStatus(entry.status),
+      );
+      if (checker !== undefined) {
+        outcome = {
+          refuse: `A check unit for ${unitId} is still running (${checker.threadId}), so no second one was started. Wait for it to settle.`,
+        };
+        return current;
+      }
+      if (liveStatus === "error" || unit.status === "error") {
+        outcome = {
+          refuse: `Worker ${unitId} ended in error, so there is no finished work to check and nothing may be accepted on its behalf. Re-delegate the unit instead.`,
+        };
+        return current;
+      }
+      if (isRunningStatus(liveStatus) || isRunningStatus(unit.status)) {
+        outcome = {
+          refuse: `Worker ${unitId} is still running (${liveStatus ?? unit.status ?? "unknown"}). Wait for it to settle, then run its check.`,
+        };
+        return current;
+      }
+      const resolved = resolvedByOf(unit, current.delegations);
+      if (resolved !== null) {
+        outcome = {
+          refuse: `This unit's chain was already settled by ${resolved}, so its earlier failed check is a fixed finding and is not re-rolled. Reject the unit to have it revised again within the budget.`,
+        };
+        return current;
+      }
+      const spent = unit.checkAttempts ?? 0;
+      if (spent >= MAX_CHECK_ATTEMPTS) {
+        outcome = {
+          refuse: `Worker ${unitId} has spent its ${MAX_CHECK_ATTEMPTS} check attempts, so no further check was started. Re-delegate the unit, or judge its output with \`orchestrator_review\`.`,
+        };
+        return current;
+      }
+      outcome = { token, attempt: spent + 1 };
+      return {
+        ...current,
+        delegations: current.delegations.map((entry) =>
+          entry.threadId === unitId
+            ? { ...entry, checkAttempts: spent + 1, checkClaim: { token, at: Date.now() } }
+            : entry,
+        ),
+      };
+    });
+    return outcome ?? { refuse: `Worker ${unitId} could not be checked.` };
+  }
+
+  /**
+   * Take only the unit's exclusive claim, for a check whose attempt budget and
+   * eligibility its caller already settled (a revision runs its own check right
+   * after it starts). The claim is what a recovery call sees in flight, so the
+   * two cannot both start a checker for one unit. Returns the refusal text, or
+   * null when the claim was taken.
+   */
+  async function claimCheck(
+    ownerThreadId: string,
+    unitId: string,
+    token: string,
+  ): Promise<string | null> {
+    // Same rule as a reservation: a stale claim is resolved against its checker,
+    // never simply taken over.
+    const stale = await reconcileStaleClaim(ownerThreadId, unitId);
+    if (stale !== null) return stale;
+    let refusal: string | null = null;
+    await mutateState(ownerThreadId, (current) => {
+      const unit = current.delegations.find((entry) => entry.threadId === unitId);
+      if (unit === undefined) return current;
+      const claim = unit.checkClaim ?? null;
+      if (claim !== null && Date.now() - claim.at < CHECK_CLAIM_TTL_MS) {
+        refusal = `Worker ${unitId} already has a check in flight (${claim.token}), so no second one was started. Wait for it to finish; an expired claim is reconciled against its checker rather than duplicated.`;
+        return current;
+      }
+      return {
+        ...current,
+        delegations: current.delegations.map((entry) =>
+          entry.threadId === unitId ? { ...entry, checkClaim: { token, at: Date.now() } } : entry,
+        ),
+      };
+    });
+    return refusal;
+  }
+
+  /**
+   * Hand back a check slot that never produced a check unit. The attempt is
+   * refunded because no worker ran; only the reservation this call made is
+   * removed, so a claim another call now holds is never cleared underneath it.
+   */
+  async function releaseCheck(
+    ownerThreadId: string,
+    unitId: string,
+    token: string,
+    refund: boolean,
+  ): Promise<void> {
+    try {
+      await mutateState(ownerThreadId, (current) => ({
+        ...current,
+        delegations: current.delegations.map((entry) =>
+          entry.threadId !== unitId || entry.checkClaim?.token !== token
+            ? entry
+            : {
+                ...entry,
+                checkClaim: null,
+                ...(refund
+                  ? { checkAttempts: Math.max(0, (entry.checkAttempts ?? 1) - 1) }
+                  : {}),
+              },
+        ),
+      }));
+    } catch (cause) {
+      bb.log.warn(`check reservation for ${unitId} could not be released: ${String(cause)}`);
+    }
+  }
+
+  /** Whether a claim token is the reservation a run takes before its worker exists. */
+  function isReservationToken(token: string): boolean {
+    return token.startsWith("check-");
+  }
+
+  /**
+   * Name the checker thread on a unit's claim. Written on its own, before the
+   * ledger row, so the unit's owner is durable even when that larger write fails:
+   * an expired claim can then be resolved against the live thread instead of
+   * being mistaken for a dead reservation. Retried once, because losing the name
+   * is what lets a second checker start behind a live one.
+   */
+  async function holdClaim(
+    ownerThreadId: string,
+    unitId: string,
+    token: string,
+    checkerId: string,
+  ): Promise<boolean> {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await mutateState(ownerThreadId, (current) => ({
+          ...current,
+          delegations: current.delegations.map((entry) =>
+            entry.threadId === unitId
+              ? { ...entry, checkClaim: { token, at: Date.now(), threadId: checkerId } }
+              : entry,
+          ),
+        }));
+        return true;
+      } catch (cause) {
+        bb.log.warn(
+          `check claim for ${unitId} could not name ${checkerId} (attempt ${attempt + 1}): ${String(cause)}`,
+        );
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The unit each unrecorded child names as the one it inspects. A checker is
+   * spawned with `checkFor` in its own plugin metadata, which is definitive; a
+   * title is not. `null` means BB could not answer, which is not "no owner" — a
+   * caller must fall back to a rule that never attributes on a guess.
+   */
+  async function checkOwnersOf(
+    threadIds: readonly string[],
+  ): Promise<Map<string, string | null> | null> {
+    if (threadIds.length === 0) return new Map();
+    try {
+      const listed = await bb.sdk.threads.experimental_listPluginMetadata({
+        threadIds: [...threadIds],
+      });
+      const owners = new Map<string, string | null>();
+      for (const row of listed.threads) {
+        const owner = row.metadata["checkFor"];
+        owners.set(row.threadId, typeof owner === "string" ? owner : null);
+      }
+      return owners;
+    } catch (cause) {
+      // The metadata route is experimental, so a host that cannot answer must
+      // read as "unknown", never as "this checker belongs to nobody".
+      bb.log.warn(
+        `plugin metadata for ${threadIds.length} child thread(s) could not be read: ${String(cause)}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * The checker a reservation spawned but never recorded. Its own metadata is
+   * the only definitive owner: `null` means the run spawned none, and `"unknown"`
+   * means BB could not be read — neither releases a claim on a guess.
+   * `"ambiguous"` means more than one child could be it, and `"unattributed"`
+   * means the only match is by title while the metadata names no unit, so the
+   * caller refuses instead of adopting it: one unit's checker must never be
+   * stored as another's evidence.
+   */
+  async function findUnrecordedChecker(
+    ownerThreadId: string,
+    unit: Delegation,
+    since: number,
+  ): Promise<string | null | "unknown" | "ambiguous" | "unattributed"> {
+    let children: Awaited<ReturnType<typeof bb.sdk.threads.list>>;
+    try {
+      children = await bb.sdk.threads.list({
+        parentThreadId: ownerThreadId,
+        includeHidden: true,
+        limit: MAX_CHILD_THREADS,
+      });
+    } catch {
+      return "unknown";
+    }
+    // A full page may omit the checker; never release its claim on a partial list.
+    if (children.length >= MAX_CHILD_THREADS) return "unknown";
+    const recorded = new Set((await getState(ownerThreadId))?.delegations.map((entry) => entry.threadId) ?? []);
+    const unrecorded = children.filter(
+      (child) =>
+        typeof child.id === "string" &&
+        !recorded.has(child.id) &&
+        (typeof child.createdAt !== "number" || child.createdAt >= since),
+    );
+    if (unrecorded.length === 0) return null;
+    const owners = await checkOwnersOf(unrecorded.map((child) => child.id as string));
+    const title = `${unit.title} (check)`;
+    if (owners !== null) {
+      // `checkFor` is written at spawn, so it survives a ledger write that did
+      // not: it is the one field that says which unit a checker inspects.
+      const named = unrecorded.filter((child) => owners.get(child.id as string) === unit.threadId);
+      if (named.length === 1) return named[0]!.id;
+      if (named.length > 1) return "ambiguous";
+      // A readable namespace that names no unit is evidence too: a title-only
+      // match is some other unit's child, or a checker from before `checkFor`
+      // existed, and neither may be attributed to this unit.
+      return unrecorded.some((child) => child.title === title) ? "unattributed" : null;
+    }
+    // A title is not proof of ownership, even when only one child matches.
+    // Keep the claim until BB can provide the checker's metadata.
+    return unrecorded.filter((child) => child.title === title).length > 1 ? "ambiguous" : "unknown";
+  }
+
+  /**
+   * Resolve a check claim that has outlived its TTL before another check may take
+   * the unit, and answer with the refusal text when the unit must stay claimed.
+   *
+   * A claim names its checker as soon as BB spawns one, so expiry is never a
+   * guess: a checker that is still running keeps the unit and has its claim
+   * refreshed, a checker that settled records the result it actually produced
+   * (fail-closed when it left no verdict), and a read BB cannot answer refuses
+   * instead of starting a second worker. Only a claim whose run never produced a
+   * worker at all is released, so an unrecorded checker is never duplicated and
+   * its silence is never read as a pass. When two unrecorded children could be
+   * the checker, or a title-only match names no unit while the metadata route
+   * answers, the claim is refused rather than attributed by title: another
+   * unit's work must never become this unit's evidence.
+   */
+  async function reconcileStaleClaim(ownerThreadId: string, unitId: string): Promise<string | null> {
+    const unit = (await getState(ownerThreadId))?.delegations.find((entry) => entry.threadId === unitId);
+    const claim = unit?.checkClaim ?? null;
+    if (unit === undefined || claim === null) return null;
+    if (Date.now() - claim.at < CHECK_CLAIM_TTL_MS) return null;
+    let checkerId = claim.threadId ?? (isReservationToken(claim.token) ? null : claim.token);
+    if (checkerId === null) {
+      const found = await findUnrecordedChecker(ownerThreadId, unit, claim.at);
+      if (found === "unknown") {
+        return `Worker ${unitId} still holds check claim ${claim.token}, whose checker cannot be identified because BB's child list is incomplete or ownership metadata could not be read. No second check was started. Inspect the children of this thread, then retry.`;
+      }
+      if (found === "ambiguous") {
+        return `Worker ${unitId} still holds check claim ${claim.token}, and more than one unrecorded child could be its checker, so none was adopted: a title is not proof of which worker a check inspects. No second check was started. Inspect those threads, then judge worker ${unitId} with \`orchestrator_review\` yourself.`;
+      }
+      if (found === "unattributed") {
+        return `Worker ${unitId} still holds check claim ${claim.token}, and the only unrecorded child that matches its check title does not name this unit as the one it checks, so it was not adopted: a title is not proof of what a check inspects. No second check was started. Inspect that thread, then judge worker ${unitId} with \`orchestrator_review\` yourself.`;
+      }
+      if (found === null) {
+        // No worker was ever spawned, so releasing the reservation cannot
+        // orphan one. The attempt stays spent: the budget counts runs, not luck.
+        await releaseCheck(ownerThreadId, unitId, claim.token, false);
+        return null;
+      }
+      checkerId = found;
+      await holdClaim(ownerThreadId, unitId, claim.token, checkerId);
+    }
+    let status: string | null = null;
+    try {
+      status = (await bb.sdk.threads.get({ threadId: checkerId })).status ?? null;
+    } catch (cause) {
+      return `Worker ${unitId}'s check is ${checkerId}, whose status BB could not read (${String(cause)}), so no second check was started. Inspect that thread, then retry.`;
+    }
+    if (isRunningStatus(status)) {
+      await holdClaim(ownerThreadId, unitId, claim.token, checkerId);
+      return `The independent check for worker ${unitId} is still running as ${checkerId}, so no second check was started. Wait for it to settle.`;
+    }
+    let report = "";
+    try {
+      report = ((await bb.sdk.threads.output({ threadId: checkerId })).output ?? "").trim();
+    } catch (cause) {
+      bb.log.warn(`recovered check ${checkerId} for ${unitId} left its output unreadable: ${String(cause)}`);
+    }
+    // Bind the checker before its result, so the record names the checker it came
+    // from and a stale write from any other one is refused.
+    await mutateState(ownerThreadId, (current) => ({
+      ...current,
+      delegations: current.delegations.map((entry) =>
+        entry.threadId === unitId
+          ? {
+              ...entry,
+              verifiedBy: checkerId,
+              checkClaim: { token: claim.token, at: Date.now(), threadId: checkerId },
+            }
+          : entry,
+      ),
+    }));
+    const parsed = parseCheckVerdict(report);
+    const problem =
+      parsed.verdict === null ? (parsed.reasoning === "" ? "the check left no verdict" : parsed.reasoning) : null;
+    const stored = await storeCheckFor(
+      ownerThreadId,
+      unitId,
+      checkerId,
+      parsed.verdict ?? "rejected",
+      report,
+      problem,
+      status,
+    );
+    if (stored) {
+      // `since` keeps a resolution recorded after this checker started: only
+      // evidence newer than the check may overrule it.
+      await recordChainOutcome(ownerThreadId, unitId, parsed.verdict === "accepted" ? unitId : null, {
+        since: claim.at,
+      });
+      const found =
+        parsed.verdict === null
+          ? `left no verdict this plugin can trust (${problem}), so it counts as failed`
+          : `reported ${parsed.verdict === "accepted" ? "pass" : "fail"}`;
+      // Its result is now the unit's evidence, so nothing starts a second check
+      // for it. The caller is told what was recovered, not that a new check ran.
+      return `The independent check for worker ${unitId} had already run as ${checkerId}. Its result was recovered from that thread — it ${found} — so no second check was started.`;
+    }
+    // Another checker was bound while this one was read, so its result is not
+    // evidence for this unit. Nothing starts behind it either.
+    return `Worker ${unitId}'s check claim named ${checkerId}, whose result could not be recorded because a newer check owns the unit now. No second check was started.`;
+  }
+
+  /**
+   * Record a spawned check unit in its owner's ledger and bind it to the unit it
+   * inspects, in one mutation. One write means a failed record cannot leave a
+   * checker the ledger does not name; the caller keeps the check claim and its
+   * parallel slot when this returns false. Idempotent, so it can be retried.
+   */
+  async function bindCheck(
+    ownerThreadId: string,
+    unit: Delegation,
+    checker: { id: string; title: string; brief: string; environmentId: string | null },
+  ): Promise<boolean> {
+    try {
+      await mutateState(ownerThreadId, (current) => {
+        if (!current.delegations.some((entry) => entry.threadId === unit.threadId)) return current;
+        const known = current.delegations.some((entry) => entry.threadId === checker.id);
+        const next = known
+          ? current.delegations
+          : trimDelegations([
+              ...current.delegations,
+              {
+                threadId: checker.id,
+                title: checker.title,
+                task: checker.brief.slice(0, 20_000),
+                createdAt: Date.now(),
+                status: null,
+                verifierFor: unit.threadId,
+                verifiedBy: null,
+                verdict: null,
+                kind: "review" as const,
+                environmentId: checker.environmentId,
+                execution: unit.execution ?? null,
+              },
+            ]);
+        return {
+          ...current,
+          delegations: next.map((entry) =>
+            entry.threadId === unit.threadId
+              ? {
+                  ...entry,
+                  verifiedBy: checker.id,
+                  checkClaim: { token: checker.id, at: Date.now(), threadId: checker.id },
+                }
+              : entry,
+          ),
+          lost: {
+            violations: current.lost?.violations ?? 0,
+            seenRows: current.lost?.seenRows ?? 0,
+            delegations:
+              (current.lost?.delegations ?? 0) +
+              Math.max(0, current.delegations.length + (known ? 0 : 1) - next.length),
+          },
+        };
+      });
+    } catch (cause) {
+      bb.log.warn(`check unit ${checker.id} could not be recorded for ${unit.threadId}: ${String(cause)}`);
+      return false;
+    }
+    // The checker's own row names its owner, which is what a scan uses to keep it
+    // visible. It does not gate a duplicate check, so a failure here is logged.
+    try {
+      await mutateState(checker.id, (current) => ({ ...current, workerOf: ownerThreadId }));
+    } catch (cause) {
+      bb.log.warn(`check unit ${checker.id} could not be linked to ${ownerThreadId}: ${String(cause)}`);
+    }
+    return true;
+  }
+
+  /** What one independent check run produced, and the text to hand the orchestrator. */
+  interface IndependentCheck {
+    /** The check unit's thread id, when one was spawned at all. */
+    id: string | null;
+    /** The parsed verdict, or null when no trustworthy one was stored. */
+    verdict: ReviewVerdict | null;
+    /** The check's report, used as the reviewer's notes for a further revision. */
+    report: string;
+    /** The check never stored a verdict, so the unit is still pending one. */
+    pending: boolean;
+    /** Text appended to whatever report the caller is building. */
+    text: string;
+  }
+
+  /**
+   * Run one unit's independent check outside the delegation call that created
+   * it. A manual rejection revises a unit from the review path, and a call that
+   * was cancelled before its check started leaves a unit that still needs one;
+   * both come through here. A check that cannot be started or finished stores no
+   * verdict, so the record stays honestly pending and `orchestrator_check` can
+   * run it later. A cancelled call never starts a worker.
+   *
+   * `check` is set by a recovery run: its reservation has already spent one
+   * attempt and holds the unit's claim, and an orchestrator-requested check
+   * counts against the turn it was asked in.
+   */
+  async function runIndependentCheck(
+    ownerThreadId: string,
+    unit: Delegation,
+    workerOutput: string | null,
+    options: {
+      projectId: string;
+      signal?: AbortSignal;
+      check?: { token: string; countPerTurn: boolean };
+    },
+  ): Promise<IndependentCheck> {
+    const retry = "Run `orchestrator_check` for it once it is idle.";
+    const notRun = (why: string): IndependentCheck => ({
+      id: null,
+      verdict: null,
+      report: "",
+      pending: true,
+      text: `\n\nNo independent check ran (${why}), so worker ${unit.threadId} stays pending its check. ${retry}`,
+    });
+    // A reservation that never became a worker hands its attempt back, so a
+    // refusal or a cancellation cannot burn the unit's check budget. A check the
+    // revision path starts holds its own claim instead, which is released
+    // without refunding an attempt it never spent.
+    let claimToken: string | null = options.check?.token ?? null;
+    const refundAttempt = options.check !== undefined;
+    const abandoned = async (why: string): Promise<IndependentCheck> => {
+      if (claimToken !== null) {
+        await releaseCheck(ownerThreadId, unit.threadId, claimToken, refundAttempt);
+      }
+      return notRun(why);
+    };
+    if (disposed || (options.signal !== undefined && options.signal.aborted)) {
+      return await abandoned("the call was cancelled");
+    }
+    // The revision path has no caller-side reservation, so the claim is taken
+    // here — before any budget call or spawn — and a concurrent recovery sees it
+    // in flight instead of starting a second checker for the same revision.
+    if (options.check === undefined) {
+      const token = `check-${Date.now().toString(36)}-${(checkTokenSeq += 1).toString(36)}`;
+      const refusal = await claimCheck(ownerThreadId, unit.threadId, token);
+      if (refusal !== null) return notRun(refusal);
+      claimToken = token;
+    }
+    const settings = settingsFor(options.projectId);
+    const countPerTurn = options.check?.countPerTurn === true;
+    const exec = executionFromRecord(unit.execution);
+    const brief = buildVerifierBrief({ task: unit.task, workerTitle: unit.title, workerOutput });
+    // One check is one more worker, so the fan-out cap bounds it too. No claim
+    // is held when this refuses, so nothing has to be handed back.
+    try {
+      await assertWithinBudget(ownerThreadId, countPerTurn, options.projectId);
+    } catch (cause) {
+      return await abandoned(cause instanceof Error ? cause.message : String(cause));
+    }
+    // A cancellation that landed while the slot was being taken must not start
+    // a worker; both slots go back.
+    if (disposed || (options.signal !== undefined && options.signal.aborted)) {
+      releaseClaim(ownerThreadId, countPerTurn);
+      return await abandoned("the call was cancelled while its check was being set up");
+    }
+    let verifierId: string;
+    let tracked = false;
+    try {
+      const thread = await bb.sdk.threads.spawn({
+        projectId: options.projectId,
+        parentThreadId: ownerThreadId,
+        title: `${unit.title} (check)`,
+        prompt: brief,
+        ...exec,
+        ...(Object.keys(exec).length === 0 ? {} : { executionInputSources: executionSources(exec) }),
+        // `checkFor` is definitive ownership, written before the ledger row, so a
+        // failed record leaves BB able to say which unit this checker inspects.
+        pluginMetadata: { workerFor: ownerThreadId, checkFor: unit.threadId },
+        environment:
+          unit.environmentId === null || unit.environmentId === undefined
+            ? { type: "project-default" }
+            : { type: "reuse", environmentId: unit.environmentId },
+      });
+      verifierId = thread.id;
+      // Name the checker on the unit's claim before the larger ledger write:
+      // the claim survives a failed record and is what a later call reconciles
+      // against, so a live checker is never mistaken for a dead reservation.
+      if (claimToken !== null) {
+        await holdClaim(ownerThreadId, unit.threadId, claimToken, thread.id);
+      }
+      // One retry: a single failed ledger write must not leave a checker the
+      // ledger does not name.
+      for (let attempt = 0; attempt < 2 && !tracked; attempt += 1) {
+        tracked = await bindCheck(ownerThreadId, unit, {
+          id: thread.id,
+          title: `${unit.title} (check)`,
+          brief,
+          environmentId: thread.environmentId ?? null,
+        });
+      }
+    } catch (cause) {
+      // The spawn itself failed, so no worker exists and both slots go back.
+      releaseClaim(ownerThreadId, countPerTurn);
+      bb.log.warn(`check unit for ${unit.threadId} could not start: ${String(cause)}`);
+      return await abandoned(String(cause));
+    }
+    if (!tracked) {
+      // The checker exists but the ledger does not name it. Its durable claim is
+      // what stops a second check, so the process-local reservation is not kept:
+      // one failed ledger write must not spend a parallel slot for the life of
+      // the process. It keeps counting while it runs, though, through the stray
+      // map, so releasing the reservation cannot let the cap be exceeded.
+      releaseClaim(ownerThreadId, countPerTurn);
+      strayCheckers.set(verifierId, { ownerThreadId, countPerTurn });
+      bb.log.warn(`check unit ${verifierId} for ${unit.threadId} is running unrecorded`);
+      return {
+        id: verifierId,
+        verdict: null,
+        report: "",
+        pending: true,
+        text: `\n\nCheck unit ${verifierId} started for worker ${unit.threadId}, but this thread's record could not be written, so it is not listed among the workers. It still counts against the parallel cap while it runs, and the unit stays claimed: do not start another check. Inspect ${verifierId} directly, and judge worker ${unit.threadId} yourself once it reports.`,
+      };
+    }
+    // Released only after the record lands, so the check counts against the cap
+    // from the moment it is visible.
+    releaseClaim(ownerThreadId, countPerTurn);
+    const checkStartedAt = Date.now();
+    const checked = await waitForWorker(verifierId, REVISION_WAIT_MS, {
+      ownerThreadId,
+      maxResumes: settings.maxStallResumes,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
+    const report = (checked.output ?? "").trim();
+    // A check still running has not reported, so storing anything for it would
+    // invent evidence. The record stays pending and the claim stays with it, so
+    // a second check cannot start while this one is still live.
+    if (checked.running) {
+      return {
+        id: verifierId,
+        verdict: null,
+        report,
+        pending: true,
+        text: `\n\nThe independent check for worker ${unit.threadId} is still running as ${verifierId}, so that unit stays pending its check. ${retry}`,
+      };
+    }
+    const parsed = parseCheckVerdict(report);
+    const passes = parsed.verdict === "accepted";
+    const problem =
+      parsed.verdict === null ? (parsed.reasoning === "" ? "the check left no verdict" : parsed.reasoning) : null;
+    const stored = await storeCheckFor(
+      ownerThreadId,
+      unit.threadId,
+      verifierId,
+      parsed.verdict ?? "rejected",
+      report,
+      problem,
+      checked.status,
+    );
+    if (!stored) {
+      // A newer attempt owns this unit now, so this result is not evidence for
+      // it. It was stored by the current check or not at all.
+      return {
+        id: verifierId,
+        verdict: parsed.verdict,
+        report,
+        pending: true,
+        text: `\n\nCheck unit ${verifierId} finished, but a newer check now owns worker ${unit.threadId}, so this result was not recorded. Its claim still decides that unit's check.`,
+      };
+    }
+    // A chain's outcome follows its latest check: a pass settles it, a fail
+    // takes the earlier resolution back. Recovery only runs for a chain that has
+    // no resolution, so a stale check cannot revoke a settled one.
+    await recordChainOutcome(ownerThreadId, unit.threadId, passes ? unit.threadId : null, {
+      since: checkStartedAt,
+    });
+    // The checker is evidence for this unit, so retention and the ledger keep it
+    // like any other check unit once it has reported.
+    try {
+      await recordResolved(ownerThreadId, verifierId);
+      await maybeArchive(ownerThreadId, verifierId);
+    } catch (cause) {
+      bb.log.warn(`check unit ${verifierId} could not be tidied up: ${String(cause)}`);
+    }
+    const verdictText =
+      parsed.verdict === null
+        ? `The check left no verdict this plugin can trust (${problem}), so it counts as failed.`
+        : `The check's verdict is ${passes ? "pass" : "fail"}.`;
+    const next =
+      passes
+        ? " This settles the chain: earlier attempts in it can be accepted and dependent units can start on it."
+        : " Reject this unit to have it revised again within the budget, or re-delegate it yourself.";
+    return {
+      id: verifierId,
+      verdict: parsed.verdict,
+      report,
+      pending: false,
+      text: `\n\nCheck unit ${verifierId} ran the same brief. ${verdictText}${next}${
+        report === ""
+          ? " It produced no final text, so its check is recorded as failed."
+          : `\n\n${report.length > 8_000 ? `${report.slice(0, 8_000)}\n\n[truncated]` : report}`
+      }`,
+    };
+  }
+
+  /**
+   * Run the independent check a unit is still waiting for. Only a record whose
+   * check never produced a verdict it can stand behind is eligible: a stored
+   * pass or fail is evidence, not something to re-roll.
+   */
+  async function recoverCheck(
+    ownerThreadId: string,
+    workerThreadId: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const state = await getState(ownerThreadId);
+    const unit = state?.delegations.find((entry) => entry.threadId === workerThreadId);
+    if (unit === undefined) {
+      throw new Error(`This thread has no worker ${workerThreadId}.`);
+    }
+    if (unit.verifierFor !== undefined) {
+      throw new Error(
+        `Worker ${workerThreadId} is itself a check unit: it is evidence for the unit it inspected, and is never checked itself.`,
+      );
+    }
+    if (unit.verify !== true) {
+      throw new Error(
+        `Worker ${workerThreadId} never asked for an independent check, so there is none to run. Judge it with \`orchestrator_review\`.`,
+      );
+    }
+    if (unit.check !== null && unit.check !== undefined && (unit.check.problem === null || unit.check.problem === undefined)) {
+      throw new Error(
+        `Worker ${workerThreadId} already has a check this plugin can trust (${unit.check.verdict}). Record a verdict on it, or reject it to have it revised.`,
+      );
+    }
+    let status = unit.status;
+    try {
+      status = (await bb.sdk.threads.get({ threadId: workerThreadId })).status;
+    } catch {
+      // The stored status is the last fact; running it on an unknown status is
+      // still bounded by the check unit's own wait.
+    }
+    if (isRunningStatus(status)) {
+      throw new Error(
+        `Worker ${workerThreadId} is still running (${status ?? "unknown"}). Wait for it to settle, then run its check.`,
+      );
+    }
+    if (status === "error") {
+      throw new Error(
+        `Worker ${workerThreadId} ended in error, so there is no finished work to check and nothing may be accepted on its behalf. Re-delegate the unit instead.`,
+      );
+    }
+    let output: string | null = null;
+    try {
+      output = (await bb.sdk.threads.output({ threadId: workerThreadId })).output ?? null;
+    } catch (cause) {
+      bb.log.warn(`worker output read failed for ${workerThreadId}: ${String(cause)}`);
+    }
+    const projectId =
+      (await projectOfThread(ownerThreadId)) ??
+      (await bb.sdk.threads.get({ threadId: ownerThreadId })).projectId;
+    // The slot is taken atomically, before any worker starts: a second call, or a
+    // check unit an earlier call left running, is refused instead of racing this
+    // one, and a chain a later revision settled is never re-rolled.
+    const reserved = await reserveCheck(ownerThreadId, workerThreadId, status);
+    if ("refuse" in reserved) throw new Error(reserved.refuse);
+    const check = await runIndependentCheck(ownerThreadId, unit, output, {
+      projectId,
+      check: { token: reserved.token, countPerTurn: true },
+      ...(signal === undefined ? {} : { signal }),
+    });
+    return check.text.trim();
+  }
+
+  /**
+   * The original unit a record belongs to: the root of its revision chain. A
+   * revision names its root when it is written; a record stored by an older build
+   * is followed through `revisionOf`, and one whose parent was trimmed is treated
+   * as its own root.
+   */
+  function chainRootOf(entry: Delegation, delegations: readonly Delegation[]): string {
+    if (entry.revisionRoot !== null && entry.revisionRoot !== undefined && entry.revisionRoot !== "") {
+      return entry.revisionRoot;
+    }
+    let current = entry;
+    const seen = new Set<string>([entry.threadId]);
+    for (;;) {
+      const parentId = current.revisionOf ?? null;
+      if (parentId === null || seen.has(parentId)) return current.threadId;
+      seen.add(parentId);
+      const parent = delegations.find((candidate) => candidate.threadId === parentId);
+      if (parent === undefined) return parentId;
+      current = parent;
+    }
+  }
+
+  function rootRecordOf(delegation: Delegation, delegations: readonly Delegation[]): Delegation {
+    const rootId = chainRootOf(delegation, delegations);
+    return delegations.find((entry) => entry.threadId === rootId) ?? delegation;
+  }
+
+  /**
+   * The revision that settled this chain, when one did: its own check passed or
+   * the orchestrator accepted it. A resolved chain is what turns the original's
+   * failed check into a fixed finding instead of a permanent refusal.
+   */
+  function resolvedByOf(delegation: Delegation, delegations: readonly Delegation[]): string | null {
+    return rootRecordOf(delegation, delegations).resolvedBy ?? null;
+  }
+
+  /**
+   * Why a worker cannot be accepted or used as a dependency, or null when its
+   * check passed or its chain was resolved by a later attempt. A check that left
+   * no usable verdict is stored as `rejected` with the reason in `problem`, so an
+   * unparseable report blocks instead of reading as success.
+   */
+  function checkBlockReason(delegation: Delegation, delegations: readonly Delegation[]): string | null {
+    const check = delegation.check;
+    if (check === null || check === undefined) {
+      // A unit that asked for an independent check and has no stored verdict is
+      // unverified, not passed: a call cancelled or a plugin disposed before the
+      // checker started leaves exactly this record. Reading it as success would
+      // let a later acceptance or dependent unit rely on a check that never ran.
+      return delegation.verify === true && resolvedByOf(delegation, delegations) === null
+        ? "its independent check never ran"
+        : null;
+    }
+    if (check.verdict === "accepted") return null;
+    if (resolvedByOf(delegation, delegations) !== null) return null;
+    return check.problem === null || check.problem === undefined
+      ? "it failed its independent check"
+      : `its independent check left no verdict this plugin can trust (${check.problem})`;
+  }
+
+  /**
+   * Record the chain's outcome on its root: the attempt whose own check passed or
+   * that the orchestrator accepted, or nothing when a later attempt failed.
+   * `undefined` leaves it alone, for a check that has not reported yet. `since`
+   * is when the check that is reporting started: a resolution recorded after it
+   * is newer evidence and is not taken back by a result from before it.
+   */
+  async function recordChainOutcome(
+    ownerThreadId: string,
+    workerId: string,
+    resolvedBy: string | null | undefined,
+    options: { since?: number } = {},
+  ): Promise<void> {
+    if (resolvedBy === undefined) return;
+    await mutateState(ownerThreadId, (current) => {
+      const worker = current.delegations.find((entry) => entry.threadId === workerId);
+      if (worker === undefined) return current;
+      const root = rootRecordOf(worker, current.delegations);
+      // The root's own passing check is the chain's own check: nothing to reconcile.
+      if (root.threadId === workerId && resolvedBy !== null) return current;
+      if ((root.resolvedBy ?? null) === resolvedBy) return current;
+      // A failure from a check that was already running when the chain was
+      // settled does not unsettle it: that resolution is the newer evidence.
+      if (
+        resolvedBy === null &&
+        root.resolvedBy !== null &&
+        root.resolvedBy !== undefined &&
+        options.since !== undefined &&
+        (root.resolvedAt ?? 0) > options.since
+      ) {
+        return current;
+      }
+      const resolvedAt = resolvedBy === null ? null : Date.now();
+      return {
+        ...current,
+        delegations: current.delegations.map((entry) =>
+          entry.threadId === root.threadId ? { ...entry, resolvedBy, resolvedAt } : entry,
+        ),
+      };
+    });
+  }
+
+  /**
+   * Take the next revision slot on a unit chain. The read, the budget check and
+   * the increment happen inside one serialized mutation, so two concurrent
+   * rejections cannot both see the same spent count. The count lives on the
+   * chain's root, so an automatic check-driven revision, a later manual rejection
+   * of any member, and a revision of a revision all spend one budget. Returns the
+   * chain depth — revisions now spent — and the root it was claimed on, or null
+   * when the cap is already reached. A claim also clears the chain's resolution:
+   * the outcome is unsettled until an attempt passes its check or is accepted.
+   */
+  async function claimRevision(
+    ownerThreadId: string,
+    parentThreadId: string,
+    maxRevisions: number,
+  ): Promise<{
+    depth: number;
+    rootId: string;
+    previousResolvedBy: string | null;
+    previousResolvedAt: number | null;
+  } | null> {
+    let claim: {
+      depth: number;
+      rootId: string;
+      previousResolvedBy: string | null;
+      previousResolvedAt: number | null;
+    } | null = null;
+    await mutateState(ownerThreadId, (current) => {
+      const parent = current.delegations.find((entry) => entry.threadId === parentThreadId);
+      if (parent === undefined) return current;
+      // A trimmed root still has a figure through the revision's own snapshot.
+      const root = rootRecordOf(parent, current.delegations);
+      const spent = root.revisions ?? parent.revisions ?? 0;
+      if (spent >= maxRevisions) return current;
+      const depth = spent + 1;
+      // Kept so a revision that never starts hands the chain's prior resolution
+      // back instead of leaving a settled chain permanently unsettled.
+      claim = {
+        depth,
+        rootId: root.threadId,
+        previousResolvedBy: root.resolvedBy ?? null,
+        previousResolvedAt: root.resolvedAt ?? null,
+      };
+      return {
+        ...current,
+        delegations: current.delegations.map((entry) =>
+          entry.threadId === root.threadId
+            ? { ...entry, revisions: depth, resolvedBy: null, resolvedAt: null }
+            : entry,
+        ),
+      };
+    });
+    return claim;
+  }
+
+  /**
+   * Hand a claimed revision slot back when the revision never started, and
+   * restore the chain resolution the claim cleared. The prior resolution is not
+   * restored when it was the rejected record itself: an explicit rejection of
+   * the attempt that settled a chain leaves it unsettled, which is what the
+   * rejection means. Nothing is restored over a resolution recorded meanwhile.
+   */
+  async function releaseRevision(
+    ownerThreadId: string,
+    parentThreadId: string,
+    previousResolvedBy: string | null = null,
+    previousResolvedAt: number | null = null,
+  ): Promise<void> {
+    await mutateState(ownerThreadId, (current) => {
+      const parent = current.delegations.find((entry) => entry.threadId === parentThreadId);
+      if (parent === undefined) return current;
+      const root = rootRecordOf(parent, current.delegations);
+      const restore =
+        previousResolvedBy !== null &&
+        previousResolvedBy !== parent.threadId &&
+        (root.resolvedBy ?? null) === null;
+      return {
+        ...current,
+        delegations: current.delegations.map((entry) =>
+          entry.threadId === root.threadId
+            ? {
+                ...entry,
+                revisions: Math.max(0, (entry.revisions ?? 0) - 1),
+                ...(restore ? { resolvedBy: previousResolvedBy, resolvedAt: previousResolvedAt } : {}),
+              }
+            : entry,
+        ),
+      };
+    });
+  }
+
+  /**
+   * Re-delegate a rejected build unit on its recorded execution, carrying the
+   * reviewer's notes into the brief. Bounded by the scope's revision budget and
+   * by the unit's own record of what it has already spent, so a rejection cannot
+   * turn into a loop; bounded by the fan-out cap as well, because a revision is
+   * still a running worker. Returns the text to append to the verdict, or ""
+   * when no revision was warranted.
+   */
+  async function reviseRejected(
+    ownerThreadId: string,
+    delegation: Delegation,
+    notes: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    // The same rule the check loop uses: a build is checked by default, and any
+    // unit that asked for `verify: true` is revised on a rejection too. A unit
+    // outside that rule is told so instead of being refused in silence, which
+    // is what invited a duplicate delegation.
+    if (delegation.kind !== "build" && delegation.verify !== true) {
+      return "\nNo revision ran: this unit is not a build and has no independent check, so re-delegate it yourself with the findings.";
+    }
+    if (notes === undefined || notes.trim() === "") {
+      return "\nNo revision ran: record the reviewer's findings in `notes`, and a rejected build unit is re-delegated with them.";
+    }
+    const projectId =
+      (await projectOfThread(ownerThreadId)) ??
+      (await bb.sdk.threads.get({ threadId: ownerThreadId })).projectId;
+    const settings = settingsFor(projectId);
+    if (disposed || (signal !== undefined && signal.aborted)) {
+      return "\nNo revision ran: the review call was cancelled. Record the verdict again to re-delegate it.";
+    }
+    const claim = await claimRevision(ownerThreadId, delegation.threadId, settings.maxRevisions);
+    if (claim === null) {
+      return `\nNo revision ran: this unit has spent its ${settings.maxRevisions}-revision budget. Re-delegate the unit yourself with a new brief.`;
+    }
+    const depth = claim.depth;
+    const exec = executionFromRecord(delegation.execution);
+    // The rejected attempt did report: the orchestrator read that report and
+    // rejected it with `notes`. Telling the revision it reported nothing would
+    // make it guess at what already exists, so the final text is carried across
+    // (trimmed by the brief builder). Only the reason a read failed is logged —
+    // the report itself is worker text and may hold anything, so it never
+    // reaches a log line.
+    let previousOutput: string | null = null;
+    try {
+      previousOutput = (await bb.sdk.threads.output({ threadId: delegation.threadId })).output ?? null;
+    } catch (cause) {
+      bb.log.warn(
+        `the report of rejected worker ${delegation.threadId} could not be read: ${String(cause)}`,
+      );
+    }
+    const brief = buildRevisionBrief({
+      task: delegation.task,
+      workerTitle: delegation.title,
+      previousOutput,
+      notes: notes.trim(),
+    });
+    let spawned!: { id: string; environmentId: string | null };
+    let startedId: string | null = null;
+    // The revision consumes a parallel slot like any other worker, so the
+    // fan-out cap bounds it too.
+    try {
+      await assertWithinBudget(ownerThreadId, false, projectId);
+    } catch (cause) {
+      // No budget was checked against a held claim, so only the chain slot goes
+      // back.
+      await releaseRevision(ownerThreadId, delegation.threadId, claim.previousResolvedBy, claim.previousResolvedAt);
+      bb.log.warn(`revision for ${delegation.threadId} could not start: ${String(cause)}`);
+      return `\nNo revision ran: ${cause instanceof Error ? cause.message : String(cause)}`;
+    }
+    // A call cancelled while the slot was being claimed must not start a worker.
+    // Both slots go back here: the parallel claim taken above and the chain
+    // revision, which is why this return cannot be left to the later finally.
+    if (disposed || (signal !== undefined && signal.aborted)) {
+      releaseClaim(ownerThreadId, false);
+      await releaseRevision(ownerThreadId, delegation.threadId, claim.previousResolvedBy, claim.previousResolvedAt);
+      return `\nNo revision ran: the review call was cancelled while revision ${depth} was being set up. Record the verdict again to re-delegate it.`;
+    }
+    try {
+      const args: Parameters<typeof bb.sdk.threads.spawn>[0] = {
+        projectId,
+        parentThreadId: ownerThreadId,
+        title: `${delegation.title} (revision ${depth})`,
+        prompt: brief,
+        ...exec,
+        ...(Object.keys(exec).length === 0 ? {} : { executionInputSources: executionSources(exec) }),
+        pluginMetadata: { workerFor: ownerThreadId },
+        // The unit's own checkout when it had one, so a revision continues the
+        // working tree it is fixing instead of opening a second one.
+        environment:
+          delegation.environmentId === null || delegation.environmentId === undefined
+            ? { type: "project-default" }
+            : { type: "reuse", environmentId: delegation.environmentId },
+      };
+      const thread = await bb.sdk.threads.spawn(args);
+      startedId = thread.id;
+      spawned = { id: thread.id, environmentId: thread.environmentId ?? null };
+      await mutateState(spawned.id, (current) => ({ ...current, workerOf: ownerThreadId }));
+      await mutateState(ownerThreadId, (current) => {
+        const next = trimDelegations([
+          ...current.delegations,
+          {
+            threadId: spawned.id,
+            title: `${delegation.title} (revision ${depth})`,
+            task: brief.slice(0, 20_000),
+            createdAt: Date.now(),
+            status: null,
+            revisionOf: delegation.threadId,
+            revisionRoot: claim.rootId,
+            revisions: depth,
+            ...(delegation.verify === true ? { verify: true } : {}),
+            kind: delegation.kind ?? ("build" as const),
+            environmentId: spawned.environmentId,
+            execution: delegation.execution ?? null,
+          },
+        ]);
+        return {
+          ...current,
+          delegations: next,
+          lost: {
+            violations: current.lost?.violations ?? 0,
+            seenRows: current.lost?.seenRows ?? 0,
+            delegations:
+              (current.lost?.delegations ?? 0) +
+              Math.max(0, current.delegations.length + 1 - next.length),
+          },
+        };
+      });
+    } catch (cause) {
+      // The revision never landed, so the chain slot is handed back and the
+      // reason is reported instead of thrown away.
+      await releaseRevision(ownerThreadId, delegation.threadId, claim.previousResolvedBy, claim.previousResolvedAt);
+      bb.log.warn(`revision for ${delegation.threadId} could not start: ${String(cause)}`);
+      const why = cause instanceof Error ? cause.message : String(cause);
+      return startedId === null
+        ? `\nNo revision ran: the revision worker could not start (${why}). Re-delegate the unit yourself.`
+        : `\nThe revision started as worker ${startedId} but could not be recorded (${why}). Check it before re-delegating.`;
+    } finally {
+      // Released only after the record lands, so a check queued in between sees
+      // the running revision instead of a free slot and passing at cap - 1.
+      releaseClaim(ownerThreadId, false);
+    }
+    const settled = await waitForWorker(spawned.id, REVISION_WAIT_MS, {
+      ownerThreadId,
+      maxResumes: settings.maxStallResumes,
+      ...(signal === undefined ? {} : { signal }),
+    });
+    await mutateState(ownerThreadId, (current) => ({
+      ...current,
+      delegations: current.delegations.map((entry) =>
+        entry.threadId === spawned.id ? { ...entry, status: settled.status } : entry,
+      ),
+    }));
+    await recordResolved(ownerThreadId, spawned.id);
+    const body = (settled.output ?? "").trim();
+    const head = `\n\nRe-delegated the rejected unit as revision ${depth}: worker ${spawned.id}${
+      settled.running ? " (still running)" : ` (status ${settled.status ?? "unknown"})`
+    }.`;
+    // The revision carries the unit's `verify: true`, so it owes an independent
+    // check of its own. Running it here is what keeps a manually revised unit
+    // acceptable: a record that asks for a check and never gets one is refused
+    // forever. A revision that has not finished leaves the check pending, which
+    // `orchestrator_check` can run once it settles.
+    const check =
+      settled.running || settled.status === "error"
+        ? null
+        : await runIndependentCheck(ownerThreadId, {
+            ...delegation,
+            threadId: spawned.id,
+            title: `${delegation.title} (revision ${depth})`,
+            task: brief.slice(0, 20_000),
+            environmentId: spawned.environmentId,
+          }, settled.output, { projectId, ...(signal === undefined ? {} : { signal }) });
+    const checkNote =
+      check !== null
+        ? check.text
+        : `\n\nThe revision is not finished, so its independent check has not run yet. Run \`orchestrator_check\` for ${spawned.id} once it settles; until then it cannot be accepted and no dependent unit may start on it.`;
+    return `${head}${checkNote}\n\n${body === "" ? "(the revision produced no final text; open it before you judge it)" : body.length > 8_000 ? `${body.slice(0, 8_000)}\n\n[truncated]` : body}`;
   }
 
   /**
@@ -2977,10 +5517,19 @@ export default async function plugin(bb: BbPluginApi) {
     await enqueue(async () => {
       const state = await getState(threadId);
       if (state === undefined) return;
+      // A checker whose ledger row never landed is still a running worker; it is
+      // counted here until BB reports it settled, so releasing its process-local
+      // slot did not bypass the cap either.
+      await pruneStrayCheckers(threadId, state);
+      const strays = [...strayCheckers.values()].filter((entry) => entry.ownerThreadId === threadId);
       const pending = pendingClaims.get(threadId) ?? { parallel: 0, turn: 0 };
       if (settings.maxParallelWorkers > 0) {
+        // A timed-out worker keeps its status (`active`), so counting only
+        // `null` let every delegation past a deadline escape the cap.
         const inFlight =
-          state.delegations.filter((delegation) => delegation.status === null).length + pending.parallel;
+          state.delegations.filter((delegation) => isRunningStatus(delegation.status)).length +
+          pending.parallel +
+          strays.length;
         if (inFlight >= settings.maxParallelWorkers) {
           throw new WorkerBudgetError(
             `${inFlight} workers are still running and this plugin caps parallel workers at ${settings.maxParallelWorkers}. Wait for one to finish, or raise maxParallelWorkers (0 removes the cap).`,
@@ -2996,7 +5545,9 @@ export default async function plugin(bb: BbPluginApi) {
         const enabledAtMs = state.enabledAt === null ? 0 : Date.parse(state.enabledAt);
         const since = Math.max(state.turnStartedAt, Number.isNaN(enabledAtMs) ? 0 : enabledAtMs);
         const thisTurn =
-          state.delegations.filter((delegation) => delegation.createdAt >= since).length + pending.turn;
+          state.delegations.filter((delegation) => delegation.createdAt >= since).length +
+          pending.turn +
+          strays.filter((entry) => entry.countPerTurn).length;
         if (thisTurn >= settings.maxDelegationsPerTurn) {
           throw new WorkerBudgetError(
             `This turn has delegated ${thisTurn} workers and this plugin caps a turn at ${settings.maxDelegationsPerTurn}. Fold what came back into a report, or raise maxDelegationsPerTurn (0 removes the cap).`,
@@ -3104,11 +5655,25 @@ export default async function plugin(bb: BbPluginApi) {
   // --- RPC -----------------------------------------------------------------
 
   bb.rpc.register(rpcContract, {
-    get_state: async ({ threadId }) =>
-      toDto(threadId, await getState(threadId), settingsFor(await projectOfThread(threadId))),
+    get_state: async ({ threadId }) => {
+      const state = await refreshWorkerRecords(threadId, await getState(threadId));
+      return toDto(
+        threadId,
+        state,
+        await childCountsOf(threadId),
+        settingsFor(await projectOfThread(threadId)),
+        retainedThreadCount(),
+      );
+    },
     set_enabled: async ({ threadId, enabled, enforcement }) => {
       const state = await setEnabled(threadId, enabled, enforcement ?? null);
-      return toDto(threadId, state, settingsFor(await projectOfThread(threadId)));
+      return toDto(
+        threadId,
+        state,
+        await childCountsOf(threadId),
+        settingsFor(await projectOfThread(threadId)),
+        retainedThreadCount(),
+      );
     },
     get_default: async () => ({ enabled: live.defaultForNewThreads }),
     set_default: async ({ enabled }) => ({ enabled: await setDefault(enabled) }),
@@ -3159,15 +5724,16 @@ export default async function plugin(bb: BbPluginApi) {
       return scopeSettings(projectId);
     },
     get_judge: async () => ({ configured: await judgeKeyConfigured() }),
-    set_judge_key: async ({ key }) => {
-      const trimmed = key === null ? "" : key.trim();
-      await judgeSettings.experimental_set({ judgeKey: trimmed === "" ? null : trimmed });
-      return { configured: trimmed !== "" };
-    },
     set_worker_execution: async (next) => setWorkerConfig(next),
     clear_violations: async ({ threadId }) => {
       const state = await clearViolations(threadId);
-      return toDto(threadId, state, settingsFor(await projectOfThread(threadId)));
+      return toDto(
+        threadId,
+        state,
+        await childCountsOf(threadId),
+        settingsFor(await projectOfThread(threadId)),
+        retainedThreadCount(),
+      );
     },
   });
 
@@ -3200,6 +5766,9 @@ export default async function plugin(bb: BbPluginApi) {
     "child-messages"?: "queued" | "immediate";
     "orchestrator-subagents"?: OrchestratorSubagentPolicy;
     "worker-subagents"?: WorkerSubagentPolicy;
+    "max-revisions"?: number;
+    "max-stall-resumes"?: number;
+    "judge-advisory"?: "on" | "off";
   }
 
   function settingsPatch(options: ScopeSettingsFlags): Partial<OrchestratorSettings> {
@@ -3230,6 +5799,13 @@ export default async function plugin(bb: BbPluginApi) {
       ...(options["worker-subagents"] === undefined
         ? {}
         : { workerSubagents: options["worker-subagents"] }),
+      ...(options["max-revisions"] === undefined ? {} : { maxRevisions: options["max-revisions"] }),
+      ...(options["max-stall-resumes"] === undefined
+        ? {}
+        : { maxStallResumes: options["max-stall-resumes"] }),
+      ...(options["judge-advisory"] === undefined
+        ? {}
+        : { judgeAdvisory: options["judge-advisory"] === "on" }),
     };
   }
 
@@ -3250,6 +5826,60 @@ export default async function plugin(bb: BbPluginApi) {
     text: string,
   ): { exitCode: number; stdout: string } {
     return { exitCode: 0, stdout: json === true ? JSON.stringify(value, null, 2) : text };
+  }
+
+  /**
+   * Ask for the judge key in BB's own form, then store it through the one secret
+   * setting. The value exists only in the submitted result and this function's
+   * local: it is not an option, not a form payload field, not what the timeline
+   * row keeps, and not part of what this command prints.
+   *
+   * A cancellation writes nothing, so a key stored earlier survives it. Every
+   * refusal is a typed CLI failure rather than a quiet success.
+   */
+  async function setupJudgeKey(ctx: PluginCliContext): Promise<void> {
+    const threadId = ctx.threadId?.trim() ?? "";
+    if (threadId === "") {
+      throw new PluginCliError("setup-jev needs a bb thread to show the form in", {
+        code: "thread_required",
+        hint: "Run it from inside a bb thread, where the form renders in that thread's composer.",
+      });
+    }
+    if (ctx.signal?.aborted === true) {
+      throw new PluginCliError("the form was cancelled before it opened, so nothing was stored", {
+        code: "cancelled",
+      });
+    }
+    const configured = await judgeKeyConfigured();
+    const result = await bb.ui.requestInput(
+      {
+        threadId,
+        rendererId: SETUP_JEV_RENDERER,
+        title: "OpenRouter key for the advisory judge",
+        // Status only. The form receives no key, and nothing here is persisted
+        // verbatim anywhere the transcript can read it.
+        payload: { configured },
+        // BB stores this description before the settings write finishes. Do not
+        // claim the key was saved until the CLI returns successfully.
+        describeSubmission: (submitted) => {
+          readJudgeKey(submitted);
+          return {
+            title: "Judge key submitted",
+            detail: "Saving to a private file. The CLI result reports whether it succeeded.",
+          };
+        },
+      },
+      ctx.signal === undefined ? undefined : { signal: ctx.signal },
+    );
+    if (result.outcome === "cancelled") {
+      const reason = /^[a-z][a-z-]*$/.test(result.reason) ? result.reason : "cancelled";
+      throw new PluginCliError(`the form was cancelled (${reason}), so the stored key is unchanged`, {
+        code: "cancelled",
+      });
+    }
+    judgeStore.write(readJudgeKey(result.value));
+    judgeKeyPresent = true;
+    bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
   }
 
   /** The stored presets, one line each. */
@@ -3285,7 +5915,6 @@ export default async function plugin(bb: BbPluginApi) {
     threadId: string,
     state: OrchestratorStateDto,
     scope: { projectId: string; overridden: readonly string[] } | null = null,
-    retainedRows = 0,
   ): string {
     const lines = [
       `thread ${threadId}`,
@@ -3302,17 +5931,38 @@ export default async function plugin(bb: BbPluginApi) {
       `  fan-out cap:       ${
         state.maxParallelWorkers === 0 ? "none" : `${state.maxParallelWorkers} in flight`
       }, ${state.maxDelegationsPerTurn === 0 ? "none" : `${state.maxDelegationsPerTurn} per turn`}`,
-      `  threads retained:  ${retainedRows} in durable state (nothing is evicted)`,
+      `  children now:      ${
+        state.children.available
+          ? `${state.children.total} child thread${state.children.total === 1 ? "" : "s"}, ${state.children.running} running (read from BB)`
+          : `unknown: BB could not give an exact count (${state.children.error ?? "no reason reported"})`
+      }`,
+      `  ledger (history):  ${state.workers.total} delegations recorded, ${state.workers.settled} settled, ${state.workers.running} last recorded running, ${state.workers.waiting} waiting for a verdict`,
+      `  decisions:         ${state.workers.accepted} accepted, ${state.workers.rejected} rejected, ${state.workers.unconfirmed} with no confirmed execution`,
+      `  advisory judge:    ${state.judge.advisory ? (state.judge.configured ? "on" : "opt-in on, no key stored") : "off"}`,
+      `  threads retained:  ${state.retention.threads} in durable state (nothing is evicted)`,
+      `  record caps:       ${state.retention.caps.delegations} workers, ${state.retention.caps.violations} violations, ${state.retention.caps.seenRows} seen rows per thread`,
+      `  records dropped:   ${state.retention.lost.delegations} workers, ${state.retention.lost.violations} violations, ${state.retention.lost.seenRows} seen rows`,
     ];
     if (state.delegations.length > 0) {
       lines.push("  recent workers:");
       for (const delegation of state.delegations.slice(-5)) {
-        const run = delegation.execution
+        const requested = delegation.execution
           ? [delegation.execution.providerId, delegation.execution.model, delegation.execution.reasoningLevel, delegation.execution.serviceTier]
               .filter((part): part is string => typeof part === "string" && part !== "")
               .join(" ") || "inherited"
           : "inherited";
-        lines.push(`    - ${delegation.threadId}: ${run}`);
+        const resolved =
+          delegation.resolved === null || delegation.resolved === undefined
+            ? "not confirmed by BB"
+            : `${delegation.resolved.providerId ?? "?"} / ${delegation.resolved.model ?? "model not reported"} (${delegation.resolved.source})`;
+        const verdict =
+          delegation.verdict ??
+          (delegation.check?.verdict === "rejected"
+            ? delegation.resolvedBy === null || delegation.resolvedBy === undefined
+              ? "check failed"
+              : `check failed, fixed by ${delegation.resolvedBy}`
+            : "unjudged");
+        lines.push(`    - ${delegation.threadId} [${delegation.status ?? "unknown"}, ${verdict}]: asked ${requested}; ran ${resolved}`);
       }
     }
     if (state.violations.length > 0) {
@@ -3337,11 +5987,16 @@ export default async function plugin(bb: BbPluginApi) {
           async run(input, ctx) {
             const threadId = resolveThreadId(input.options.thread, ctx);
             const projectId = await projectOfThread(threadId);
-            const state = toDto(threadId, await getState(threadId), settingsFor(projectId));
+            const state = toDto(
+              threadId,
+              await getState(threadId),
+              await childCountsOf(threadId),
+              settingsFor(projectId),
+              retainedThreadCount(),
+            );
             const scope =
               projectId === null ? null : { projectId, overridden: Object.keys(projectSettings[projectId] ?? {}) };
-            const retained = countStateRows.get()?.n ?? 0;
-            return render(input.options.json, state, describeState(threadId, state, scope, retained));
+            return render(input.options.json, state, describeState(threadId, state, scope));
           },
         }),
         review: cliCommand({
@@ -3372,6 +6027,25 @@ export default async function plugin(bb: BbPluginApi) {
             return render(input.options.json, { message: text }, text);
           },
         }),
+        check: cliCommand({
+          summary: "Run a worker's pending independent check, for when the check tool is not loaded in this session",
+          options: {
+            worker: { type: "string", required: true, description: "The worker thread whose check has not run" },
+            json: { type: "boolean", description: "Emit machine-readable JSON" },
+          },
+          async run(input, ctx) {
+            // Same rule as review: the check runs for the calling orchestrator's
+            // own worker, never on another thread's ledger.
+            if (ctx.threadId === undefined || ctx.threadId === "") {
+              throw new PluginCliError("no thread to check from", {
+                code: "thread_required",
+                hint: "Run this inside the orchestrator's bb thread.",
+              });
+            }
+            const text = await recoverCheck(ctx.threadId, input.options.worker);
+            return render(input.options.json, { message: text }, text);
+          },
+        }),
         delegate: cliCommand({
           summary: "Delegate to a worker when the native tool is unavailable",
           options: {
@@ -3381,12 +6055,18 @@ export default async function plugin(bb: BbPluginApi) {
             provider: { type: "string", aliases: ["provider-id", "providerId"], description: "Pin the worker's registered provider before it starts (1–120 characters)" },
             model: { type: "string", description: "Pin the worker's model before it starts (1–200 characters)" },
             "no-wait": { type: "boolean", description: "Return immediately so other units can be delegated" },
+            verify: { type: "boolean", description: "Run an independent check after the worker finishes; cannot be combined with --no-wait" },
             timeout: { type: "integer", min: 10, max: 3600, description: "Wait timeout in seconds (default 900)" },
             hidden: { type: "boolean", description: "Keep the worker out of the sidebar" },
             workspace: {
               type: "enum",
               values: ["shared", "worktree"],
               description: "Where this unit runs: shared (the orchestrator's checkout) or worktree. Required when the scope's worker workspace is mixed",
+            },
+            kind: {
+              type: "enum",
+              values: [...WORKER_PRESETS],
+              description: "The unit kind: build, review or research. Picks the workspace under mixed and decides whether the unit is checked",
             },
           },
           async run(input, ctx) {
@@ -3408,9 +6088,11 @@ export default async function plugin(bb: BbPluginApi) {
               provider: input.options.provider,
               model: input.options.model,
               waitForResult: input.options["no-wait"] !== true,
+              verify: input.options.verify,
               timeoutSeconds: input.options.timeout,
               hidden: input.options.hidden,
               workspace: input.options.workspace,
+              kind: input.options.kind,
             });
             if (!parsed.success) {
               throw new PluginCliError("invalid delegation arguments", {
@@ -3443,7 +6125,13 @@ export default async function plugin(bb: BbPluginApi) {
                 : (input.options.enforcement as EnforcementLevel);
             const state = await setEnabled(threadId, true, enforcement);
             await syncMirror(threadId, true, state.enforcement);
-            const dto = toDto(threadId, state, settingsFor(await projectOfThread(threadId)));
+            const dto = toDto(
+              threadId,
+              state,
+              await childCountsOf(threadId),
+              settingsFor(await projectOfThread(threadId)),
+              retainedThreadCount(),
+            );
             return render(
               input.options.json,
               dto,
@@ -3458,7 +6146,13 @@ export default async function plugin(bb: BbPluginApi) {
           async run(input, ctx) {
             const threadId = resolveThreadId(input.options.thread, ctx);
             const state = await setEnabled(threadId, false, null);
-            const dto = toDto(threadId, state, settingsFor(await projectOfThread(threadId)));
+            const dto = toDto(
+              threadId,
+              state,
+              await childCountsOf(threadId),
+              settingsFor(await projectOfThread(threadId)),
+              retainedThreadCount(),
+            );
             return render(input.options.json, dto, `Orchestrator mode off for ${threadId}.`);
           },
         }),
@@ -3539,6 +6233,26 @@ export default async function plugin(bb: BbPluginApi) {
               values: [...ORCHESTRATOR_SUBAGENT_POLICIES],
               description:
                 "Write that scope's orchestrator subagent policy: none (the default) starts no subagents, all allows any identified subagent within existing authority",
+            },
+            "max-revisions": {
+              type: "integer",
+              min: 0,
+              max: 5,
+              description:
+                "Write that scope's revision budget: how many times one unit chain may be re-delegated after a failed check or a rejected review",
+            },
+            "max-stall-resumes": {
+              type: "integer",
+              min: 0,
+              max: 5,
+              description:
+                "Write that scope's stall budget: how many resume messages a worker with no timeline progress may receive before it is reported as stuck",
+            },
+            "judge-advisory": {
+              type: "enum",
+              values: ["on", "off"],
+              description:
+                "Opt in or out of sending minimized check evidence to the advisory judge; a stored key alone does not enable it",
             },
             "worker-subagents": {
               type: "enum",
@@ -3700,6 +6414,9 @@ export default async function plugin(bb: BbPluginApi) {
                 `  child messages:      ${values.childMessageDelivery}${view.overridden.includes("childMessageDelivery") ? " (project)" : " (global)"}`,
                 `  orchestrator subagents: ${values.orchestratorSubagents}${view.overridden.includes("orchestratorSubagents") ? " (project)" : " (global)"}`,
                 `  worker subagents:       ${values.workerSubagents}${view.overridden.includes("workerSubagents") ? " (project)" : " (global)"}`,
+                `  revisions per unit: ${values.maxRevisions}${view.overridden.includes("maxRevisions") ? " (project)" : " (global)"}`,
+                `  stall resumes:      ${values.maxStallResumes}${view.overridden.includes("maxStallResumes") ? " (project)" : " (global)"}`,
+                `  advisory judge:     ${values.judgeAdvisory ? "on" : "off"}${view.overridden.includes("judgeAdvisory") ? " (project)" : " (global)"}`,
                 `  workers run as:      ${view.worker}`,
                 `  project rules:       ${view.rules === null ? "inherits the global rules" : `${view.rules.length} characters`}`,
               ].join("\n"),
@@ -3755,7 +6472,13 @@ export default async function plugin(bb: BbPluginApi) {
               const state = await clearViolations(threadId);
               return render(
                 input.options.json,
-                toDto(threadId, state, settingsFor(await projectOfThread(threadId))),
+                toDto(
+                  threadId,
+                  state,
+                  await childCountsOf(threadId),
+                  settingsFor(await projectOfThread(threadId)),
+                  retainedThreadCount(),
+                ),
                 `Cleared for ${threadId}.`,
               );
             }
@@ -3794,6 +6517,20 @@ export default async function plugin(bb: BbPluginApi) {
             await setDefault(enabled);
             return render(input.options.json, { enabled }, 
               `New threads start in orchestrator mode: ${enabled ? "yes" : "no"}`);
+          },
+        }),
+        "setup-jev": cliCommand({
+          summary: "Store the advisory judge's OpenRouter key from a form, never from an argument",
+          description:
+            "Opens a password form in this thread's composer and saves what it submits to a private file. The key is never an argument, never printed and never kept in the transcript; cancelling leaves any stored key alone, and the advisory judge stays off until it is opted into for the scope.",
+          options: { json: { type: "boolean", description: "Emit machine-readable JSON" } },
+          async run(input, ctx) {
+            await setupJudgeKey(ctx);
+            return render(
+              input.options.json,
+              { configured: true },
+              "Judge key saved in a private file, never shown again. The advisory judge stays off until it is opted into for the scope.",
+            );
           },
         }),
         worker: cliCommand({
