@@ -9,9 +9,51 @@ import {
 } from "@get-bb/plugin-sdk/testing";
 import type { BbPluginApi, PluginSettingValue } from "@get-bb/plugin-sdk";
 import { REVIEW_TOOL } from "./shared";
-import plugin, { DELEGATE_TOOL, MAX_STATE_BYTES, type OrchestratorStateDto } from "./server";
+import plugin, { DELEGATE_TOOL, MAX_STATE_BYTES, judgeCheckVerdict, type OrchestratorStateDto } from "./server";
 import { writeMirror } from "./shared";
 import { CHILD_BATCH_WAIT_REASON } from "./child-message-queue";
+
+describe("the advisory judge", () => {
+  const reply = (content: string) =>
+    (async () => new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 })) as unknown as typeof fetch;
+
+  it("reads AGREE and DISAGREE with a rationale", async () => {
+    expect(await judgeCheckVerdict("k", "report", reply("AGREE The tests ran and passed."))).toEqual({
+      agrees: true,
+      rationale: "The tests ran and passed.",
+    });
+    expect(await judgeCheckVerdict("k", "report", reply("DISAGREE Nothing was run."))).toEqual({
+      agrees: false,
+      rationale: "Nothing was run.",
+    });
+  });
+
+  it("returns null when the answer has no AGREE or DISAGREE", async () => {
+    expect(await judgeCheckVerdict("k", "report", reply("maybe"))).toBeNull();
+  });
+
+  it("returns null when OpenRouter refuses or the network fails, so nothing blocks", async () => {
+    const refused = (async () => new Response("nope", { status: 401 })) as unknown as typeof fetch;
+    expect(await judgeCheckVerdict("k", "report", refused)).toBeNull();
+    const down = (async () => {
+      throw new Error("offline");
+    }) as unknown as typeof fetch;
+    expect(await judgeCheckVerdict("k", "report", down)).toBeNull();
+  });
+
+  it("sends the key as a bearer token and caps the report it reads at 4,000 characters", async () => {
+    let sent: { url: string; init: RequestInit } | null = null;
+    const capture = (async (url: string, init: RequestInit) => {
+      sent = { url, init };
+      return new Response(JSON.stringify({ choices: [{ message: { content: "AGREE ok" } }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    await judgeCheckVerdict("sk-test", "x".repeat(9_000), capture);
+    expect(sent!.url).toBe("https://openrouter.ai/api/v1/chat/completions");
+    expect((sent!.init.headers as Record<string, string>).Authorization).toBe("Bearer sk-test");
+    const body = JSON.parse(String(sent!.init.body)) as { messages: { content: string }[] };
+    expect(body.messages[1]!.content.length).toBe(4_000);
+  });
+});
 
 const THREAD = "th_orchestrator";
 const WORKER = "th_worker";
@@ -1744,10 +1786,17 @@ describe("the delegation tool", () => {
     expect(String(result)).toContain(WORKER);
 
     const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as {
-      delegations: { threadId: string; status: string | null }[];
+      delegations: { threadId: string; status: string | null; execution?: unknown }[];
     };
     expect(state.delegations).toHaveLength(1);
     expect(state.delegations[0]!.threadId).toBe(WORKER);
+    expect(state.delegations[0]!.execution).toEqual({
+      providerId: expect.any(String),
+      model: null,
+      reasoningLevel: null,
+      serviceTier: null,
+      permissionMode: null,
+    });
   });
 
   it.each(["provider", "providerId"])("pins %s and the model before starting a worker", async (field) => {
@@ -2150,6 +2199,112 @@ describe("the delegation tool", () => {
     expect(String(result)).toContain("th_first failed");
   });
 
+  it("resumes a failed worker once on its own execution when no fallback is set", async () => {
+    const { harness } = await load({}, undefined, CATALOG);
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+    });
+    await enable(harness);
+    twoWorkers(harness);
+    harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
+      makeThreadResponse({ id: threadId, status: threadId === "th_first" ? "error" : "idle" }),
+    );
+
+    const result = await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Rebuild the index" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    expect(spawned).toHaveLength(2);
+    expect(spawned[1]).toMatchObject({
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+    });
+    expect(String(result)).toContain("Re-delegated the same brief");
+  });
+
+  it("refuses a dependency that is not one of this orchestrator's workers", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    await expect(
+      harness.behavior.callAgentTool(
+        DELEGATE_TOOL,
+        { task: "Build the bundle", after: ["th_stranger"] },
+        { threadId: THREAD, projectId: "proj_1" },
+      ),
+    ).rejects.toThrow(/not this orchestrator's workers/);
+    expect(spawned).toHaveLength(0);
+  });
+
+  it("waits for each own dependency to be idle before spawning the dependent unit", async () => {
+    const { harness } = await load();
+    await enable(harness);
+    twoWorkers(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Fetch the feed", waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned).toHaveLength(1);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Index the feed", after: ["th_first"], waitForResult: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(harness.inspection.sdk.callsTo("threads.wait")).toEqual(
+      expect.arrayContaining([[expect.objectContaining({ threadId: "th_first", status: "idle" })]]),
+    );
+    expect(spawned).toHaveLength(2);
+  });
+
+  it("checks a build unit by default and reports the check's verdict as advice", async () => {
+    const { harness } = await load();
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      presets: { build: { model: "command-code/deepseek/deepseek-v4.1-flash-fast" } },
+    });
+    await enable(harness);
+    let started = 0;
+    harness.inspection.sdk.stub("threads.spawn", async (args) => {
+      spawned.push(args as unknown as Record<string, unknown>);
+      return makeThreadResponse({ id: started++ === 0 ? "th_unit" : "th_check", parentThreadId: THREAD });
+    });
+    harness.inspection.sdk.stub("threads.output", async ({ threadId }) => ({
+      output: threadId === "th_check" ? "ran tests: 2 failed\nVERDICT: fail the tests fail" : "changed the file",
+    }));
+
+    const result = await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Fix the parser", preset: "build" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+
+    expect(spawned).toHaveLength(2);
+    expect(String(result)).toContain("The check's verdict is fail. You still judge this unit with orchestrator_review.");
+    const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as OrchestratorStateDto;
+    expect(state.delegations[0]!.threadId).toBe("th_unit");
+    expect(state.delegations[0]!.verdict ?? null).toBeNull();
+  });
+
+  it("does not check a build unit that the orchestrator opted out of", async () => {
+    const { harness } = await load();
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      presets: { build: { model: "command-code/deepseek/deepseek-v4.1-flash-fast" } },
+    });
+    await enable(harness);
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Fix the parser", preset: "build", verify: false },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned).toHaveLength(1);
+  });
+
   it("lets a fallback without its own access inherit the worker's", async () => {
     const { harness } = await load({}, undefined, CATALOG);
     await harness.behavior.callRpc("set_worker_execution", {
@@ -2199,7 +2354,7 @@ describe("the delegation tool", () => {
     expect(String(result)).toContain("th_retry");
   });
 
-  it("does not retry a failed worker when no fallback is configured", async () => {
+  it("resumes a failed worker once when no fallback is configured, then reports the second failure", async () => {
     const harness = await armFallback(null);
     harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
       makeThreadResponse({ id: threadId, status: "error" }),
@@ -2211,8 +2366,8 @@ describe("the delegation tool", () => {
       { threadId: THREAD, projectId: "proj_1" },
     );
 
-    expect(spawned).toHaveLength(1);
-    expect(String(result)).toContain('status "error"');
+    expect(spawned).toHaveLength(2);
+    expect(String(result)).toContain("Re-delegated the same brief");
   });
 
   it("does not retry a worker that finished", async () => {
@@ -2497,6 +2652,39 @@ describe("the delegation tool", () => {
     expect(spawned[0]!.environment).toEqual({ type: "reuse", environmentId: "env_1" });
   });
 
+  it("picks the checkout from the unit kind under a mixed scope", async () => {
+    const { harness } = await load({ workerWorkspace: "mixed" });
+    await harness.behavior.callRpc("set_worker_execution", {
+      providerId: "acp-omp",
+      model: "command-code/deepseek/deepseek-v4.1-flash-fast",
+      presets: {
+        build: { model: "command-code/deepseek/deepseek-v4.1-flash-fast" },
+        review: { model: "command-code/deepseek/deepseek-v4.1-flash-fast" },
+      },
+    });
+    await enable(harness);
+    harness.inspection.sdk.stub("threads.spawn", async (args) => {
+      spawned.push(args as unknown as Record<string, unknown>);
+      return makeThreadResponse({ id: "th_unit", parentThreadId: THREAD, environmentId: "env_1" });
+    });
+
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Review the retry change", preset: "review" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned[0]!.environment).toEqual({ type: "reuse", environmentId: "env_1" });
+
+    await harness.behavior.callAgentTool(
+      DELEGATE_TOOL,
+      { task: "Implement the retry change", preset: "build" },
+      { threadId: THREAD, projectId: "proj_1" },
+    );
+    expect(spawned[1]!.environment).toMatchObject({
+      type: "host",
+      workspace: { type: "managed-worktree" },
+    });
+  });
   it("makes every delegation name its checkout under a mixed scope", async () => {
     const { harness } = await load({ workerWorkspace: "mixed" });
     await enable(harness);
@@ -2550,7 +2738,7 @@ describe("the delegation tool", () => {
     expect(sharedContract.text).not.toContain("worktree");
   });
 
-  it("does not check a worker that failed", async () => {
+  it("resumes a failed worker but does not check it", async () => {
     const { harness } = await load();
     await enable(harness);
     harness.inspection.sdk.stub("threads.get", async ({ threadId }) =>
@@ -2563,7 +2751,7 @@ describe("the delegation tool", () => {
       { threadId: THREAD, projectId: "proj_1" },
     );
 
-    expect(spawned).toHaveLength(1);
+    expect(spawned).toHaveLength(2);
   });
 
   it("hands the orchestrator a worker's failure reason", async () => {
@@ -2690,7 +2878,7 @@ describe("the delegation tool", () => {
 
     await harness.behavior.callAgentTool(
       DELEGATE_TOOL,
-      { task: "Add a retry to src/retry.ts", preset: "build" },
+      { task: "Add a retry to src/retry.ts", preset: "build", verify: false },
       { threadId: THREAD, projectId: "proj_1" },
     );
     expect(spawned[0]!.title).toBe("BUILD: Add a retry to src/retry.ts");
@@ -3878,6 +4066,20 @@ describe("cli", () => {
       expect(JSON.parse(result.stdout!).ok).toBe(false);
     }
     expect(spawned).toEqual([]);
+  });
+
+  it("stores the judge key without ever returning it", async () => {
+    const { harness } = await load();
+    expect(await harness.behavior.callRpc("get_judge", null)).toEqual({ configured: false });
+
+    const secret = "sk-or-test-0123456789";
+    expect(await harness.behavior.callRpc("set_judge_key", { key: secret })).toEqual({ configured: true });
+    expect(await harness.behavior.callRpc("get_judge", null)).toEqual({ configured: true });
+    // The key appears in no response the plugin gives back.
+    expect(JSON.stringify(await harness.behavior.callRpc("get_judge", null))).not.toContain(secret);
+    expect(JSON.stringify(await harness.behavior.callRpc("get_state", { threadId: THREAD }))).not.toContain(secret);
+
+    expect(await harness.behavior.callRpc("set_judge_key", { key: null })).toEqual({ configured: false });
   });
 
   it("turns the mode on and reports it", async () => {

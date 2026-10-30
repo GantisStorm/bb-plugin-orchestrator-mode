@@ -343,6 +343,25 @@ function ScopeSettings() {
   const [draft, setDraft] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [judge, setJudge] = useState<{ configured: boolean } | null>(null);
+  const [judgeDraft, setJudgeDraft] = useState("");
+
+  useEffect(() => {
+    void rpc.call("get_judge", null).then(setJudge).catch(() => setJudge(null));
+  }, [rpc]);
+
+  const saveJudgeKey = useCallback(
+    async (key: string | null) => {
+      setBusy(true);
+      try {
+        setJudge(await rpc.call("set_judge_key", { key }));
+        setJudgeDraft("");
+      } finally {
+        setBusy(false);
+      }
+    },
+    [rpc],
+  );
 
   const load = useCallback(async () => {
     try {
@@ -996,6 +1015,46 @@ function ScopeSettings() {
             Save rules
           </Button>
         </div>
+      </div>
+
+      <div className="mt-3 border-t border-border/60 pt-3">
+        <div className="text-sm font-medium">Advisory judge key</div>
+        <p className="mt-0.5 text-xs leading-snug text-subtle-foreground/75">
+          An OpenRouter key. When set, a build unit's check report also gets a second opinion from a model. It adds advice to the result and never records or blocks anything. The report is sent to OpenRouter. Stored by this plugin, never shown again.
+        </p>
+        <div className="mt-2 flex items-center gap-2">
+          <input
+            type="password"
+            autoComplete="off"
+            spellCheck={false}
+            value={judgeDraft}
+            disabled={loading || busy}
+            onChange={(event) => setJudgeDraft(event.target.value)}
+            placeholder={judge?.configured ? "A key is stored. Enter a new one to replace it." : "Paste your OpenRouter key"}
+            className="h-8 min-w-0 flex-1 rounded-md border border-border/60 bg-card px-2 text-xs text-foreground outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8 px-2 text-xs"
+            disabled={judgeDraft.trim() === "" || busy}
+            onClick={() => void saveJudgeKey(judgeDraft)}
+          >
+            Save key
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 px-2 text-xs"
+            disabled={judge?.configured !== true || busy}
+            onClick={() => void saveJudgeKey(null)}
+          >
+            Clear
+          </Button>
+        </div>
+        <p className="mt-1 text-xs text-subtle-foreground/75">
+          {judge === null ? "" : judge.configured ? "Judge on: a key is stored." : "Judge off: no key stored."}
+        </p>
       </div>
 
       <details className="mt-3 border-t border-border/60 pt-3">

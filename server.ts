@@ -114,6 +114,10 @@ const MAX_UNJUDGED_RETAINED = 200;
 
 /** Threads kept in the KV map before the least recently touched is dropped. */
 const MAX_THREADS = 300;
+/** KV key for the running count of threads the state map has dropped, shown by `status`. */
+const DROPS_KEY = "state-drops";
+/** KV key for the OpenRouter key the advisory judge uses. Stored here, never returned, logged or shown. */
+const JUDGE_KEY = "judge-key";
 /**
  * The KV map's byte ceiling, under BB's 262,144-byte value limit. A write past
  * that limit fails with an opaque store error and the toggle silently stays
@@ -137,6 +141,65 @@ const MAX_CHILD_THREADS = 200;
 const utf8Encoder = new TextEncoder();
 function byteLength(value: unknown): number {
   return utf8Encoder.encode(JSON.stringify(value) ?? "null").length;
+}
+
+export interface JudgeOpinion {
+  agrees: boolean;
+  rationale: string;
+}
+
+/**
+ * An advisory second opinion on a check unit's report, from an OpenRouter model.
+ * It only adds text to the result: it never records a verdict, blocks a unit or
+ * stops a turn. Any failure returns null, so a missing or broken judge changes
+ * nothing. The report it reads is sent to OpenRouter, capped at 4,000 characters.
+ */
+export async function judgeCheckVerdict(
+  key: string,
+  checkOutput: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<JudgeOpinion | null> {
+  try {
+    const response = await fetchImpl("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "typesafe/jev-1.13",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You read a checker's report on another worker's output. On the first line answer AGREE if the report shows the work was actually verified, or DISAGREE if it does not. Then give one sentence of reasoning.",
+          },
+          { role: "user", content: checkOutput.slice(0, 4_000) },
+        ],
+      }),
+    });
+    if (!response.ok) return null;
+    const body = (await response.json()) as { choices?: { message?: { content?: string } }[] };
+    const text = (body.choices?.[0]?.message?.content ?? "").trim();
+    const match = /^(AGREE|DISAGREE)\b[\s.:,-]*([\s\S]*)$/i.exec(text);
+    if (match === null) return null;
+    return { agrees: match[1]!.toUpperCase() === "AGREE", rationale: match[2]!.trim() };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The verdict a check unit ends with: `VERDICT: pass` or `VERDICT: fail` as its
+ * last such line. Null when the check left no verdict, so nothing is recorded
+ * on its behalf and the orchestrator reads the report itself.
+ */
+export function parseCheckVerdict(text: string): { verdict: ReviewVerdict; reasoning: string } | null {
+  let found: { verdict: ReviewVerdict; reasoning: string } | null = null;
+  for (const line of text.split("\n")) {
+    const match = /^\s*VERDICT:\s*(pass|fail)\b\s*[-—:.]?\s*(.*)$/i.exec(line);
+    if (match) {
+      found = { verdict: match[1]!.toLowerCase() === "pass" ? "accepted" : "rejected", reasoning: match[2]!.trim() };
+    }
+  }
+  return found;
 }
 
 export interface Delegation {
@@ -164,6 +227,14 @@ export interface Delegation {
    * `worktree` delegation left behind.
    */
   environmentId?: string | null;
+  /** The model, reasoning, tier and permission a worker was asked to run with. Null fields inherit the stored execution. */
+  execution?: {
+    providerId: string | null;
+    model: string | null;
+    reasoningLevel: string | null;
+    serviceTier: string | null;
+    permissionMode: string | null;
+  } | null;
 }
 
 export interface ThreadState {
@@ -222,6 +293,16 @@ const delegationSchema = z.object({
   reviewedAt: z.number().nullable().optional(),
   failure: z.string().nullable().optional(),
   environmentId: z.string().nullable().optional(),
+  execution: z
+    .object({
+      providerId: z.string().nullable(),
+      model: z.string().nullable(),
+      reasoningLevel: z.string().nullable(),
+      serviceTier: z.string().nullable(),
+      permissionMode: z.string().nullable(),
+    })
+    .nullable()
+    .optional(),
 });
 
 const violationSchema = z.object({
@@ -348,6 +429,9 @@ export type ScopeSettingsDto = z.infer<typeof scopeSettingsSchema>;
 const contractSchema = z.object({ text: z.string(), extra: z.string(), limit: z.number() });
 export type ContractDto = z.infer<typeof contractSchema>;
 
+/** Whether the advisory judge has a key. The key itself is never part of any response. */
+const judgeStatusSchema = z.object({ configured: z.boolean() }).strict();
+
 /** The shape every RPC call returns; the schema above owns it. */
 export type OrchestratorStateDto = z.infer<typeof stateSchema>;
 
@@ -381,6 +465,8 @@ export const rpcContract = defineRpcContract({
       .strict(),
     output: contractSchema,
   },
+  get_judge: { input: z.null(), output: judgeStatusSchema },
+  set_judge_key: { input: z.object({ key: z.string().max(300).nullable() }).strict(), output: judgeStatusSchema },
   get_worker_execution: { input: z.null(), output: workerConfigSchema },
   set_worker_execution: {
     input: workerConfigSchema.nullable(),
@@ -1269,8 +1355,24 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
+  /** Whether a judge key is stored. The value is read here and never returned. */
+  async function judgeKeyConfigured(): Promise<boolean> {
+    const stored = (await bb.storage.kv.get(JUDGE_KEY)) as { key?: unknown } | null;
+    return typeof stored?.key === "string" && stored.key !== "";
+  }
+
+  /** Thread ids the last prune dropped, counted into DROPS_KEY by the next persist. */
+  let pendingDrops: string[] = [];
   async function persist(next: Record<string, ThreadState>): Promise<void> {
     await bb.storage.kv.set(STATE_KEY, next);
+    if (pendingDrops.length > 0) {
+      const previous = (await bb.storage.kv.get(DROPS_KEY)) as { count?: number } | null;
+      await bb.storage.kv.set(DROPS_KEY, {
+        count: (previous?.count ?? 0) + pendingDrops.length,
+        lastDroppedAt: Date.now(),
+      });
+      pendingDrops = [];
+    }
     cache = next;
     bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
   }
@@ -1403,6 +1505,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     if (dropped.length > 0) {
+      pendingDrops = dropped;
       bb.log.warn(
         `state map over budget: dropped ${dropped.length} least recently touched thread(s) (${dropped.slice(0, 5).join(", ")}${dropped.length > 5 ? ", …" : ""})`,
       );
@@ -1611,6 +1714,13 @@ export default async function plugin(bb: BbPluginApi) {
       .boolean()
       .optional()
       .describe("Wait for the worker to finish and return its result. Default true."),
+    after: z
+      .array(z.string().trim().min(1).max(200))
+      .max(20)
+      .optional()
+      .describe(
+        "Worker thread ids this unit depends on. It starts only once each of them is idle, so independent units run in parallel and a dependent unit waits for its inputs. Only this orchestrator's own workers are accepted.",
+      ),
     timeoutSeconds: z
       .number()
       .int()
@@ -1677,6 +1787,7 @@ export default async function plugin(bb: BbPluginApi) {
       task,
       title,
       waitForResult,
+      after,
       timeoutSeconds,
       hidden,
       workspace,
@@ -1692,6 +1803,25 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<string> {
     if (threadId === undefined) {
       throw new Error("orchestrator_delegate needs a thread context.");
+    }
+    // A dependent unit starts only after each named input has finished. A
+    // dependency that failed stops this unit too: starting on a broken input
+    // would hand the worker a result it cannot trust.
+    if (after !== undefined && after.length > 0) {
+      const own = new Set((await getState(threadId))?.delegations.map((delegation) => delegation.threadId) ?? []);
+      const foreign = after.filter((id) => !own.has(id));
+      if (foreign.length > 0) {
+        throw new Error(`These are not this orchestrator's workers, so they cannot be dependencies: ${foreign.join(", ")}`);
+      }
+      const deadlineMs = Date.now() + (timeoutSeconds ?? 900) * 1000;
+      for (const id of after) {
+        const remainingMs = Math.max(1000, deadlineMs - Date.now());
+        await bb.sdk.threads.wait({ threadId: id, status: "idle", timeoutMs: remainingMs, signal }).catch(() => undefined);
+        const status = (await bb.sdk.threads.get({ threadId: id })).status;
+        if (status !== "idle") {
+          throw new Error(`Dependency ${id} did not finish cleanly (status: ${status}), so this unit did not start.`);
+        }
+      }
     }
     // A check unit inspects finished work, so it can only start once the
     // worker has settled. Refusing beats spawning a worker nobody checks.
@@ -1715,14 +1845,23 @@ export default async function plugin(bb: BbPluginApi) {
     if (reviewHeavy && waitForResult === false) {
       throw new Error("This scope is review-heavy, so every unit is checked once it finishes. Keep waitForResult true.");
     }
-    const checkUnit = verify === true || reviewHeavy;
+    // A build unit is checked by default: the review loop is on for every unit
+    // that changes files. A check needs the result, so a unit that does not wait
+    // is left unchecked rather than refused.
+    const checkUnit =
+      verify === true || reviewHeavy || (preset === "build" && verify !== false && waitForResult !== false);
     const scopeWorkspace = settingsFor(projectId).workerWorkspace;
-    if (workspace === undefined && scopeWorkspace === "mixed") {
+    // In a mixed scope a named kind picks its own checkout: a build writes its own
+    // branch, while a review or research unit only reads the orchestrator's checkout.
+    // A unit with no workspace and no kind still has to name one.
+    const kindWorkspace: "shared" | "worktree" | undefined =
+      preset === "build" ? "worktree" : preset === undefined ? undefined : "shared";
+    if (workspace === undefined && scopeWorkspace === "mixed" && kindWorkspace === undefined) {
       throw new Error(
-        "This scope runs workers in both checkouts, so each delegation names where it runs: `workspace: \"shared\"` uses the orchestrator's own checkout, so its edits are visible at once, and `workspace: \"worktree\"` gives the unit its own branch, which stays out until a merge unit brings it in.",
+        "This scope runs workers in both checkouts, so each delegation names where it runs: `workspace: \"shared\"` uses the orchestrator's own checkout, so its edits are visible at once, and `workspace: \"worktree\"` gives the unit its own branch, which stays out until a merge unit brings it in. Or pass a `preset` (build, review or research) and the workspace follows it.",
       );
     }
-    const unitWorkspace = workspace ?? scopeWorkspace;
+    const unitWorkspace = workspace ?? (scopeWorkspace === "mixed" ? kindWorkspace! : scopeWorkspace);
     /**
      * The machine a new worktree belongs on: the orchestrator's own, so the unit
      * sees the same host as the thread that handed it the work. An environment
@@ -1888,6 +2027,13 @@ export default async function plugin(bb: BbPluginApi) {
                 ? {}
                 : { verifierFor: options.verifierFor, verifiedBy: null, verdict: null }),
               environmentId: spawned.environmentId ?? null,
+              execution: {
+                providerId: spawned.providerId ?? exec.providerId ?? null,
+                model: exec.model ?? null,
+                reasoningLevel: exec.reasoningLevel ?? null,
+                serviceTier: exec.serviceTier ?? null,
+                permissionMode: exec.permissionMode ?? null,
+              },
             },
           ]),
         }));
@@ -1963,19 +2109,19 @@ export default async function plugin(bb: BbPluginApi) {
      * Re-delegate the same brief on the fallback, which inherits every field
      * it does not name from the execution the first attempt used.
      */
-    async function retryOnFallback(fallback: WorkerExecution, reason: string): Promise<string> {
+    async function retryOnFallback(fallback: WorkerExecution, reason: string, label: "fallback" | "resume" = "fallback"): Promise<string> {
       const retryExec = reconcile({ ...workerExec, ...fallback });
       const target = retryExec.model ?? "the project default";
       bb.log.warn(`${reason} Retrying on ${target}.`);
       const retry = await spawnWorker(
         retryExec,
-        `${workerTitle} (fallback)`,
+        `${workerTitle} (${label})`,
         environmentFor(workerEnvironmentId),
         { pluginInitiated: true },
       );
       const retryId = retry.id;
       const settled = await settle(retryId, timeoutMs);
-      return `${reason} Re-delegated the same brief on \`${target}\` as worker ${retryId}.\n\n${await finish(retryId, `${workerTitle} (fallback)`, settled)}`;
+      return `${reason} Re-delegated the same brief on \`${target}\` as worker ${retryId}.\n\n${await finish(retryId, `${workerTitle} (${label})`, settled)}`;
     }
 
     /**
@@ -2012,7 +2158,23 @@ export default async function plugin(bb: BbPluginApi) {
       }));
       const checked = await settle(verifierId, timeoutMs);
       const verdict = (checked.output ?? "").trim();
-      return `\n\nCheck unit ${verifierId} ran the same brief.${
+      // The check's verdict is advice. The orchestrator still judges the unit, so
+      // it is reported in the result and never recorded on the worker.
+      const parsed = checked.running ? null : parseCheckVerdict(checked.output ?? "");
+      let advice =
+        parsed === null
+          ? ""
+          : `\n\nThe check's verdict is ${parsed.verdict === "accepted" ? "pass" : "fail"}. You still judge this unit with orchestrator_review.`;
+      // The advisory judge reads the check's report only when a key is stored and
+      // the check gave a verdict. Its opinion is text, never a recorded verdict.
+      const judgeKey = parsed === null ? null : ((await bb.storage.kv.get(JUDGE_KEY)) as { key?: unknown } | null)?.key;
+      if (typeof judgeKey === "string" && judgeKey !== "") {
+        const opinion = await judgeCheckVerdict(judgeKey, checked.output ?? "");
+        if (opinion !== null) {
+          advice += `\nAdvisory judge: ${opinion.agrees ? "agrees" : "disagrees"}. ${opinion.rationale}`;
+        }
+      }
+      return `\n\nCheck unit ${verifierId} ran the same brief.${advice}${
         checked.running
           ? " It is still running, so check it before you accept the work."
           : verdict === ""
@@ -2082,8 +2244,13 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     const first = await settle(workerId, timeoutMs);
-    if (first.running || first.status !== "error" || fallback === undefined) {
+    if (first.running || first.status !== "error") {
       return await finish(workerId, workerTitle, first);
+    }
+    // One resume on the same execution when no fallback is set: a failed worker
+    // gets a second attempt, and that attempt is not retried again.
+    if (fallback === undefined) {
+      return await retryOnFallback({}, `Worker ${workerId} failed.`, "resume");
     }
     return await retryOnFallback(fallback, `Worker ${workerId} failed.`);
   }
@@ -2950,6 +3117,12 @@ export default async function plugin(bb: BbPluginApi) {
       }
       return scopeSettings(projectId);
     },
+    get_judge: async () => ({ configured: await judgeKeyConfigured() }),
+    set_judge_key: async ({ key }) => {
+      const trimmed = key === null ? "" : key.trim();
+      await bb.storage.kv.set(JUDGE_KEY, trimmed === "" ? null : { key: trimmed });
+      return { configured: trimmed !== "" };
+    },
     set_worker_execution: async (next) => setWorkerConfig(next),
     clear_violations: async ({ threadId }) => {
       const state = await clearViolations(threadId);
@@ -3071,6 +3244,7 @@ export default async function plugin(bb: BbPluginApi) {
     threadId: string,
     state: OrchestratorStateDto,
     scope: { projectId: string; overridden: readonly string[] } | null = null,
+    drops: { count?: number; lastDroppedAt?: number } | null = null,
   ): string {
     const lines = [
       `thread ${threadId}`,
@@ -3087,7 +3261,19 @@ export default async function plugin(bb: BbPluginApi) {
       `  fan-out cap:       ${
         state.maxParallelWorkers === 0 ? "none" : `${state.maxParallelWorkers} in flight`
       }, ${state.maxDelegationsPerTurn === 0 ? "none" : `${state.maxDelegationsPerTurn} per turn`}`,
+      `  threads dropped:   ${drops?.count ?? 0} from the state map${drops?.lastDroppedAt ? ` (last ${new Date(drops.lastDroppedAt).toISOString()})` : ""}`,
     ];
+    if (state.delegations.length > 0) {
+      lines.push("  recent workers:");
+      for (const delegation of state.delegations.slice(-5)) {
+        const run = delegation.execution
+          ? [delegation.execution.providerId, delegation.execution.model, delegation.execution.reasoningLevel, delegation.execution.serviceTier]
+              .filter((part): part is string => typeof part === "string" && part !== "")
+              .join(" ") || "inherited"
+          : "inherited";
+        lines.push(`    - ${delegation.threadId}: ${run}`);
+      }
+    }
     if (state.violations.length > 0) {
       lines.push("  recent direct work:");
       for (const violation of state.violations.slice(-5)) {
@@ -3113,7 +3299,8 @@ export default async function plugin(bb: BbPluginApi) {
             const state = toDto(threadId, await getState(threadId), settingsFor(projectId));
             const scope =
               projectId === null ? null : { projectId, overridden: Object.keys(projectSettings[projectId] ?? {}) };
-            return render(input.options.json, state, describeState(threadId, state, scope));
+            const drops = (await bb.storage.kv.get(DROPS_KEY)) as { count?: number; lastDroppedAt?: number } | null;
+            return render(input.options.json, state, describeState(threadId, state, scope, drops ?? null));
           },
         }),
         review: cliCommand({
