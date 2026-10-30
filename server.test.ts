@@ -9,27 +9,45 @@ import {
 } from "@get-bb/plugin-sdk/testing";
 import type { BbPluginApi, PluginSettingValue } from "@get-bb/plugin-sdk";
 import { REVIEW_TOOL } from "./shared";
-import plugin, { DELEGATE_TOOL, MAX_STATE_BYTES, judgeCheckVerdict, type OrchestratorStateDto } from "./server";
+import plugin, { DELEGATE_TOOL, judgeCheckVerdict, type OrchestratorStateDto } from "./server";
 import { writeMirror } from "./shared";
 import { CHILD_BATCH_WAIT_REASON } from "./child-message-queue";
 
 describe("the advisory judge", () => {
-  const reply = (content: string) =>
-    (async () => new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 })) as unknown as typeof fetch;
+  const decision = (noul: number) =>
+    (async () =>
+      new Response(JSON.stringify({ answers: { verified: { type: "noul", noul } } }), {
+        status: 200,
+      })) as unknown as typeof fetch;
 
-  it("reads AGREE and DISAGREE with a rationale", async () => {
-    expect(await judgeCheckVerdict("k", "report", reply("AGREE The tests ran and passed."))).toEqual({
+  it("reads the probability Jev returns as agreement or disagreement", async () => {
+    expect(await judgeCheckVerdict("k", "report", decision(0.92))).toEqual({
       agrees: true,
-      rationale: "The tests ran and passed.",
+      rationale: "Jev put 92% on the report showing the work was actually verified.",
     });
-    expect(await judgeCheckVerdict("k", "report", reply("DISAGREE Nothing was run."))).toEqual({
+    expect(await judgeCheckVerdict("k", "report", decision(0.08))).toEqual({
       agrees: false,
-      rationale: "Nothing was run.",
+      rationale: "Jev put 8% on the report showing the work was actually verified.",
     });
   });
 
-  it("returns null when the answer has no AGREE or DISAGREE", async () => {
-    expect(await judgeCheckVerdict("k", "report", reply("maybe"))).toBeNull();
+  it("returns null when the answer carries no probability", async () => {
+    const prose = (async () =>
+      new Response(JSON.stringify({ answers: { verified: { type: "noul", noul: "yes" } } }), {
+        status: 200,
+      })) as unknown as typeof fetch;
+    expect(await judgeCheckVerdict("k", "report", prose)).toBeNull();
+  });
+
+  it("does not ask anything without a key or a report", async () => {
+    let called = false;
+    const capture = (async () => {
+      called = true;
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+    expect(await judgeCheckVerdict("", "report", capture)).toBeNull();
+    expect(await judgeCheckVerdict("k", "   ", capture)).toBeNull();
+    expect(called).toBe(false);
   });
 
   it("returns null when OpenRouter refuses or the network fails, so nothing blocks", async () => {
@@ -45,13 +63,18 @@ describe("the advisory judge", () => {
     let sent: { url: string; init: RequestInit } | null = null;
     const capture = (async (url: string, init: RequestInit) => {
       sent = { url, init };
-      return new Response(JSON.stringify({ choices: [{ message: { content: "AGREE ok" } }] }), { status: 200 });
+      return new Response(JSON.stringify({ answers: { verified: { type: "noul", noul: 0.9 } } }), {
+        status: 200,
+      });
     }) as unknown as typeof fetch;
     await judgeCheckVerdict("sk-test", "x".repeat(9_000), capture);
-    expect(sent!.url).toBe("https://openrouter.ai/api/v1/chat/completions");
+    // Jev is served on the decisions endpoint; `/api/v1/chat/completions` does
+    // not carry the model at all.
+    expect(sent!.url).toBe("https://openrouter.ai/api/alpha/decisions");
     expect((sent!.init.headers as Record<string, string>).Authorization).toBe("Bearer sk-test");
-    const body = JSON.parse(String(sent!.init.body)) as { messages: { content: string }[] };
-    expect(body.messages[1]!.content.length).toBe(4_000);
+    const body = JSON.parse(String(sent!.init.body)) as { state: string; model: string };
+    expect(body.state.length).toBe(4_000);
+    expect(body.model).toBe("typesafe/jev-1.13");
   });
 });
 
@@ -195,6 +218,19 @@ function textOf(input: unknown): string {
         : "",
     )
     .join("\n");
+}
+
+
+/**
+ * The rows this build persists: one table row per thread in the plugin's own
+ * database, not the single KV map the previous build wrote.
+ */
+function persistedRows(bb: BbPluginApi): Record<string, unknown> {
+  const rows = bb.storage
+    .database()
+    .prepare("SELECT thread_id, state FROM thread_state")
+    .all() as { thread_id: string; state: string }[];
+  return Object.fromEntries(rows.map((row) => [row.thread_id, JSON.parse(row.state) as unknown]));
 }
 
 async function load(
@@ -1009,11 +1045,11 @@ describe("the dispatch checkpoint", () => {
     await dispatch(harness, THREAD, { status: "active" }, {
       initiator: "user", senderThreadId: null, attempt: "join-turn",
     });
-    const state = await bb.storage.kv.get<Record<string, { turnStartedAt: number }>>("state");
-    expect(state?.[THREAD]?.turnStartedAt).toBe(777);
+    const state = persistedRows(bb) as Record<string, { turnStartedAt: number }>;
+    expect(state[THREAD]?.turnStartedAt).toBe(777);
     await dispatch(harness, THREAD, { status: "idle" }, { attempt: "start-turn" });
-    const updated = await bb.storage.kv.get<Record<string, { turnStartedAt: number }>>("state");
-    expect(updated?.[THREAD]?.turnStartedAt).toBeGreaterThan(777);
+    const updated = persistedRows(bb) as Record<string, { turnStartedAt: number }>;
+    expect(updated[THREAD]?.turnStartedAt).toBeGreaterThan(777);
   });
 
   it("configures child message delivery through the scope CLI", async () => {
@@ -1124,7 +1160,7 @@ describe("the watchdog", () => {
     await new Promise((resolve) => setTimeout(resolve, 350));
     const state = (await harness.behavior.callRpc("get_state", { threadId: THREAD })) as OrchestratorStateDto;
     expect(state).toMatchObject({ violations: [{ id: "row_delta" }], nudgeCount: 1 });
-    expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+    expect(persistedRows(bb)).toMatchObject({ [THREAD]: { lastSeq: 4 } });
     expect(sentTexts).toHaveLength(1);
   });
 
@@ -1160,7 +1196,7 @@ describe("the watchdog", () => {
     }));
     await idle(harness);
     await vi.waitFor(async () => {
-      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 3 } });
+      expect(persistedRows(bb)).toMatchObject({ [THREAD]: { lastSeq: 3 } });
     });
     expect(sentTexts).toEqual([]);
     expect(await harness.behavior.callRpc("get_state", { threadId: THREAD })).toMatchObject({ violations: [] });
@@ -1220,7 +1256,7 @@ describe("the watchdog", () => {
     // wait for when the row is exempt, and the cursor is the real signal that
     // the scan finished.
     await vi.waitFor(async () => {
-      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+      expect(persistedRows(bb)).toMatchObject({ [THREAD]: { lastSeq: 4 } });
     });
 
     expect(sentTexts).toEqual([]);
@@ -1254,7 +1290,7 @@ describe("the watchdog", () => {
     timelineMaxSeq = 4;
     await idle(harness);
     await vi.waitFor(async () => {
-      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+      expect(persistedRows(bb)).toMatchObject({ [THREAD]: { lastSeq: 4 } });
     });
 
     expect(sentTexts).toEqual([]);
@@ -1333,7 +1369,7 @@ describe("the watchdog", () => {
     timelineMaxSeq = 4;
     await idle(harness);
     await vi.waitFor(async () => {
-      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+      expect(persistedRows(bb)).toMatchObject({ [THREAD]: { lastSeq: 4 } });
     });
 
     expect(sentTexts).toEqual([]);
@@ -1360,7 +1396,7 @@ describe("the watchdog", () => {
     timelineMaxSeq = 4;
     await idle(harness);
     await vi.waitFor(async () => {
-      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+      expect(persistedRows(bb)).toMatchObject({ [THREAD]: { lastSeq: 4 } });
     });
 
     expect(sentTexts).toEqual([]);
@@ -1392,7 +1428,7 @@ describe("the watchdog", () => {
     timelineMaxSeq = 4;
     await idle(harness);
     await vi.waitFor(async () => {
-      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 4 } });
+      expect(persistedRows(bb)).toMatchObject({ [THREAD]: { lastSeq: 4 } });
     });
 
     expect(sentTexts).toEqual([]);
@@ -3270,25 +3306,34 @@ describe("rpc", () => {
       expect(await harness.behavior.callRpc("get_state", { threadId })).toMatchObject({ enabled: true });
       expect(metadata[threadId]).toEqual(writeMirror({ enabled: true, enforcement: null }));
     }
-    expect(await bb.storage.kv.get("state")).toMatchObject({
+    expect(persistedRows(bb)).toMatchObject({
       th_first: { enabled: true }, th_second: { enabled: true },
     });
   });
 
   it("leaves failed writes uncommitted and accepts later mutations", async () => {
     const { bb, harness } = await load();
-    const write = vi.spyOn(bb.storage.kv, "set").mockRejectedValueOnce(new Error("write failed"));
+    const db = bb.storage.database();
+    // The table is gone, so the row write fails the way a disk error would.
+    db.exec("DROP TABLE thread_state");
     try {
-      await expect(enable(harness, "th_failed")).rejects.toThrow("write failed");
+      await expect(enable(harness, "th_failed")).rejects.toThrow();
+      // Nothing reached the cache, so the thread still reads as off, and no
+      // thread-metadata mirror was written for a change that never committed.
       expect(await harness.behavior.callRpc("get_state", { threadId: "th_failed" })).toMatchObject({ enabled: false });
       expect(metadata["th_failed"]).toBeUndefined();
-
-      await enable(harness, "th_later");
-      expect(await bb.storage.kv.get("state")).toMatchObject({ th_later: { enabled: true } });
-      expect(await harness.behavior.callRpc("get_state", { threadId: "th_later" })).toMatchObject({ enabled: true });
     } finally {
-      write.mockRestore();
+      db.exec(`CREATE TABLE IF NOT EXISTS thread_state (
+        thread_id TEXT PRIMARY KEY NOT NULL,
+        touched_at INTEGER NOT NULL,
+        state TEXT NOT NULL
+      )`);
     }
+
+    await enable(harness, "th_later");
+    expect(persistedRows(bb)).toMatchObject({ th_later: { enabled: true } });
+    expect(await harness.behavior.callRpc("get_state", { threadId: "th_later" })).toMatchObject({ enabled: true });
+    expect(metadata["th_later"]).toEqual(writeMirror({ enabled: true, enforcement: null }));
   });
 
   it("reports the effective enforcement and the plugin defaults", async () => {
@@ -3498,7 +3543,7 @@ describe("rpc", () => {
     timelineMaxSeq = 3;
     await idle(harness);
     await vi.waitFor(async () => {
-      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 3,
+      expect(persistedRows(bb)).toMatchObject({ [THREAD]: { lastSeq: 3,
         violations: [expect.objectContaining({ detail: `started subagent \`${name}\` itself` })] } });
     });
     await vi.waitFor(() => expect(stoppedThreads).toEqual([THREAD]));
@@ -3550,7 +3595,7 @@ describe("rpc", () => {
     timelineMaxSeq = 5;
     await idle(harness);
     await vi.waitFor(async () => {
-      expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { lastSeq: 5, violations: [] } });
+      expect(persistedRows(bb)).toMatchObject({ [THREAD]: { lastSeq: 5, violations: [] } });
     });
     expect(stoppedThreads).toEqual([]);
     expect(sentTexts).toEqual([]);
@@ -3641,22 +3686,27 @@ describe("rpc", () => {
     }
   });
 
-  it("evicts by touch time even when a stored touchedAt is not a number", async () => {
+  it("retains every thread's row, including one with an unreadable touchedAt", async () => {
     const seed: Record<string, unknown> = {};
     for (let index = 1; index <= 300; index += 1) {
       seed[`th_${index}`] = { enabled: false, touchedAt: index };
     }
     seed.th_bad = { enabled: false, touchedAt: "recently" };
-    const { bb, harness } = await load({}, seed);
+    const { harness } = await load({}, seed);
     await enable(harness);
-    const raw = (await bb.storage.kv.get("state")) as Record<string, unknown>;
-    expect(Object.keys(raw)).toHaveLength(300);
-    // The unreadable timestamp falls back to 0, so that row is the oldest.
-    expect(raw.th_bad).toBeUndefined();
-    expect(raw.th_2).toBeDefined();
+    // The unreadable timestamp still reads as the oldest row, but nothing is
+    // evicted: a per-thread row has no shared byte budget to run out of.
+    const row = (await harness.behavior.callRpc("get_state", {
+      threadId: "th_bad",
+    })) as OrchestratorStateDto;
+    expect(row).toBeDefined();
+    for (const threadId of ["th_1", "th_2", "th_150", "th_300"]) {
+      const kept = (await harness.behavior.callRpc("get_state", { threadId })) as OrchestratorStateDto;
+      expect(kept).toBeDefined();
+    }
   });
 
-  it("keeps the persisted map under the byte budget without losing the newest thread", async () => {
+  it("keeps a large row whole instead of evicting its neighbours", async () => {
     const detail = "x".repeat(100);
     const seed: Record<string, unknown> = {};
     for (let index = 1; index <= 20; index += 1) {
@@ -3672,51 +3722,53 @@ describe("rpc", () => {
         })),
       };
     }
-    // ~220 KB of rows: seedable (under the store's 256 KB limit) but well past
-    // the plugin's 192 KB budget, so the next write has to prune before it can
-    // succeed.
-    const { bb, harness } = await load({}, seed);
+    // ~220 KB of rows: more than the single 256 KB KV value the previous build
+    // kept them in, which is why it had to evict. Rows live in the database now,
+    // so every one survives with its violations intact.
+    const { harness } = await load({}, seed);
     await enable(harness);
 
-    const raw = (await bb.storage.kv.get("state")) as Record<string, unknown>;
-    // (a) the persisted map fits the budget the store enforces.
-    expect(Buffer.byteLength(JSON.stringify(raw), "utf8")).toBeLessThanOrEqual(MAX_STATE_BYTES);
-    // (b) the newest thread and the newest seeded row survived the trim.
-    expect(raw[THREAD]).toMatchObject({ enabled: true });
-    expect(raw.th_20).toBeDefined();
-    expect(Object.keys(raw).length).toBeLessThan(20);
-    // (c) the write succeeded and a surviving row still reads back whole.
+    for (const threadId of ["th_1", "th_2", "th_20", THREAD]) {
+      const kept = (await harness.behavior.callRpc("get_state", {
+        threadId,
+      })) as OrchestratorStateDto;
+      expect(kept, `${threadId} is retained`).toBeDefined();
+    }
     const kept = (await harness.behavior.callRpc("get_state", {
       threadId: "th_20",
     })) as OrchestratorStateDto;
     expect(kept.violations).toHaveLength(60);
+    // Nothing was dropped, so nothing claims to have been.
+    expect(
+      harness.inspection.logEntries.some(
+        (entry) => entry.level === "warn" && entry.message.includes("dropped"),
+      ),
+    ).toBe(false);
   });
 });
 
 describe("state persistence", () => {
-  it("counts the byte budget in UTF-8 bytes, not code units", async () => {
-    // ~100 K code units but ~200 K UTF-8 bytes: a code-unit budget would keep
-    // the whole map, the byte budget has to evict the oldest row.
+  it("imports the legacy KV state map once, keeping every row it held", async () => {
+    // A map written by the previous build, over the 256 KB the old single value
+    // could hold, is imported row by row rather than dropped or truncated.
     const seed: Record<string, unknown> = {
-      th_old: { enabled: false, touchedAt: 1, lastReviewNudge: "😀".repeat(50_000) },
+      th_old: { enabled: true, touchedAt: 1, lastReviewNudge: "😀".repeat(50_000) },
       th_new: { enabled: false, touchedAt: 2 },
     };
-    expect(JSON.stringify(seed).length).toBeLessThan(MAX_STATE_BYTES);
-    expect(Buffer.byteLength(JSON.stringify(seed), "utf8")).toBeGreaterThan(MAX_STATE_BYTES);
+    expect(Buffer.byteLength(JSON.stringify(seed), "utf8")).toBeGreaterThan(196_608);
 
-    const { bb, harness } = await load({}, seed);
-    await enable(harness, "th_write");
-
-    const raw = (await bb.storage.kv.get("state")) as Record<string, unknown>;
-    expect(Buffer.byteLength(JSON.stringify(raw), "utf8")).toBeLessThanOrEqual(MAX_STATE_BYTES);
-    expect(raw.th_old).toBeUndefined();
-    expect(raw.th_new).toBeDefined();
-    expect(raw.th_write).toMatchObject({ enabled: true });
-    // The eviction is announced, never silent.
+    const { harness } = await load({}, seed);
+    const old = (await harness.behavior.callRpc("get_state", {
+      threadId: "th_old",
+    })) as OrchestratorStateDto;
+    expect(old.enabled).toBe(true);
+    const kept = (await harness.behavior.callRpc("get_state", {
+      threadId: "th_new",
+    })) as OrchestratorStateDto;
+    expect(kept).toBeDefined();
+    // The import is announced, and it is not a repair: no row was discarded.
     expect(
-      harness.inspection.logEntries.some(
-        (entry) => entry.level === "warn" && entry.message.includes("th_old"),
-      ),
+      harness.inspection.logEntries.some((entry) => entry.message.includes("imported 2 thread(s)")),
     ).toBe(true);
   });
 
@@ -3741,7 +3793,7 @@ describe("state persistence", () => {
       read.mockRestore();
     }
     await enable(harness);
-    expect(await bb.storage.kv.get("state")).toMatchObject({ [THREAD]: { enabled: true } });
+    expect(persistedRows(bb)).toMatchObject({ [THREAD]: { enabled: true } });
   });
 
   it("treats an array-shaped stored state as empty instead of harvesting its indices", async () => {
@@ -3750,7 +3802,7 @@ describe("state persistence", () => {
       [{ enabled: true, touchedAt: 1 }] as unknown as Record<string, unknown>,
     );
     await enable(harness);
-    const raw = (await bb.storage.kv.get("state")) as Record<string, unknown>;
+    const raw = (persistedRows(bb)) as Record<string, unknown>;
     // The array's element must not come back as a thread keyed "0".
     expect(Object.keys(raw)).toEqual([THREAD]);
     expect(
@@ -3778,10 +3830,12 @@ describe("state persistence", () => {
     const { bb, harness } = await load({}, seed);
     await enable(harness);
 
-    const raw = (await bb.storage.kv.get("state")) as Record<string, unknown>;
+    const raw = persistedRows(bb);
     expect(Object.prototype.hasOwnProperty.call(raw, "__proto__")).toBe(true);
-    // The count cap still evicted the oldest real row, not the newer proto row.
-    expect(raw.th_0).toBeUndefined();
+    expect(raw.__proto__).toMatchObject({ enabled: true });
+    // Rows hold no shared budget, so the hostile id neither evicts a neighbour
+    // nor disappears.
+    expect(raw.th_0).toBeDefined();
     expect(raw.th_299).toBeDefined();
     // Nothing leaked onto Object.prototype.
     expect(({} as Record<string, unknown>).enabled).toBeUndefined();
@@ -3810,7 +3864,7 @@ describe("state persistence", () => {
       await pending;
       await enable(harness, "th_b");
 
-      const raw = (await bb.storage.kv.get("state")) as Record<string, unknown>;
+      const raw = (persistedRows(bb)) as Record<string, unknown>;
       expect(raw).toMatchObject({ th_a: { enabled: true }, th_b: { enabled: true } });
     } finally {
       read.mockRestore();

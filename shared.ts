@@ -637,6 +637,14 @@ const READ_ONLY_PROGRAMS: ReadonlySet<string> = new Set([
   "realpath",
   "dirname",
   "basename",
+  // Text filters: the shape of every `bb ... | cut -c1-80` line an orchestrator
+  // uses to read a wide result. Their writers are flag-guarded in
+  // `MUTATING_PROGRAM_FLAGS`; `sed` and `awk` stay out because a script can
+  // write a file (`sed -i`, `awk 'print > "f"'`) in ways no argument table sees.
+  "cut",
+  "tr",
+  "sort",
+  "uniq",
 ]);
 
 /**
@@ -786,6 +794,14 @@ const MUTATING_PROGRAM_FLAGS: Record<string, (arg: string) => boolean> = {
     hasShortFlag(arg, "O"),
   bat: (arg) => arg === "--pager" || arg.startsWith("--pager="),
   ag: (arg) => arg === "--pager" || arg.startsWith("--pager="),
+  // `sort -o FILE`/`--output=FILE` writes its result, and `--compress-program`
+  // runs a program.
+  sort: (arg) =>
+    /^--output(?:=|$)/.test(arg) ||
+    /^--compress-program(?:=|$)/.test(arg) ||
+    hasShortFlag(arg, "o"),
+  // GNU `cut --output=FILE` writes its result to a file.
+  cut: (arg) => /^--output(?:=|$)/.test(arg),
 };
 
 /**
@@ -1359,6 +1375,8 @@ function isReadOnlySegment(segment: string): boolean {
   if (name === "curl") return isReadOnlyCurl(args);
   if (name === "gh" && args[0] === "api") return isReadOnlyGhApi(args.slice(1));
   if (!READ_ONLY_PROGRAMS.has(name)) return false;
+  // `uniq in out` writes `out`; one operand or a `-` writes nothing.
+  if (name === "uniq" && args.filter((arg) => !arg.startsWith("-")).length > 1) return false;
   const mutating = MUTATING_PROGRAM_FLAGS[name];
   if (name === "find" && mutating !== undefined) {
     for (let index = 0; index < args.length; index += 1) {

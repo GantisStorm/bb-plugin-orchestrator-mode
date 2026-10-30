@@ -86,7 +86,6 @@ export { DELEGATE_TOOL };
 /** Realtime channel the composer surfaces listen on. */
 const STATE_CHANGED = "orchestrator-state";
 
-const STATE_KEY = "state";
 /**
  * The global settings record: every thread-behaviour setting, plus the composer
  * default. Stored here rather than as BB settings descriptors because a
@@ -112,19 +111,12 @@ const CONTRACT_KEY = "contract";
  */
 const MAX_UNJUDGED_RETAINED = 200;
 
-/** Threads kept in the KV map before the least recently touched is dropped. */
-const MAX_THREADS = 300;
-/** KV key for the running count of threads the state map has dropped, shown by `status`. */
-const DROPS_KEY = "state-drops";
-/** KV key for the OpenRouter key the advisory judge uses. Stored here, never returned, logged or shown. */
-const JUDGE_KEY = "judge-key";
 /**
- * The KV map's byte ceiling, under BB's 262,144-byte value limit. A write past
- * that limit fails with an opaque store error and the toggle silently stays
- * off, so the map is trimmed to fit here and leave 64 KiB of headroom — several
- * rows at the measured ~15 KB each — for the row the write is adding.
+ * The legacy single KV map this build used to write. It is read once by
+ * `importLegacyState` and never written again; a per-thread table row replaced
+ * it because one KV value's byte ceiling forced evictions between threads.
  */
-export const MAX_STATE_BYTES = 196_608;
+const STATE_KEY = "state";
 const MAX_VIOLATIONS = 100;
 const MAX_SEEN_ROWS = 500;
 const MAX_DELEGATIONS = 50;
@@ -137,50 +129,58 @@ const MAX_DELEGATIONS = 50;
  */
 const MAX_CHILD_THREADS = 200;
 
-/** UTF-8 bytes of a JSON value, the unit the store's size budget is measured in. */
-const utf8Encoder = new TextEncoder();
-function byteLength(value: unknown): number {
-  return utf8Encoder.encode(JSON.stringify(value) ?? "null").length;
-}
-
 export interface JudgeOpinion {
   agrees: boolean;
   rationale: string;
 }
 
 /**
- * An advisory second opinion on a check unit's report, from an OpenRouter model.
- * It only adds text to the result: it never records a verdict, blocks a unit or
- * stops a turn. Any failure returns null, so a missing or broken judge changes
- * nothing. The report it reads is sent to OpenRouter, capped at 4,000 characters.
+ * An advisory second opinion on a check unit's report, from Jev through
+ * OpenRouter. It only adds text to the result: it never records a verdict,
+ * blocks a unit or stops a turn. Any failure returns null, so a missing or
+ * broken judge changes nothing.
+ *
+ * Jev is not a chat model. OpenRouter serves it on the decisions endpoint
+ * (`/api/alpha/decisions`) with a typed question, and answers with a
+ * probability — never prose. The old call to `/api/v1/chat/completions` named a
+ * model that endpoint does not serve, so it could not succeed. The report is
+ * sent there, capped at 4,000 characters, and nothing else is transmitted.
  */
+const JEV_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions";
+const JEV_MODEL = "typesafe/jev-1.13";
+const JEV_REPORT_LIMIT = 4_000;
+
 export async function judgeCheckVerdict(
   key: string,
   checkOutput: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<JudgeOpinion | null> {
+  if (key === "" || checkOutput.trim() === "") return null;
   try {
-    const response = await fetchImpl("https://openrouter.ai/api/v1/chat/completions", {
+    const response = await fetchImpl(JEV_DECISIONS_URL, {
       method: "POST",
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "typesafe/jev-1.13",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You read a checker's report on another worker's output. On the first line answer AGREE if the report shows the work was actually verified, or DISAGREE if it does not. Then give one sentence of reasoning.",
+        model: JEV_MODEL,
+        state: checkOutput.slice(0, JEV_REPORT_LIMIT),
+        questions: {
+          verified: {
+            type: "noul",
+            instructions:
+              "Does this report show that the work it describes was actually run or checked, rather than only claimed?",
           },
-          { role: "user", content: checkOutput.slice(0, 4_000) },
-        ],
+        },
       }),
     });
     if (!response.ok) return null;
-    const body = (await response.json()) as { choices?: { message?: { content?: string } }[] };
-    const text = (body.choices?.[0]?.message?.content ?? "").trim();
-    const match = /^(AGREE|DISAGREE)\b[\s.:,-]*([\s\S]*)$/i.exec(text);
-    if (match === null) return null;
-    return { agrees: match[1]!.toUpperCase() === "AGREE", rationale: match[2]!.trim() };
+    const body = (await response.json()) as { answers?: { verified?: { noul?: unknown } } };
+    const probability = body.answers?.verified?.noul;
+    if (typeof probability !== "number" || !Number.isFinite(probability)) return null;
+    const bounded = Math.min(1, Math.max(0, probability));
+    return {
+      agrees: bounded >= 0.5,
+      rationale: `Jev put ${Math.round(bounded * 100)}% on the report showing the work was actually verified.`,
+    };
   } catch {
     return null;
   }
@@ -636,6 +636,22 @@ export default async function plugin(bb: BbPluginApi) {
   let disposed = false;
   let catalog: WorkerCatalog = { providers: [], models: [], unavailable: [] };
   let catalogReady = false;
+
+  /**
+   * The advisory judge's OpenRouter key, as a real secret setting: BB keeps it in
+   * an owner-only file under the plugin's own directory, never in `bb.db` and
+   * never in a response to the frontend. A KV row is readable by every plugin and
+   * lives in the database, which is not where a credential belongs.
+   */
+  const judgeSettings = bb.settings.define({
+    judgeKey: {
+      type: "string",
+      label: "OpenRouter key for the advisory judge",
+      description:
+        "Used only to ask Jev for a second opinion on a check unit's report. Stored as a secret, never shown again.",
+      secret: true,
+    },
+  });
 
   /** The settings that shape thread behaviour, after a scope's values are validated. */
   interface SettingsView {
@@ -1244,6 +1260,32 @@ export default async function plugin(bb: BbPluginApi) {
   let mutationQueue: Promise<unknown> = Promise.resolve();
 
   /**
+   * Per-thread state lives in this plugin's own SQLite database, not in a single
+   * KV value. A KV row is capped at 256 KB and every thread shared it, so one
+   * busy thread's history forced the least recently touched threads out of the
+   * map — losing exactly the delegation and violation records the state exists
+   * to keep. A row per thread has no shared budget: nothing is evicted, and the
+   * existing KV map is imported once so the upgrade keeps every record it had.
+   */
+  const stateDb = bb.storage.database();
+  bb.storage.migrate(stateDb, [
+    `CREATE TABLE IF NOT EXISTS thread_state (
+       thread_id TEXT PRIMARY KEY NOT NULL,
+       touched_at INTEGER NOT NULL,
+       state TEXT NOT NULL
+     )`,
+  ]);
+  const readStateRows = stateDb.prepare<[], { thread_id: string; state: string }>(
+    "SELECT thread_id, state FROM thread_state",
+  );
+  const writeStateRow = stateDb.prepare<[string, number, string]>(
+    `INSERT INTO thread_state (thread_id, touched_at, state) VALUES (?, ?, ?)
+     ON CONFLICT(thread_id) DO UPDATE SET touched_at = excluded.touched_at, state = excluded.state`,
+  );
+  const deleteStateRow = stateDb.prepare<[string]>("DELETE FROM thread_state WHERE thread_id = ?");
+  const countStateRows = stateDb.prepare<[], { n: number }>("SELECT COUNT(*) AS n FROM thread_state");
+
+  /**
    * Claims this process has made but not yet recorded. A cap check that counted
    * only the recorded delegations would let two simultaneous claims both pass,
    * so in-flight claims are counted too. `turn` tracks the ones that count
@@ -1288,21 +1330,28 @@ export default async function plugin(bb: BbPluginApi) {
     // A corrupt or unreadable store must not throw out of a read: every caller
     // (the toggle, the dispatch hook, the watchdog, the contract builder) treats
     // "no row" as an ordinary state, so degrade to an empty map and log.
-    let rows: Record<string, unknown> = {};
+    const rows: Record<string, unknown> = {};
     try {
-      const stored = await bb.storage.kv.get<unknown>(STATE_KEY);
-      if (stored === undefined || stored === null) {
-        rows = {};
-      } else if (typeof stored === "object" && !Array.isArray(stored)) {
-        rows = stored as Record<string, unknown>;
-      } else {
-        bb.log.warn(
-          `stored state is not an object (${Array.isArray(stored) ? "array" : typeof stored}); starting empty`,
-        );
+      for (const row of readStateRows.all()) {
+        try {
+          rows[row.thread_id] = JSON.parse(row.state) as unknown;
+        } catch (cause) {
+          bb.log.warn(`state row for ${row.thread_id} is not JSON; skipped: ${String(cause)}`);
+        }
       }
     } catch (cause) {
       bb.log.warn(`state read failed; starting empty: ${String(cause)}`);
     }
+    // One-time import of the single KV map this build used to write. It is kept
+    // rather than deleted, so a rollback to the previous build still has its
+    // records, and rows already in the table win over the older copy.
+    let imported = 0;
+    try {
+      imported = await importLegacyState(rows);
+    } catch (cause) {
+      bb.log.warn(`legacy state import failed; continuing with the database rows: ${String(cause)}`);
+    }
+    if (imported > 0) bb.log.info(`imported ${imported} thread(s) from the legacy KV state map`);
     // Normalize here, not only in getState and mutateState: every reader shares this
     // cache, including the agent-configuration path, and a row written by an older
     // build must not reach a caller with a missing array.
@@ -1319,6 +1368,37 @@ export default async function plugin(bb: BbPluginApi) {
     // memory, and the next mutation would persist that stale map over the write.
     if (cache === null) cache = loaded;
     return cache;
+  }
+
+  /**
+   * Copy rows out of the legacy KV map into the table, once. Returns how many
+   * rows this call added: a populated table short-circuits, so the import runs
+   * exactly once in the life of an upgrade.
+   */
+  async function importLegacyState(rows: Record<string, unknown>): Promise<number> {
+    if (countStateRows.get()?.n !== 0) return 0;
+    let legacy: Record<string, unknown> = {};
+    try {
+      const stored = await bb.storage.kv.get<unknown>(STATE_KEY);
+      if (stored !== null && typeof stored === "object" && !Array.isArray(stored)) {
+        legacy = stored as Record<string, unknown>;
+      } else if (stored !== undefined && stored !== null) {
+        bb.log.warn(
+          `legacy state is not an object (${Array.isArray(stored) ? "array" : typeof stored}); nothing imported`,
+        );
+      }
+    } catch (cause) {
+      bb.log.warn(`legacy state read failed; nothing imported: ${String(cause)}`);
+    }
+    const entries = Object.entries(legacy);
+    if (entries.length === 0) return 0;
+    stateDb.transaction(() => {
+      for (const [threadId, state] of entries) {
+        writeStateRow.run(threadId, Date.now(), JSON.stringify(state));
+        rows[threadId] = state;
+      }
+    })();
+    return entries.length;
   }
 
   /**
@@ -1357,22 +1437,36 @@ export default async function plugin(bb: BbPluginApi) {
 
   /** Whether a judge key is stored. The value is read here and never returned. */
   async function judgeKeyConfigured(): Promise<boolean> {
-    const stored = (await bb.storage.kv.get(JUDGE_KEY)) as { key?: unknown } | null;
-    return typeof stored?.key === "string" && stored.key !== "";
+    const { judgeKey } = await judgeSettings.get();
+    return typeof judgeKey === "string" && judgeKey !== "";
   }
 
-  /** Thread ids the last prune dropped, counted into DROPS_KEY by the next persist. */
-  let pendingDrops: string[] = [];
+  /**
+   * The OpenRouter key, or null when none is stored. Read at call time so a key
+   * saved from the settings section is used by the next check without a reload.
+   * Never logged, never returned to the frontend.
+   */
+  async function judgeKey(): Promise<string | null> {
+    const { judgeKey: key } = await judgeSettings.get();
+    return typeof key === "string" && key !== "" ? key : null;
+  }
+
+  /**
+   * Write the rows this mutation changed. The map is the cache, not the storage
+   * format: each thread is one table row, so no write can crowd out another
+   * thread, and no record is ever evicted to make room.
+   */
   async function persist(next: Record<string, ThreadState>): Promise<void> {
-    await bb.storage.kv.set(STATE_KEY, next);
-    if (pendingDrops.length > 0) {
-      const previous = (await bb.storage.kv.get(DROPS_KEY)) as { count?: number } | null;
-      await bb.storage.kv.set(DROPS_KEY, {
-        count: (previous?.count ?? 0) + pendingDrops.length,
-        lastDroppedAt: Date.now(),
-      });
-      pendingDrops = [];
-    }
+    const previous = cache ?? {};
+    stateDb.transaction(() => {
+      for (const [threadId, state] of Object.entries(next)) {
+        if (previous[threadId] === state) continue;
+        writeStateRow.run(threadId, state.touchedAt, JSON.stringify(state));
+      }
+      for (const threadId of Object.keys(previous)) {
+        if (next[threadId] === undefined) deleteStateRow.run(threadId);
+      }
+    })();
     cache = next;
     bb.realtime.publish(STATE_CHANGED, { at: Date.now() });
   }
@@ -1419,12 +1513,12 @@ export default async function plugin(bb: BbPluginApi) {
       if (next === null) {
         if (all[threadId] === undefined) return undefined;
         delete all[threadId];
-        await persist(prune(all, inFlightThreads(threadId)));
+        await persist(all);
         return undefined;
       }
       next.touchedAt = Date.now();
       setRow(all, threadId, next);
-      await persist(prune(all, inFlightThreads(threadId)));
+      await persist(all);
       return next;
     });
   }
@@ -1446,15 +1540,6 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
-   * The threads a prune must not evict: the one this write is about, and any
-   * thread whose scan is queued or running. Dropping a scanning thread would
-   * lose its cursor and re-report work the next scan already classified.
-   */
-  function inFlightThreads(threadId: string): string[] {
-    return [threadId, ...scanning, ...scanTimers.keys()];
-  }
-
-  /**
    * Store a row as an own data property. A plain `map[threadId] = row` treats
    * the key `__proto__` as the object's prototype setter instead, so that row
    * would disappear from `Object.keys`/`JSON.stringify` and the map would start
@@ -1467,50 +1552,6 @@ export default async function plugin(bb: BbPluginApi) {
       writable: true,
       configurable: true,
     });
-  }
-
-  /**
-   * Drop the least recently touched threads until the map is inside both its
-   * count cap and the store's byte budget. The newest thread and every thread in
-   * flight always survive, whatever the budget says. Each eviction is logged, so
-   * a drop is never silent.
-   */
-  function prune(
-    all: Record<string, ThreadState>,
-    protectedIds: readonly string[],
-  ): Record<string, ThreadState> {
-    const ids = Object.keys(all);
-    if (ids.length <= MAX_THREADS && byteLength(all) <= MAX_STATE_BYTES) return all;
-
-    // Oldest first: walking this order backwards is the eviction order.
-    const ranked = ids.sort((a, b) => (all[a]!.touchedAt ?? 0) - (all[b]!.touchedAt ?? 0));
-    const keep = new Set(protectedIds);
-    const newest = ranked[ranked.length - 1];
-    if (newest !== undefined) keep.add(newest);
-    const out: Record<string, ThreadState> = {};
-    let bytes = 2; // "{}"
-    let count = 0;
-    const dropped: string[] = [];
-    for (let index = ranked.length - 1; index >= 0; index -= 1) {
-      const id = ranked[index]!;
-      // The exact JSON the store will write for this entry: quoted key, colon,
-      // value. Summed with the braces and commas this equals stringified size.
-      const grown = bytes + (count === 0 ? 0 : 1) + byteLength(id) + 1 + byteLength(all[id]);
-      if (keep.has(id) || (count < MAX_THREADS && grown <= MAX_STATE_BYTES)) {
-        setRow(out, id, all[id]!);
-        bytes = grown;
-        count += 1;
-      } else {
-        dropped.push(id);
-      }
-    }
-    if (dropped.length > 0) {
-      pendingDrops = dropped;
-      bb.log.warn(
-        `state map over budget: dropped ${dropped.length} least recently touched thread(s) (${dropped.slice(0, 5).join(", ")}${dropped.length > 5 ? ", …" : ""})`,
-      );
-    }
-    return out;
   }
 
   function effectiveEnforcement(
@@ -2167,9 +2208,9 @@ export default async function plugin(bb: BbPluginApi) {
           : `\n\nThe check's verdict is ${parsed.verdict === "accepted" ? "pass" : "fail"}. You still judge this unit with orchestrator_review.`;
       // The advisory judge reads the check's report only when a key is stored and
       // the check gave a verdict. Its opinion is text, never a recorded verdict.
-      const judgeKey = parsed === null ? null : ((await bb.storage.kv.get(JUDGE_KEY)) as { key?: unknown } | null)?.key;
-      if (typeof judgeKey === "string" && judgeKey !== "") {
-        const opinion = await judgeCheckVerdict(judgeKey, checked.output ?? "");
+      const key = parsed === null ? null : await judgeKey();
+      if (key !== null) {
+        const opinion = await judgeCheckVerdict(key, checked.output ?? "");
         if (opinion !== null) {
           advice += `\nAdvisory judge: ${opinion.agrees ? "agrees" : "disagrees"}. ${opinion.rationale}`;
         }
@@ -3120,7 +3161,7 @@ export default async function plugin(bb: BbPluginApi) {
     get_judge: async () => ({ configured: await judgeKeyConfigured() }),
     set_judge_key: async ({ key }) => {
       const trimmed = key === null ? "" : key.trim();
-      await bb.storage.kv.set(JUDGE_KEY, trimmed === "" ? null : { key: trimmed });
+      await judgeSettings.experimental_set({ judgeKey: trimmed === "" ? null : trimmed });
       return { configured: trimmed !== "" };
     },
     set_worker_execution: async (next) => setWorkerConfig(next),
@@ -3244,7 +3285,7 @@ export default async function plugin(bb: BbPluginApi) {
     threadId: string,
     state: OrchestratorStateDto,
     scope: { projectId: string; overridden: readonly string[] } | null = null,
-    drops: { count?: number; lastDroppedAt?: number } | null = null,
+    retainedRows = 0,
   ): string {
     const lines = [
       `thread ${threadId}`,
@@ -3261,7 +3302,7 @@ export default async function plugin(bb: BbPluginApi) {
       `  fan-out cap:       ${
         state.maxParallelWorkers === 0 ? "none" : `${state.maxParallelWorkers} in flight`
       }, ${state.maxDelegationsPerTurn === 0 ? "none" : `${state.maxDelegationsPerTurn} per turn`}`,
-      `  threads dropped:   ${drops?.count ?? 0} from the state map${drops?.lastDroppedAt ? ` (last ${new Date(drops.lastDroppedAt).toISOString()})` : ""}`,
+      `  threads retained:  ${retainedRows} in durable state (nothing is evicted)`,
     ];
     if (state.delegations.length > 0) {
       lines.push("  recent workers:");
@@ -3299,8 +3340,8 @@ export default async function plugin(bb: BbPluginApi) {
             const state = toDto(threadId, await getState(threadId), settingsFor(projectId));
             const scope =
               projectId === null ? null : { projectId, overridden: Object.keys(projectSettings[projectId] ?? {}) };
-            const drops = (await bb.storage.kv.get(DROPS_KEY)) as { count?: number; lastDroppedAt?: number } | null;
-            return render(input.options.json, state, describeState(threadId, state, scope, drops ?? null));
+            const retained = countStateRows.get()?.n ?? 0;
+            return render(input.options.json, state, describeState(threadId, state, scope, retained));
           },
         }),
         review: cliCommand({

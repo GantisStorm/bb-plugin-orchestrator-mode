@@ -187,6 +187,12 @@ describe("read-only command detection", () => {
     "cat <<'EOF'\nbody\nEOF",
     "cat <<-EOF\n\tbody\n\tEOF",
     'echo "a << b"',
+    // Text filters a pipeline through a wide read result. The reported false
+    // positive was `bb thread show <id> 2>&1 | head -n 6 | cut -c1-160`.
+    "bb thread show thr_ate8sdq4nq 2>&1 | head -n 6 | cut -c1-160",
+    "bb thread list --json | jq -r '.[].id' | sort | uniq -c",
+    "cat f | cut -d: -f1",
+    "git log --oneline | tr -d ' ' | sort -u",
   ];
   for (const command of readOnly) {
     it(`allows \`${command}\``, () => {
@@ -314,6 +320,15 @@ describe("read-only command detection", () => {
     "cat <<EOF > out.txt\nbody\nEOF",
     "bash <<EOF\nrm -rf build\nEOF",
     "cat <<EOF\nbody",
+    // The text filters' own writers stay work.
+    "sort -o out.txt f",
+    "sort f --output=out.txt",
+    "sort --compress-program=touch f",
+    "cut --output=out.txt -c1-5 f",
+    "uniq f out.txt",
+    // A redirect or `tee` still writes, whatever the filter is.
+    "bb thread show x | cut -c1-160 > out.txt",
+    "bb thread show x | sort | tee out.txt",
   ];
   for (const command of mutating) {
     it(`refuses \`${command}\``, () => {

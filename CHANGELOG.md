@@ -40,6 +40,22 @@ All notable changes to Orchestrator Mode are documented here. The format follows
 - `curl` and `gh api` count as reads when they only fetch: `curl` with GET or HEAD, `gh api`
   with GET. A flag that sends a body, writes a file or reads a config, and `gh api graphql`,
   stay work. Before, every `curl` and `gh api` call was work, even a plain status check.
+- Per-thread state is stored as one row per thread in the plugin's own database instead of a
+  single key-value map. The map had one 256 KB ceiling for every thread, so one busy thread
+  forced the least recently touched threads out of it and their delegation and violation
+  records were lost. Nothing is evicted now, and the existing map is imported once on
+  upgrade. `bb orchestrator-mode status` reports retained threads instead of dropped ones.
+- The text filters `cut`, `tr`, `sort` and `uniq` count as reads, so
+  `bb thread show <id> | head -n 6 | cut -c1-160` is no longer flagged as doing the work
+  itself. `sort -o`, `sort --compress-program`, `cut --output` and `uniq IN OUT` still write
+  and stay work, as do redirects and `tee`. `sed` and `awk` stay work: a script can write a
+  file or run a program in ways no argument table can see.
+- The advisory judge's OpenRouter key is a secret plugin setting, stored in an owner-only
+  file rather than in the database, and is never returned to the frontend.
+- The advisory judge asks Jev on OpenRouter's decisions endpoint with a typed question, the
+  way Jev is served. It used to post to `/api/v1/chat/completions` with a model that endpoint
+  does not carry, so it could never answer. It sends only the check unit's report, capped at
+  4,000 characters, and still never records a verdict.
 
 ## 0.1.4 - 2026-10-18
 
